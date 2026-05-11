@@ -3,11 +3,10 @@ import numpy as np
 from typing import *
 from .asktell import AskTellFewShot
 from .llm_model import GaussDist
-from langchain.prompts.few_shot import FewShotPromptTemplate
-from langchain.prompts.prompt import PromptTemplate
+from langchain_core.prompts import FewShotPromptTemplate, PromptTemplate
 from langchain_community.vectorstores import FAISS, Chroma
 from langchain_openai import OpenAIEmbeddings
-from langchain.prompts.example_selector import SemanticSimilarityExampleSelector
+from langchain_core.example_selectors import SemanticSimilarityExampleSelector
 
 
 class AskTellNearestNeighbor(AskTellFewShot):

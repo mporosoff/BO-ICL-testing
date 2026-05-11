@@ -1,12 +1,12 @@
+import ast
 import numpy as np
 import pandas as pd
 from .pool import Pool
 from .asktell import AskTellFewShot, QuantileTransformer
 from .llm_model import GaussDist
 
-from langchain.prompts.few_shot import FewShotPromptTemplate
-from langchain.prompts.prompt import PromptTemplate
-from langchain.prompts.example_selector import (
+from langchain_core.prompts import FewShotPromptTemplate, PromptTemplate
+from langchain_core.example_selectors import (
     MaxMarginalRelevanceExampleSelector,
     SemanticSimilarityExampleSelector,
 )
@@ -45,11 +45,30 @@ class AskTellGPR(AskTellFewShot):
     def _get_cache(self, cache_path=None):
         try:
             cache = pd.read_csv(cache_path)
+            if "embedding" in cache.columns:
+                cache["embedding"] = cache["embedding"].apply(self._parse_embedding)
             print(f"Loaded cache from {cache_path}.")
         except:
             print("Cached embeddings not found. Creating new cache table.")
             cache = pd.DataFrame({"x": [], "embedding": []})
         return cache
+
+    @staticmethod
+    def _parse_embedding(value):
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if pd.isna(value):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = ast.literal_eval(value)
+            except (SyntaxError, ValueError):
+                return value
+            if isinstance(parsed, (list, tuple)):
+                return list(parsed)
+        return value
 
     def save_cache(self, cache_path):
         self._embeddings_cache.to_csv(cache_path, index=False)

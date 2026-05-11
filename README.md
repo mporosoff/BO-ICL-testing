@@ -44,6 +44,12 @@ import os
 os.environ["OPENAI_API_KEY"] = "<your-key-here>"
 ```
 
+### Local browser runner
+
+On Windows, double-click `run_boicl_local.bat` to create the local environment,
+save API keys to an ignored `.env`, and launch a browser app for GPR-guided
+experiments. See `LOCAL_RUNNER.md` for dataset format and workflow notes.
+
 ### Quickstart 🔥
 
 `boicl` provides a simple interface to use the model.

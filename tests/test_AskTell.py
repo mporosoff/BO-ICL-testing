@@ -1,9 +1,7 @@
 import boicl
 from boicl import (
     AskTellFewShotTopk,
-    AskTellGPR,
     AskTellNearestNeighbor,
-    AskTellRidgeKernelRegression,
     AskTellFinetuning,
     Pool,
 )
@@ -14,6 +12,16 @@ import os
 import openai
 import time
 
+try:
+    from boicl import AskTellGPR, AskTellRidgeKernelRegression
+except ImportError:
+    AskTellGPR = None
+    AskTellRidgeKernelRegression = None
+    GPR_AVAILABLE = False
+else:
+    GPR_AVAILABLE = True
+
+LIVE_API_TESTS = os.environ.get("RUN_LIVE_API_TESTS") == "1"
 
 np.random.seed(0)
 
@@ -95,6 +103,9 @@ class TestAskTell(ABC):
 
 class TestAskTellTopK(TestAskTell):
     __test__ = True
+    pytestmark = pytest.mark.skipif(
+        not LIVE_API_TESTS, reason="requires live LLM API access"
+    )
 
     @classmethod
     def asktells_to_test(cls):
@@ -107,6 +118,9 @@ class TestAskTellTopK(TestAskTell):
 
 class TestAskTellKNN:
     __test__ = True
+    pytestmark = pytest.mark.skipif(
+        not LIVE_API_TESTS, reason="requires live embedding API access"
+    )
 
     # @classmethod
     # def asktells_to_test(cls):
@@ -137,6 +151,10 @@ class TestAskTellKNN:
 
 class TestAskTellKRR:
     __test__ = True
+    pytestmark = pytest.mark.skipif(
+        not (LIVE_API_TESTS and GPR_AVAILABLE),
+        reason="requires live embedding API access and GPR extras",
+    )
 
     def test_krr(self):
         asktell = AskTellRidgeKernelRegression(
@@ -156,6 +174,10 @@ class TestAskTellKRR:
 
 class TestAskTellGPR:
     __test__ = True
+    pytestmark = pytest.mark.skipif(
+        not (LIVE_API_TESTS and GPR_AVAILABLE),
+        reason="requires live embedding API access and GPR extras",
+    )
 
     # @classmethod
     # def asktells_to_test(cls):

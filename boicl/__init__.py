@@ -1,13 +1,8 @@
 from .version import __version__
 from .asktell import AskTellFewShotTopk
 from .asktellFinetuning import AskTellFinetuning
-
-try:
-    from .asktellGPR import AskTellGPR
-    from .asktellRidgeRegression import AskTellRidgeKernelRegression
-except ImportError:
-    print("GPR Packages not installed. Do `pip install boicl[gpr]` to install them")
 from .asktellNearestNeighbor import AskTellNearestNeighbor
+from .datasets import build_ocm_dataset, write_ocm_dataset
 from .pool import Pool
 from .tool import BOICLTool
 
@@ -15,9 +10,17 @@ from .tool import BOICLTool
 __all__ = [
     "AskTellFewShotTopk",
     "AskTellFinetuning",
-    "AskTellGPR",
-    "AskTellRidgeKernelRegression",
     "AskTellNearestNeighbor",
+    "build_ocm_dataset",
+    "write_ocm_dataset",
     "Pool",
     "BOICLTool",
 ]
+
+try:
+    from .asktellGPR import AskTellGPR
+    from .asktellRidgeRegression import AskTellRidgeKernelRegression
+except ImportError:
+    pass
+else:
+    __all__.extend(["AskTellGPR", "AskTellRidgeKernelRegression"])

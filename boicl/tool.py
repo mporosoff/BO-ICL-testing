@@ -65,3 +65,6 @@ class BOICLTool(BaseTool):
     async def _arun(self, query: str) -> str:
         """Use the tool asynchronously."""
         raise NotImplementedError()
+
+    def __call__(self, query: str) -> str:
+        return self._run(query)

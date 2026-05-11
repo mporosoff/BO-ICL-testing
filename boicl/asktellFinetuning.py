@@ -6,7 +6,7 @@ import time
 import json
 
 from typing import *
-from langchain.prompts.prompt import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 from .llm_model import get_llm
 import warnings
 

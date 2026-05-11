@@ -3,10 +3,12 @@ from boicl import llm_model
 import numpy as np
 from abc import ABC
 import pytest
+import os
 
-from langchain.schema import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
 np.random.seed(0)
+LIVE_API_TESTS = os.environ.get("RUN_LIVE_API_TESTS") == "1"
 
 
 def pytest_generate_tests(metafunc):
@@ -30,6 +32,9 @@ class TestLLM(ABC):
 
 class TestOpenAILLM(TestLLM):
     __test__ = True
+    pytestmark = pytest.mark.skipif(
+        not LIVE_API_TESTS, reason="requires live LLM API access"
+    )
 
     @classmethod
     def models_to_test(cls):
@@ -38,6 +43,9 @@ class TestOpenAILLM(TestLLM):
 
 class TestChatOpenAILLM(TestLLM):
     __test__ = True
+    pytestmark = pytest.mark.skipif(
+        not LIVE_API_TESTS, reason="requires live LLM API access"
+    )
 
     @classmethod
     def models_to_test(cls):

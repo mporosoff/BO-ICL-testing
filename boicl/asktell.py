@@ -18,11 +18,10 @@ from .aqfxns import (
     greedy,
 )
 from .pool import Pool
-from langchain.prompts.few_shot import FewShotPromptTemplate
-from langchain.prompts.prompt import PromptTemplate
+from langchain_core.prompts import FewShotPromptTemplate, PromptTemplate
 from langchain_community.vectorstores import FAISS, Chroma
 from langchain_openai import OpenAIEmbeddings
-from langchain.prompts.example_selector import (
+from langchain_core.example_selectors import (
     MaxMarginalRelevanceExampleSelector,
     SemanticSimilarityExampleSelector,
 )
@@ -154,6 +153,8 @@ class AskTellFewShot:
         self.tokens_used = 0
         self.cos_sim = cos_sim
         self.use_logprobs = use_logprobs
+        self.llm = None
+        self.inv_llm = None
 
     def _setup_llm(self, model: str, temperature: Optional[float] = None):
         raise NotImplementedError
@@ -203,6 +204,8 @@ class AskTellFewShot:
         query = self.inv_prompt.format(
             y=self.format_y(y), y_name=self._y_name, x_name=self._x_name
         )
+        if self.inv_llm is None:
+            self.inv_llm = self._setup_inv_llm(self._model, self._temperature)
         x, tokens = self._inv_predict(query, system_message=system_message)
 
         return x[0]
@@ -225,8 +228,10 @@ class AskTellFewShot:
                 None, self._prompt_template, self._suffix, self._prefix
             )
             self.inv_prompt = self._setup_inverse_prompt(None)
-            self.llm = self._setup_llm(self._model)
             self._ready = True
+
+        if self.llm is None:
+            self.llm = self._setup_llm(self._model, self._temperature)
 
         if self._selector_k is not None:
             self.prompt.example_selector.k = min(self._example_count, self._selector_k)
@@ -277,8 +282,6 @@ class AskTellFewShot:
                 example_dict, self._prompt_template, self._suffix, self._prefix
             )
             self.inv_prompt = self._setup_inverse_prompt(inv_example)
-            self.llm = self._setup_llm(self._model, self._temperature)
-            self.inv_llm = self._setup_inv_llm(self._model, self._temperature)
             self._ready = True
         else:
             # in else, so we don't add twice

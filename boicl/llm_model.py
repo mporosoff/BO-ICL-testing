@@ -11,7 +11,7 @@ from langchain_community.callbacks import get_openai_callback
 import langchain
 from dataclasses import dataclass
 
-from langchain.schema import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from functools import reduce
 from typing import Union
 import warnings

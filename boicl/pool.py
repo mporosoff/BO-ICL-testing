@@ -26,11 +26,16 @@ class Pool:
         self._selected = []
         self._available = pool[:]
         self.format = formatter
-        self._db = FAISS.from_texts(
-            [formatter(x) for x in pool],
-            OpenAIEmbeddings(),  # model="text-embedding-3-large"
-            metadatas=[dict(data=p) for p in pool],
-        )
+        self._db = None
+
+    def _get_db(self):
+        if self._db is None:
+            self._db = FAISS.from_texts(
+                [self.format(x) for x in self._pool],
+                OpenAIEmbeddings(),  # model="text-embedding-3-large"
+                metadatas=[dict(data=p) for p in self._pool],
+            )
+        return self._db
 
     def sample(self, n: int) -> List[str]:
         """Sample n items from the pool"""
@@ -51,7 +56,7 @@ class Pool:
 
         # want to select extra, then remove previously chosen
         _k = k + len(self._selected)
-        docs = self._db.max_marginal_relevance_search(
+        docs = self._get_db().max_marginal_relevance_search(
             x, k=_k, fetch_k=5 * _k, lambda_mult=lambda_mult
         )
         docs = [d.metadata["data"] for d in docs]
