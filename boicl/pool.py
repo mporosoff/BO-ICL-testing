@@ -19,20 +19,26 @@ class Pool:
         ['b', 'c', 'd']
     """
 
-    def __init__(self, pool: List[Any], formatter: Callable = lambda x: str(x)) -> None:
+    def __init__(
+        self,
+        pool: List[Any],
+        formatter: Callable = lambda x: str(x),
+        embedding_model: str = "text-embedding-ada-002",
+    ) -> None:
         if type(pool) is not list:
             raise TypeError("Pool must be a list")
         self._pool = pool
         self._selected = []
         self._available = pool[:]
         self.format = formatter
+        self.embedding_model = embedding_model
         self._db = None
 
     def _get_db(self):
         if self._db is None:
             self._db = FAISS.from_texts(
                 [self.format(x) for x in self._pool],
-                OpenAIEmbeddings(),  # model="text-embedding-3-large"
+                OpenAIEmbeddings(model=self.embedding_model),
                 metadatas=[dict(data=p) for p in self._pool],
             )
         return self._db

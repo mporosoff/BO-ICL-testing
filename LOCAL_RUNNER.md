@@ -9,6 +9,7 @@ The launcher:
 - creates `.venv` when needed;
 - installs BO-ICL with the GPR extra and local app dependencies;
 - prompts for `OPENAI_API_KEY` without echoing it to the terminal;
+- optionally prompts for `OPENROUTER_API_KEY` and `ANTHROPIC_API_KEY`;
 - starts `python -m boicl.local_app` and opens the browser.
 
 Secrets stay in `.env`, which is ignored by Git. Do not paste real API keys into
@@ -65,11 +66,25 @@ training. Entered uncertainty is stored, exported, and plotted as an error bar.
 The current BO-ICL `AskTellGPR` implementation does not yet use per-observation
 uncertainty as fixed noise during GP fitting.
 
+The browser has two suggestion engines:
+
+- `GPR with embeddings` uses the selected embedding model plus Gaussian process
+  regression.
+- `BO-ICL LLM` uses `Prediction LLM` for candidate prediction and acquisition
+  scoring. If `Inverse filter` is greater than zero, it also uses `Inverse
+  design LLM` to propose a target procedure, then searches the uploaded pool for
+  similar candidates before scoring them.
+
 The embedding model is selectable in the browser settings and uses a separate
 local cache per embedding model. `Prediction LLM` and `Inverse design LLM` are
-stored in the run configuration for BO-ICL language-model workflows, but the
-current browser runner's GPR suggestion path uses embeddings plus a Gaussian
-process rather than an LLM for prediction.
+independent settings. OpenAI model names use `OPENAI_API_KEY`, `openrouter/...`
+model names use `OPENROUTER_API_KEY`, and `claude-...` model names use
+`ANTHROPIC_API_KEY`.
+
+The `Inverse Design` panel can generate free-form proposals from the labeled
+examples and the active objective target. Use those proposals directly as manual
+procedures, or use `Inverse filter` to turn inverse-design output into ranked
+candidates from the uploaded pool.
 
 `Batch size` controls how many candidates are suggested per update.
 `Iteration cap` stops suggestions after that many active-objective observations;

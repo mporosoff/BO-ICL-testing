@@ -43,13 +43,44 @@ ACQUISITION_FUNCTIONS = [
 ]
 
 
+MODEL_PRESETS = [
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-4-turbo-preview",
+    "gpt-4",
+    "gpt-3.5-turbo",
+    "gpt-3.5-turbo-instruct",
+    "openrouter/mistralai/mistral-7b-instruct:free",
+    "openrouter/meta-llama/llama-3.1-8b-instruct:free",
+    "claude-3-haiku-20240307",
+    "claude-3-5-sonnet-20240620",
+]
+
+
+EMBEDDING_MODEL_PRESETS = [
+    "text-embedding-ada-002",
+    "text-embedding-3-small",
+    "text-embedding-3-large",
+]
+
+
 DEFAULT_CONFIG = {
+    "optimizer": "gpr",
     "objective_name": "objective",
     "objective_direction": "maximize",
     "acquisition": "upper_confidence_bound",
     "embedding_model": "text-embedding-ada-002",
     "prediction_model": "gpt-4o",
     "inverse_model": "gpt-4o",
+    "prediction_system_message": "",
+    "inverse_system_message": "",
+    "llm_samples": 5,
+    "selector_k": 0,
+    "inverse_filter": 0,
+    "inverse_random_candidates": 16,
+    "inverse_target_value": "",
+    "inverse_target_multiplier": 1.2,
+    "inverse_design_count": 3,
     "batch_size": 1,
     "iterations_per_trial": 0,
     "replicates_per_candidate": 1,
@@ -162,6 +193,23 @@ def _numeric_columns(df: pd.DataFrame, columns: List[Any]) -> List[Any]:
     return numeric
 
 
+def _model_provider(model_name: str) -> str:
+    if model_name.startswith("openrouter/"):
+        return "openrouter"
+    if model_name.startswith("claude-"):
+        return "anthropic"
+    return "openai"
+
+
+def _required_key_name(model_name: str) -> str:
+    provider = _model_provider(model_name)
+    if provider == "openrouter":
+        return "OPENROUTER_API_KEY"
+    if provider == "anthropic":
+        return "ANTHROPIC_API_KEY"
+    return "OPENAI_API_KEY"
+
+
 def _load_env_file(env_path: Path) -> None:
     if load_dotenv is not None:
         load_dotenv(env_path, override=False)
@@ -200,6 +248,7 @@ class LocalBOState:
     candidates: List[Dict[str, Any]] = field(default_factory=list)
     observations: List[Dict[str, Any]] = field(default_factory=list)
     suggestions: List[Dict[str, Any]] = field(default_factory=list)
+    inverse_designs: List[Dict[str, Any]] = field(default_factory=list)
     events: List[Dict[str, str]] = field(default_factory=list)
     last_error: Optional[str] = None
     last_model_status: str = "No dataset loaded."
@@ -221,9 +270,11 @@ class LocalBOState:
     def key_status(self) -> Dict[str, Any]:
         key = os.environ.get("OPENAI_API_KEY", "")
         openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
         return {
             "openai_configured": bool(key),
             "openrouter_configured": bool(openrouter_key),
+            "anthropic_configured": bool(anthropic_key),
             "openai_hint": f"...{key[-4:]}" if len(key) > 8 else "",
         }
 
@@ -241,6 +292,7 @@ class LocalBOState:
                 "available_count": len(available_candidates),
                 "observations": self.observations,
                 "suggestions": self.suggestions,
+                "inverse_designs": self.inverse_designs,
                 "events": self.events,
                 "last_error": self.last_error,
                 "last_model_status": self.last_model_status,
@@ -253,6 +305,8 @@ class LocalBOState:
                     int(self.config["random_replicates"]),
                 ),
                 "acquisition_functions": ACQUISITION_FUNCTIONS,
+                "model_presets": MODEL_PRESETS,
+                "embedding_model_presets": EMBEDDING_MODEL_PRESETS,
             }
 
     def active_observations(self) -> List[Dict[str, Any]]:
@@ -323,6 +377,7 @@ class LocalBOState:
             self.candidates = []
             self.observations = []
             self.suggestions = []
+            self.inverse_designs = []
             self.last_error = None
             self.last_model_status = "Dataset loaded. Add observations to train GPR."
             if value_columns:
@@ -381,6 +436,11 @@ class LocalBOState:
                     "iterations_per_trial",
                     "replicates_per_candidate",
                     "random_replicates",
+                    "llm_samples",
+                    "selector_k",
+                    "inverse_filter",
+                    "inverse_random_candidates",
+                    "inverse_design_count",
                     "score_limit",
                     "n_neighbors",
                     "n_components",
@@ -388,9 +448,14 @@ class LocalBOState:
                     value = int(value)
                 elif key == "ucb_lambda":
                     value = float(value)
+                elif key == "inverse_target_multiplier":
+                    value = float(value)
                 elif key == "auto_suggest":
                     value = bool(value)
                 self.config[key] = value
+            self.config["optimizer"] = (
+                "llm" if self.config["optimizer"] == "llm" else "gpr"
+            )
             if self.config["acquisition"] not in ACQUISITION_FUNCTIONS:
                 self.config["acquisition"] = DEFAULT_CONFIG["acquisition"]
             self.config["objective_direction"] = (
@@ -406,6 +471,15 @@ class LocalBOState:
                 1, int(self.config["replicates_per_candidate"])
             )
             self.config["random_replicates"] = max(0, int(self.config["random_replicates"]))
+            self.config["llm_samples"] = max(1, min(20, int(self.config["llm_samples"])))
+            self.config["selector_k"] = max(0, int(self.config["selector_k"]))
+            self.config["inverse_filter"] = max(0, int(self.config["inverse_filter"]))
+            self.config["inverse_random_candidates"] = max(
+                0, int(self.config["inverse_random_candidates"])
+            )
+            self.config["inverse_design_count"] = max(
+                1, min(10, int(self.config["inverse_design_count"]))
+            )
             self.config["score_limit"] = max(1, int(self.config["score_limit"]))
             self.config["n_neighbors"] = max(1, int(self.config["n_neighbors"]))
             self.config["n_components"] = max(1, int(self.config["n_components"]))
@@ -492,24 +566,28 @@ class LocalBOState:
                 self.suggestions = []
                 self.last_model_status = "No unevaluated candidates remain."
                 return self.to_json()
-            if not os.environ.get("OPENAI_API_KEY"):
+            missing_key = self._missing_key_for_suggestions()
+            if missing_key:
                 self.suggestions = self._random_suggestions(available)
-                self.last_model_status = "OpenAI API key missing. Showing random candidates."
-                self.log("Add OPENAI_API_KEY to enable embeddings and GPR.")
+                self.last_model_status = f"{missing_key} missing. Showing random candidates."
+                self.log(f"Add {missing_key} to enable {self.config['optimizer'].upper()} suggestions.")
                 return self.to_json()
             if len(active_observations) < 2:
                 self.suggestions = self._random_suggestions(available)
-                self.last_model_status = "Add at least 2 observations before GPR suggestions."
+                self.last_model_status = "Add at least 2 observations before model suggestions."
                 return self.to_json()
             if len(self._training_observations()) < 2:
                 self.suggestions = self._random_suggestions(available)
-                self.last_model_status = "Add at least 2 unique procedures before GPR suggestions."
+                self.last_model_status = "Add at least 2 unique procedures before model suggestions."
                 return self.to_json()
 
             try:
-                self.suggestions = self._gpr_suggestions(available)
+                if self.config["optimizer"] == "llm":
+                    self.suggestions = self._llm_suggestions(available)
+                else:
+                    self.suggestions = self._gpr_suggestions(available)
                 self.last_model_status = (
-                    f"Updated GPR on {len(active_observations)} observations."
+                    f"Updated {self.config['optimizer'].upper()} on {len(active_observations)} observations."
                 )
                 self.log(f"Updated suggestions with {self.config['acquisition']}.")
             except Exception as exc:  # pragma: no cover - needs live API/GPR deps
@@ -517,9 +595,25 @@ class LocalBOState:
                 self.last_error = "".join(
                     traceback.format_exception_only(type(exc), exc)
                 ).strip()
-                self.last_model_status = "GPR update failed. Showing random candidates."
-                self.log("GPR update failed; see status panel.")
+                self.last_model_status = "Model update failed. Showing random candidates."
+                self.log("Model update failed; see status panel.")
             return self.to_json()
+
+    def _missing_key_for_suggestions(self) -> Optional[str]:
+        if self.config["optimizer"] == "gpr":
+            return None if os.environ.get("OPENAI_API_KEY") else "OPENAI_API_KEY"
+        key_name = _required_key_name(self.config["prediction_model"])
+        if not os.environ.get(key_name):
+            return key_name
+        if self.config["selector_k"] and not os.environ.get("OPENAI_API_KEY"):
+            return "OPENAI_API_KEY"
+        if self.config["inverse_filter"]:
+            inverse_key_name = _required_key_name(self.config["inverse_model"])
+            if not os.environ.get(inverse_key_name):
+                return inverse_key_name
+            if not os.environ.get("OPENAI_API_KEY"):
+                return "OPENAI_API_KEY"
+        return None
 
     def _random_suggestions(self, available: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         batch_size = min(self.config["batch_size"], len(available))
@@ -593,6 +687,134 @@ class LocalBOState:
             }
             for procedure, aq, mean, std in zip(selected, acquisition, means, stds)
         ]
+
+    def _build_llm_model(self):
+        from boicl import AskTellFewShotTopk
+
+        selector_k = int(self.config["selector_k"]) or None
+        model = AskTellFewShotTopk(
+            model=self.config["prediction_model"],
+            inverse_model=self.config["inverse_model"],
+            k=int(self.config["llm_samples"]),
+            selector_k=selector_k,
+            y_name=self.config["objective_name"],
+            x_name="procedure",
+            y_formatter=lambda y: f"{float(y):0.6g}",
+        )
+        for obs in self._training_observations():
+            model.tell(obs["procedure"], obs["target"])
+        return model
+
+    def _llm_suggestions(self, available: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        from boicl import Pool
+
+        model = self._build_llm_model()
+        subset = self._candidate_subset(available)
+        procedures = [cand["procedure"] for cand in subset]
+        inverse_text = None
+        if self.config["inverse_filter"] and procedures:
+            inverse_text = self._generate_inverse_text(model)
+            pool = Pool(procedures, embedding_model=self.config["embedding_model"])
+            filtered = pool.approx_sample(
+                inverse_text,
+                min(int(self.config["inverse_filter"]), len(procedures)),
+            )
+            remaining = [procedure for procedure in procedures if procedure not in filtered]
+            random_count = min(int(self.config["inverse_random_candidates"]), len(remaining))
+            procedures = filtered + random.sample(remaining, random_count)
+            self.inverse_designs.insert(
+                0,
+                {
+                    "procedure": inverse_text,
+                    "target": self._inverse_target_display_value(),
+                    "model": self.config["inverse_model"],
+                    "time": _now(),
+                    "source": "inverse_filter",
+                },
+            )
+            self.inverse_designs = self.inverse_designs[:20]
+        if not procedures:
+            return self._random_suggestions(available)
+
+        raw = model.ask(
+            procedures,
+            aq_fxn=self.config["acquisition"],
+            k=min(self.config["batch_size"], len(procedures)),
+            inv_filter=0,
+            aug_random_filter=len(procedures),
+            _lambda=self.config["ucb_lambda"],
+            system_message=self.config["prediction_system_message"],
+            inv_system_message=self.config["inverse_system_message"],
+        )
+        selected, acquisition, means = raw[:3]
+        by_proc = {cand["procedure"]: cand for cand in subset}
+        return [
+            {
+                "candidate_id": by_proc[procedure]["id"],
+                "procedure": procedure,
+                "acquisition": float(aq),
+                "mean": self.display_value(float(mean)) if mean is not None else None,
+                "std": None,
+                "source": "llm",
+                "prediction_model": self.config["prediction_model"],
+                "inverse_model": self.config["inverse_model"],
+                "inverse_seed": inverse_text,
+            }
+            for procedure, aq, mean in zip(selected, acquisition, means)
+            if procedure in by_proc
+        ]
+
+    def _inverse_target_display_value(self) -> float:
+        configured = _coerce_float(self.config.get("inverse_target_value"))
+        if configured is not None:
+            return configured
+        observations = self.active_observations()
+        if not observations:
+            raise ValueError("Add observations or enter an inverse target value first.")
+        values = [obs["value"] for obs in observations if obs["value"] is not None]
+        best = min(values) if self.config["objective_direction"] == "minimize" else max(values)
+        return best * float(self.config["inverse_target_multiplier"])
+
+    def _inverse_target_model_value(self) -> float:
+        return self.target_value(self._inverse_target_display_value())
+
+    def _generate_inverse_text(self, model) -> str:
+        return model.inv_predict(
+            self._inverse_target_model_value(),
+            system_message=self.config["inverse_system_message"],
+        )
+
+    def generate_inverse_designs(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        target = payload.get("target_value")
+        count = payload.get("count")
+        with self.lock:
+            if target not in (None, ""):
+                self.config["inverse_target_value"] = str(target)
+            if count not in (None, ""):
+                self.config["inverse_design_count"] = max(1, min(10, int(count)))
+            key_name = _required_key_name(self.config["inverse_model"])
+            if not os.environ.get(key_name):
+                raise ValueError(f"{key_name} is required for inverse design.")
+            if self.config["selector_k"] and not os.environ.get("OPENAI_API_KEY"):
+                raise ValueError("OPENAI_API_KEY is required for selector examples.")
+            if len(self._training_observations()) < 1:
+                raise ValueError("Add at least one labeled procedure before inverse design.")
+            model = self._build_llm_model()
+            generated = []
+            for _ in range(int(self.config["inverse_design_count"])):
+                generated.append(
+                    {
+                        "procedure": self._generate_inverse_text(model),
+                        "target": self._inverse_target_display_value(),
+                        "model": self.config["inverse_model"],
+                        "time": _now(),
+                        "source": "manual_inverse_design",
+                    }
+                )
+            self.inverse_designs = generated + self.inverse_designs
+            self.inverse_designs = self.inverse_designs[:20]
+            self.log(f"Generated {len(generated)} inverse design proposal(s).")
+            return self.to_json()
 
     def _training_observations(self) -> List[Dict[str, Any]]:
         grouped: Dict[str, List[Dict[str, Any]]] = {}
@@ -707,6 +929,7 @@ class LocalAppHandler(BaseHTTPRequestHandler):
                 payload = self._read_json()
                 key = (payload.get("openai_api_key") or "").strip()
                 openrouter_key = (payload.get("openrouter_api_key") or "").strip()
+                anthropic_key = (payload.get("anthropic_api_key") or "").strip()
                 if key:
                     _write_env_value(self.state.env_path, "OPENAI_API_KEY", key)
                     self.state.log("Saved OPENAI_API_KEY to local .env.")
@@ -715,6 +938,11 @@ class LocalAppHandler(BaseHTTPRequestHandler):
                         self.state.env_path, "OPENROUTER_API_KEY", openrouter_key
                     )
                     self.state.log("Saved OPENROUTER_API_KEY to local .env.")
+                if anthropic_key:
+                    _write_env_value(
+                        self.state.env_path, "ANTHROPIC_API_KEY", anthropic_key
+                    )
+                    self.state.log("Saved ANTHROPIC_API_KEY to local .env.")
                 self._send_json(self.state.to_json())
             elif parsed.path == "/api/import-dataset":
                 filename = parse_qs(parsed.query).get("filename", ["dataset.csv"])[0]
@@ -725,6 +953,8 @@ class LocalAppHandler(BaseHTTPRequestHandler):
                 self._send_json(self.state.add_observation(self._read_json()))
             elif parsed.path == "/api/suggest":
                 self._send_json(self.state.suggest())
+            elif parsed.path == "/api/inverse-design":
+                self._send_json(self.state.generate_inverse_designs(self._read_json()))
             elif parsed.path == "/api/reset":
                 self._send_json(self.state.reset_run())
             else:
@@ -985,6 +1215,10 @@ INDEX_HTML = r"""<!doctype html>
           <label for="openrouterKey">OpenRouter API key</label>
           <input id="openrouterKey" type="password" autocomplete="off" placeholder="optional">
         </div>
+        <div class="field">
+          <label for="anthropicKey">Anthropic API key</label>
+          <input id="anthropicKey" type="password" autocomplete="off" placeholder="optional">
+        </div>
         <button class="primary" id="saveKey">Save Locally</button>
       </section>
 
@@ -1000,9 +1234,18 @@ INDEX_HTML = r"""<!doctype html>
       <section class="panel">
         <h2>Settings</h2>
         <div class="field">
+          <label for="optimizer">Suggestion engine</label>
+          <select id="optimizer">
+            <option value="gpr">GPR with embeddings</option>
+            <option value="llm">BO-ICL LLM</option>
+          </select>
+        </div>
+        <div class="field">
           <label for="objectiveName">Objective name</label>
           <input id="objectiveName" value="objective" list="objectiveOptions">
           <datalist id="objectiveOptions"></datalist>
+          <datalist id="modelOptions"></datalist>
+          <datalist id="embeddingModelOptions"></datalist>
         </div>
         <div class="row">
           <div class="field">
@@ -1020,16 +1263,24 @@ INDEX_HTML = r"""<!doctype html>
         <div class="row">
           <div class="field">
             <label for="embeddingModel">Embedding model</label>
-            <input id="embeddingModel" value="text-embedding-ada-002">
+            <input id="embeddingModel" value="text-embedding-ada-002" list="embeddingModelOptions">
           </div>
           <div class="field">
             <label for="predictionModel">Prediction LLM</label>
-            <input id="predictionModel" value="gpt-4o">
+            <input id="predictionModel" value="gpt-4o" list="modelOptions">
           </div>
         </div>
         <div class="field">
           <label for="inverseModel">Inverse design LLM</label>
-          <input id="inverseModel" value="gpt-4o">
+          <input id="inverseModel" value="gpt-4o" list="modelOptions">
+        </div>
+        <div class="field">
+          <label for="predictionSystemMessage">Prediction system message</label>
+          <textarea id="predictionSystemMessage"></textarea>
+        </div>
+        <div class="field">
+          <label for="inverseSystemMessage">Inverse design system message</label>
+          <textarea id="inverseSystemMessage"></textarea>
         </div>
         <div class="row">
           <div class="field">
@@ -1040,6 +1291,40 @@ INDEX_HTML = r"""<!doctype html>
             <label for="ucbLambda">UCB lambda</label>
             <input id="ucbLambda" type="number" step="0.1" value="0.5">
           </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="llmSamples">LLM samples</label>
+            <input id="llmSamples" type="number" min="1" max="20" value="5">
+          </div>
+          <div class="field">
+            <label for="selectorK">Selector examples</label>
+            <input id="selectorK" type="number" min="0" value="0">
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="inverseFilter">Inverse filter</label>
+            <input id="inverseFilter" type="number" min="0" value="0">
+          </div>
+          <div class="field">
+            <label for="inverseRandomCandidates">Random add-ons</label>
+            <input id="inverseRandomCandidates" type="number" min="0" value="16">
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="inverseTargetValue">Inverse target</label>
+            <input id="inverseTargetValue" type="number" step="any" placeholder="auto">
+          </div>
+          <div class="field">
+            <label for="inverseTargetMultiplier">Auto target multiplier</label>
+            <input id="inverseTargetMultiplier" type="number" step="0.05" value="1.2">
+          </div>
+        </div>
+        <div class="field">
+          <label for="inverseDesignCount">Inverse proposals</label>
+          <input id="inverseDesignCount" type="number" min="1" max="10" value="3">
         </div>
         <div class="row">
           <div class="field">
@@ -1117,6 +1402,14 @@ INDEX_HTML = r"""<!doctype html>
       </section>
 
       <section class="panel">
+        <div class="toolbar" style="justify-content: space-between; margin-bottom: 12px;">
+          <h2 style="margin:0;">Inverse Design</h2>
+          <button id="inverseDesign">Generate Proposals</button>
+        </div>
+        <div id="inverseDesigns"></div>
+      </section>
+
+      <section class="panel">
         <h2>Observations</h2>
         <div id="observations"></div>
       </section>
@@ -1171,12 +1464,22 @@ INDEX_HTML = r"""<!doctype html>
 
     function payloadConfig() {
       return {
+        optimizer: $('optimizer').value,
         objective_name: $('objectiveName').value,
         objective_direction: $('objectiveDirection').value,
         acquisition: $('acquisition').value,
         embedding_model: $('embeddingModel').value,
         prediction_model: $('predictionModel').value,
         inverse_model: $('inverseModel').value,
+        prediction_system_message: $('predictionSystemMessage').value,
+        inverse_system_message: $('inverseSystemMessage').value,
+        llm_samples: Number($('llmSamples').value || 5),
+        selector_k: Number($('selectorK').value || 0),
+        inverse_filter: Number($('inverseFilter').value || 0),
+        inverse_random_candidates: Number($('inverseRandomCandidates').value || 16),
+        inverse_target_value: $('inverseTargetValue').value,
+        inverse_target_multiplier: Number($('inverseTargetMultiplier').value || 1.2),
+        inverse_design_count: Number($('inverseDesignCount').value || 3),
         batch_size: Number($('batchSize').value || 1),
         iterations_per_trial: Number($('iterationsPerTrial').value || 0),
         replicates_per_candidate: Number($('replicatesPerCandidate').value || 1),
@@ -1191,8 +1494,9 @@ INDEX_HTML = r"""<!doctype html>
     function render() {
       if (!state) return;
       const key = state.key_status.openai_configured;
-      $('keyStatus').textContent = key ? `OpenAI key set ${state.key_status.openai_hint}` : 'OpenAI key missing';
-      $('keyStatus').className = `chip ${key ? 'good' : 'warn'}`;
+      const keyCount = [state.key_status.openai_configured, state.key_status.openrouter_configured, state.key_status.anthropic_configured].filter(Boolean).length;
+      $('keyStatus').textContent = keyCount ? `${keyCount} API key${keyCount > 1 ? 's' : ''} set` : 'API keys missing';
+      $('keyStatus').className = `chip ${keyCount ? 'good' : 'warn'}`;
       $('datasetStatus').textContent = `${state.candidate_count} candidates`;
       $('datasetStatus').className = `chip ${state.candidate_count ? 'good' : 'warn'}`;
       $('observationStatus').textContent = `${state.observations.length} observations`;
@@ -1203,20 +1507,37 @@ INDEX_HTML = r"""<!doctype html>
       renderCandidateSelect();
       renderPlot();
       renderSuggestions();
+      renderInverseDesigns();
       renderObservations();
       renderMessages();
     }
 
     function renderConfig() {
       const config = state.config;
+      $('optimizer').value = config.optimizer;
       $('objectiveName').value = config.objective_name;
       $('objectiveOptions').innerHTML = (state.objective_names || [])
+        .map((name) => `<option value="${escapeHtml(name)}"></option>`)
+        .join('');
+      $('modelOptions').innerHTML = (state.model_presets || [])
+        .map((name) => `<option value="${escapeHtml(name)}"></option>`)
+        .join('');
+      $('embeddingModelOptions').innerHTML = (state.embedding_model_presets || [])
         .map((name) => `<option value="${escapeHtml(name)}"></option>`)
         .join('');
       $('objectiveDirection').value = config.objective_direction;
       $('embeddingModel').value = config.embedding_model;
       $('predictionModel').value = config.prediction_model;
       $('inverseModel').value = config.inverse_model;
+      $('predictionSystemMessage').value = config.prediction_system_message;
+      $('inverseSystemMessage').value = config.inverse_system_message;
+      $('llmSamples').value = config.llm_samples;
+      $('selectorK').value = config.selector_k;
+      $('inverseFilter').value = config.inverse_filter;
+      $('inverseRandomCandidates').value = config.inverse_random_candidates;
+      $('inverseTargetValue').value = config.inverse_target_value;
+      $('inverseTargetMultiplier').value = config.inverse_target_multiplier;
+      $('inverseDesignCount').value = config.inverse_design_count;
       $('batchSize').value = config.batch_size;
       $('iterationsPerTrial').value = config.iterations_per_trial;
       $('replicatesPerCandidate').value = config.replicates_per_candidate;
@@ -1322,6 +1643,31 @@ INDEX_HTML = r"""<!doctype html>
       });
     }
 
+    function renderInverseDesigns() {
+      const designs = state.inverse_designs || [];
+      if (!designs.length) {
+        $('inverseDesigns').innerHTML = '<div class="empty">No inverse designs</div>';
+        return;
+      }
+      $('inverseDesigns').innerHTML = `<div class="scroll"><table>
+        <thead><tr><th>Proposal</th><th>Target</th><th>Model</th><th></th></tr></thead>
+        <tbody>${designs.map((design, idx) => `<tr>
+          <td class="procedure">${escapeHtml(design.procedure)}</td>
+          <td>${fmt(design.target)}</td>
+          <td>${escapeHtml(design.model || '')}</td>
+          <td><button data-inverse-use="${idx}">Use</button></td>
+        </tr>`).join('')}</tbody>
+      </table></div>`;
+      document.querySelectorAll('[data-inverse-use]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const design = designs[Number(button.dataset.inverseUse)];
+          $('candidateSelect').value = '';
+          $('manualProcedure').value = design ? design.procedure : '';
+          $('objectiveValue').focus();
+        });
+      });
+    }
+
     function renderObservations() {
       const observations = state.observations || [];
       if (!observations.length) {
@@ -1370,11 +1716,13 @@ INDEX_HTML = r"""<!doctype html>
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           openai_api_key: $('openaiKey').value,
-          openrouter_api_key: $('openrouterKey').value
+          openrouter_api_key: $('openrouterKey').value,
+          anthropic_api_key: $('anthropicKey').value
         })
       });
       $('openaiKey').value = '';
       $('openrouterKey').value = '';
+      $('anthropicKey').value = '';
     });
 
     $('importDataset').addEventListener('click', async () => {
@@ -1419,6 +1767,21 @@ INDEX_HTML = r"""<!doctype html>
 
     $('suggest').addEventListener('click', updateSuggestions);
     $('suggestTop').addEventListener('click', updateSuggestions);
+    $('inverseDesign').addEventListener('click', async () => {
+      await request('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payloadConfig())
+      });
+      await request('/api/inverse-design', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          target_value: $('inverseTargetValue').value,
+          count: $('inverseDesignCount').value
+        })
+      });
+    });
     $('resetRun').addEventListener('click', () => request('/api/reset', { method: 'POST' }));
 
     refresh();

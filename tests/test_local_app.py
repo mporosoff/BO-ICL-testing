@@ -1,3 +1,4 @@
+from boicl import AskTellFewShotTopk, Pool
 from boicl.local_app import LocalBOState, _best_trace, _coerce_float
 
 
@@ -65,3 +66,36 @@ def test_float_coercion_rejects_empty_and_nonfinite():
     assert _coerce_float("1.5") == 1.5
     assert _coerce_float("") is None
     assert _coerce_float("nan") is None
+
+
+def test_browser_config_tracks_llm_and_inverse_models(tmp_path):
+    state = LocalBOState(tmp_path)
+
+    payload = state.update_config(
+        {
+            "optimizer": "llm",
+            "prediction_model": "gpt-4o-mini",
+            "inverse_model": "openrouter/mistralai/mistral-7b-instruct:free",
+            "llm_samples": 3,
+            "inverse_filter": 4,
+        }
+    )
+
+    assert payload["config"]["optimizer"] == "llm"
+    assert payload["config"]["prediction_model"] == "gpt-4o-mini"
+    assert payload["config"]["inverse_model"].startswith("openrouter/")
+    assert payload["config"]["llm_samples"] == 3
+    assert payload["config"]["inverse_filter"] == 4
+
+
+def test_fewshot_can_use_separate_inverse_model():
+    asktell = AskTellFewShotTopk(model="gpt-4o-mini", inverse_model="gpt-4o")
+
+    assert asktell._model == "gpt-4o-mini"
+    assert asktell._inverse_model == "gpt-4o"
+
+
+def test_pool_keeps_embedding_model_setting():
+    pool = Pool(["a", "b"], embedding_model="text-embedding-3-small")
+
+    assert pool.embedding_model == "text-embedding-3-small"

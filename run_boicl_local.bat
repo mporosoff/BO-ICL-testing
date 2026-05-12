@@ -42,17 +42,20 @@ if errorlevel 1 goto :pip_failed
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$envPath = '.env';" ^
   "$content = if (Test-Path $envPath) { Get-Content -Raw $envPath } else { '' };" ^
-  "if ($content -notmatch '(?m)^OPENAI_API_KEY=.+') {" ^
-  "  $secure = Read-Host 'Paste OPENAI_API_KEY (hidden; press Enter to skip)' -AsSecureString;" ^
-  "  $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure);" ^
-  "  try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) };" ^
-  "  if ($plain) {" ^
-  "    if ($content -match '(?m)^OPENAI_API_KEY=.*$') { $content = [regex]::Replace($content, '(?m)^OPENAI_API_KEY=.*$', ('OPENAI_API_KEY=' + $plain)) }" ^
-  "    else { $content = $content.TrimEnd() + \"`r`nOPENAI_API_KEY=$plain`r`n\" };" ^
-  "    Set-Content -Path $envPath -Value $content -NoNewline;" ^
-  "    Write-Host 'Saved OPENAI_API_KEY to local .env';" ^
+  "function Save-Key($name) {" ^
+  "  if ($content -notmatch ('(?m)^' + [regex]::Escape($name) + '=.+')) {" ^
+  "    $secure = Read-Host ('Paste ' + $name + ' (hidden; press Enter to skip)') -AsSecureString;" ^
+  "    $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure);" ^
+  "    try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) };" ^
+  "    if ($plain) {" ^
+  "      if ($script:content -match ('(?m)^' + [regex]::Escape($name) + '=.*$')) { $script:content = [regex]::Replace($script:content, ('(?m)^' + [regex]::Escape($name) + '=.*$'), ($name + '=' + $plain)) }" ^
+  "      else { $script:content = $script:content.TrimEnd() + \"`r`n$name=$plain`r`n\" };" ^
+  "      Set-Content -Path $envPath -Value $script:content -NoNewline;" ^
+  "      Write-Host ('Saved ' + $name + ' to local .env');" ^
+  "    }" ^
   "  }" ^
-  "}"
+  "};" ^
+  "Save-Key 'OPENAI_API_KEY'; Save-Key 'OPENROUTER_API_KEY'; Save-Key 'ANTHROPIC_API_KEY';"
 
 echo.
 echo Starting browser app...

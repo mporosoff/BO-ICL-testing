@@ -100,6 +100,7 @@ class AskTellFewShot:
         suffix: Optional[str] = None,
         prefix: Optional[str] = None,
         model: str = "gpt-3.5-turbo",
+        inverse_model: Optional[str] = None,
         temperature: Optional[float] = None,
         x_formatter: Callable[[str], str] = lambda x: x,
         y_formatter: Callable[[float], str] = lambda y: f"{y:0.2f}",
@@ -143,6 +144,7 @@ class AskTellFewShot:
         self._prefix = prefix
         self._suffix = suffix
         self._model = model
+        self._inverse_model = inverse_model or model
         self._example_count = 0
         self._temperature = temperature
         self._k = k
@@ -205,7 +207,7 @@ class AskTellFewShot:
             y=self.format_y(y), y_name=self._y_name, x_name=self._x_name
         )
         if self.inv_llm is None:
-            self.inv_llm = self._setup_inv_llm(self._model, self._temperature)
+            self.inv_llm = self._setup_inv_llm(self._inverse_model, self._temperature)
         x, tokens = self._inv_predict(query, system_message=system_message)
 
         return x[0]
