@@ -113,6 +113,11 @@ def get_llm(
 ):
     openai_models = ["davinci-002", "gpt-3.5-turbo-instruct"]
     chatopenai_models = [
+        "gpt-5.1",
+        "gpt-5",
+        "gpt-5-mini",
+        "gpt-5-nano",
+        "gpt-4.1",
         "gpt-4",
         "gpt-3.5-turbo",
         "gpt-4-turbo-preview",
@@ -129,6 +134,11 @@ def get_llm(
         "mistralai/Mixtral-8x7B-Instruct-v0.1",
     ]
     anthropic_models = [
+        "claude-opus-4-1-20250805",
+        "claude-opus-4-20250514",
+        "claude-sonnet-4-20250514",
+        "claude-3-7-sonnet-20250219",
+        "claude-3-5-haiku-20241022",
         "claude-3-haiku-20240307",
         "claude-3-5-sonnet-20240620",
         "claude-3-opus-20240229",
@@ -442,7 +452,7 @@ class AnthropicLLM(LLM):
         )
 
         return ChatAnthropic(
-            model="claude-3-haiku-20240307",
+            model=self.model_name,
             temperature=self.temperature,
             top_p=self.top_p,
             max_tokens=self.max_tokens,

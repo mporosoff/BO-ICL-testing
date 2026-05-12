@@ -44,16 +44,21 @@ ACQUISITION_FUNCTIONS = [
 
 
 MODEL_PRESETS = [
+    "gpt-5.1",
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5-nano",
+    "gpt-4.1",
     "gpt-4o",
     "gpt-4o-mini",
-    "gpt-4-turbo-preview",
-    "gpt-4",
-    "gpt-3.5-turbo",
-    "gpt-3.5-turbo-instruct",
     "openrouter/mistralai/mistral-7b-instruct:free",
     "openrouter/meta-llama/llama-3.1-8b-instruct:free",
+    "claude-opus-4-1-20250805",
+    "claude-opus-4-20250514",
+    "claude-sonnet-4-20250514",
+    "claude-3-7-sonnet-20250219",
+    "claude-3-5-haiku-20241022",
     "claude-3-haiku-20240307",
-    "claude-3-5-sonnet-20240620",
 ]
 
 

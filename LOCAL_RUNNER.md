@@ -81,6 +81,12 @@ independent settings. OpenAI model names use `OPENAI_API_KEY`, `openrouter/...`
 model names use `OPENROUTER_API_KEY`, and `claude-...` model names use
 `ANTHROPIC_API_KEY`.
 
+The model dropdowns are presets, not a hard limit. You can type another provider
+model string if the installed SDK and your API account support it. Avoid older
+legacy presets such as GPT-3.5 or GPT-4 Turbo Preview for new runs; use GPT-5.1,
+GPT-5 mini/nano, GPT-4.1, GPT-4o/mini, or current Claude 4/3.7/3.5 Haiku models
+instead.
+
 The `Inverse Design` panel can generate free-form proposals from the labeled
 examples and the active objective target. Use those proposals directly as manual
 procedures, or use `Inverse filter` to turn inverse-design output into ranked
