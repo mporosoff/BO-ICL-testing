@@ -47,7 +47,13 @@ DEFAULT_CONFIG = {
     "objective_name": "objective",
     "objective_direction": "maximize",
     "acquisition": "upper_confidence_bound",
+    "embedding_model": "text-embedding-ada-002",
+    "prediction_model": "gpt-4o",
+    "inverse_model": "gpt-4o",
     "batch_size": 1,
+    "iterations_per_trial": 0,
+    "replicates_per_candidate": 1,
+    "random_replicates": 25,
     "ucb_lambda": 0.5,
     "score_limit": 250,
     "n_neighbors": 5,
@@ -100,16 +106,60 @@ def _clean_procedures(df: pd.DataFrame) -> List[str]:
 def _best_trace(observations: List[Dict[str, Any]], direction: str) -> List[Dict[str, Any]]:
     best = None
     trace = []
-    for index, obs in enumerate(observations, start=1):
+    plotted = 0
+    for obs in observations:
         value = obs["value"]
+        if value is None:
+            continue
+        plotted += 1
         if best is None:
             best = value
         elif direction == "minimize":
             best = min(best, value)
         else:
             best = max(best, value)
-        trace.append({"index": index, "value": value, "best": best})
+        trace.append({"index": plotted, "value": value, "best": best})
     return trace
+
+
+def _random_walk_trace(
+    observations: List[Dict[str, Any]], direction: str, replicates: int
+) -> List[Dict[str, Any]]:
+    values = [obs["value"] for obs in observations if obs["value"] is not None]
+    if len(values) < 2 or replicates <= 0:
+        return []
+    traces = []
+    for _ in range(replicates):
+        shuffled = list(values)
+        random.shuffle(shuffled)
+        traces.append(_best_trace([{"value": value} for value in shuffled], direction))
+    out = []
+    for index in range(len(values)):
+        out.append(
+            {
+                "index": index + 1,
+                "best": float(np.mean([trace[index]["best"] for trace in traces])),
+            }
+        )
+    return out
+
+
+def _safe_cache_fragment(value: str) -> str:
+    return "".join(ch if ch.isalnum() else "_" for ch in value).strip("_") or "default"
+
+
+def _is_uncertainty_column(column: Any) -> bool:
+    name = str(column).lower()
+    return any(token in name for token in ["uncert", "std", "stdev", "sigma", "error"])
+
+
+def _numeric_columns(df: pd.DataFrame, columns: List[Any]) -> List[Any]:
+    numeric = []
+    for column in columns:
+        values = pd.to_numeric(df[column], errors="coerce")
+        if values.notna().any():
+            numeric.append(column)
+    return numeric
 
 
 def _load_env_file(env_path: Path) -> None:
@@ -146,6 +196,7 @@ def _write_env_value(env_path: Path, key: str, value: str) -> None:
 class LocalBOState:
     root: Path
     config: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_CONFIG))
+    objective_names: List[str] = field(default_factory=lambda: ["objective"])
     candidates: List[Dict[str, Any]] = field(default_factory=list)
     observations: List[Dict[str, Any]] = field(default_factory=list)
     suggestions: List[Dict[str, Any]] = field(default_factory=list)
@@ -157,12 +208,15 @@ class LocalBOState:
         self.lock = threading.RLock()
         self.env_path = self.root / ".env"
         self.cache_dir = self.root / ".cache"
-        self.embedding_cache_path = self.cache_dir / "boicl_embeddings.csv"
         _load_env_file(self.env_path)
 
     def log(self, message: str) -> None:
         self.events.insert(0, {"time": _now(), "message": message})
         self.events = self.events[:20]
+
+    def embedding_cache_path(self) -> Path:
+        fragment = _safe_cache_fragment(self.config["embedding_model"])
+        return self.cache_dir / f"boicl_embeddings_{fragment}.csv"
 
     def key_status(self) -> Dict[str, Any]:
         key = os.environ.get("OPENAI_API_KEY", "")
@@ -175,51 +229,109 @@ class LocalBOState:
 
     def to_json(self) -> Dict[str, Any]:
         with self.lock:
+            active_observations = self.active_observations()
+            available_candidates = self.available_candidates()
             return {
                 "config": self.config,
+                "objective_names": self.objective_names,
                 "key_status": self.key_status(),
                 "candidates": self.candidates[:500],
                 "candidate_count": len(self.candidates),
-                "available_count": len(self.available_candidates()),
+                "available_candidates": available_candidates[:500],
+                "available_count": len(available_candidates),
                 "observations": self.observations,
                 "suggestions": self.suggestions,
                 "events": self.events,
                 "last_error": self.last_error,
                 "last_model_status": self.last_model_status,
                 "best_trace": _best_trace(
-                    self.observations, self.config["objective_direction"]
+                    active_observations, self.config["objective_direction"]
+                ),
+                "random_walk_trace": _random_walk_trace(
+                    active_observations,
+                    self.config["objective_direction"],
+                    int(self.config["random_replicates"]),
                 ),
                 "acquisition_functions": ACQUISITION_FUNCTIONS,
             }
 
-    def available_candidates(self) -> List[Dict[str, Any]]:
-        evaluated_ids = {obs.get("candidate_id") for obs in self.observations}
-        evaluated_procs = {obs["procedure"] for obs in self.observations}
+    def active_observations(self) -> List[Dict[str, Any]]:
+        objective = self.config["objective_name"]
         return [
-            cand
-            for cand in self.candidates
-            if cand["id"] not in evaluated_ids and cand["procedure"] not in evaluated_procs
+            obs
+            for obs in self.observations
+            if obs.get("objectives", {}).get(objective) is not None
         ]
 
+    def refresh_active_objective(self) -> None:
+        objective = self.config["objective_name"]
+        for obs in self.observations:
+            value = obs.get("objectives", {}).get(objective)
+            uncertainty = obs.get("uncertainties", {}).get(objective)
+            obs["value"] = value
+            obs["uncertainty"] = uncertainty
+            obs["target"] = self.target_value(value) if value is not None else None
+
+    def available_candidates(self) -> List[Dict[str, Any]]:
+        max_replicates = max(1, int(self.config["replicates_per_candidate"]))
+        counts: Dict[str, int] = {}
+        for obs in self.active_observations():
+            key = obs.get("candidate_id") or obs["procedure"]
+            counts[key] = counts.get(key, 0) + 1
+        available = []
+        for cand in self.candidates:
+            count = counts.get(cand["id"], counts.get(cand["procedure"], 0))
+            if count < max_replicates:
+                available.append(cand)
+        return available
+
     def target_value(self, value: float) -> float:
+        if value is None:
+            return None
         return -value if self.config["objective_direction"] == "minimize" else value
 
     def display_value(self, value: float) -> float:
+        if value is None:
+            return None
         return -value if self.config["objective_direction"] == "minimize" else value
 
     def import_dataset(self, filename: str, raw: bytes) -> Dict[str, Any]:
         df = _read_table_from_bytes(filename, raw)
         _clean_procedures(df)
         first_col = df.columns[0]
+        data_columns = list(df.columns[1:])
+        value_columns = _numeric_columns(
+            df, [column for column in data_columns if not _is_uncertainty_column(column)]
+        )
+        uncertainty_columns = _numeric_columns(
+            df, [column for column in data_columns if _is_uncertainty_column(column)]
+        )
+        uncertainty_by_objective: Dict[str, Any] = {}
+        for uncertainty_column in uncertainty_columns:
+            uncertainty_name = str(uncertainty_column).lower()
+            matches = [
+                column
+                for column in value_columns
+                if str(column).lower() in uncertainty_name
+            ]
+            if len(matches) == 1:
+                uncertainty_by_objective[str(matches[0])] = uncertainty_column
+            elif len(value_columns) == 1:
+                uncertainty_by_objective[str(value_columns[0])] = uncertainty_column
+
         with self.lock:
             self.candidates = []
             self.observations = []
             self.suggestions = []
             self.last_error = None
             self.last_model_status = "Dataset loaded. Add observations to train GPR."
+            if value_columns:
+                self.objective_names = [str(column) for column in value_columns]
+                if self.config["objective_name"] not in self.objective_names:
+                    self.config["objective_name"] = self.objective_names[0]
+            else:
+                self.objective_names = [self.config["objective_name"]]
 
-            value_col = df.columns[1] if len(df.columns) > 1 else None
-            unc_col = df.columns[2] if len(df.columns) > 2 else None
             for row_index, row in df.iterrows():
                 if pd.isna(row[first_col]) or not str(row[first_col]).strip():
                     continue
@@ -230,17 +342,27 @@ class LocalBOState:
                     "procedure": procedure,
                 }
                 self.candidates.append(candidate)
-                if value_col is not None:
-                    value = _coerce_float(row[value_col])
-                    if value is None:
-                        continue
-                    uncertainty = _coerce_float(row[unc_col]) if unc_col is not None else None
+                objectives = {
+                    str(column): _coerce_float(row[column]) for column in value_columns
+                }
+                objectives = {
+                    key: value for key, value in objectives.items() if value is not None
+                }
+                uncertainties = {
+                    objective: _coerce_float(row[uncertainty_column])
+                    for objective, uncertainty_column in uncertainty_by_objective.items()
+                }
+                uncertainties = {
+                    key: value for key, value in uncertainties.items() if value is not None
+                }
+                if objectives:
                     self._add_observation_locked(
                         procedure,
-                        value,
-                        uncertainty,
+                        objectives,
+                        uncertainties,
                         candidate_id=candidate["id"],
                     )
+            self.refresh_active_objective()
             self.log(
                 f"Imported {len(self.candidates)} candidates from {Path(filename).name}."
             )
@@ -256,6 +378,9 @@ class LocalBOState:
                 value = payload[key]
                 if key in {
                     "batch_size",
+                    "iterations_per_trial",
+                    "replicates_per_candidate",
+                    "random_replicates",
                     "score_limit",
                     "n_neighbors",
                     "n_components",
@@ -274,9 +399,19 @@ class LocalBOState:
                 else "maximize"
             )
             self.config["batch_size"] = max(1, min(25, int(self.config["batch_size"])))
+            self.config["iterations_per_trial"] = max(
+                0, int(self.config["iterations_per_trial"])
+            )
+            self.config["replicates_per_candidate"] = max(
+                1, int(self.config["replicates_per_candidate"])
+            )
+            self.config["random_replicates"] = max(0, int(self.config["random_replicates"]))
             self.config["score_limit"] = max(1, int(self.config["score_limit"]))
             self.config["n_neighbors"] = max(1, int(self.config["n_neighbors"]))
             self.config["n_components"] = max(1, int(self.config["n_components"]))
+            if self.config["objective_name"] not in self.objective_names:
+                self.objective_names.append(self.config["objective_name"])
+            self.refresh_active_objective()
             self.log("Updated run settings.")
             return self.to_json()
 
@@ -295,7 +430,16 @@ class LocalBOState:
             raise ValueError("Objective value must be numeric.")
         uncertainty = _coerce_float(payload.get("uncertainty"))
         with self.lock:
-            self._add_observation_locked(procedure, value, uncertainty, candidate_id)
+            objective = self.config["objective_name"]
+            if objective not in self.objective_names:
+                self.objective_names.append(objective)
+            self._add_observation_locked(
+                procedure,
+                {objective: value},
+                {objective: uncertainty} if uncertainty is not None else {},
+                candidate_id,
+            )
+            self.refresh_active_objective()
             self.suggestions = []
             self.last_error = None
             self.last_model_status = "Observation added. Suggestions need an update."
@@ -305,8 +449,8 @@ class LocalBOState:
     def _add_observation_locked(
         self,
         procedure: str,
-        value: float,
-        uncertainty: Optional[float],
+        objectives: Dict[str, float],
+        uncertainties: Dict[str, float],
         candidate_id: Optional[str] = None,
     ) -> None:
         if candidate_id is None:
@@ -315,13 +459,20 @@ class LocalBOState:
                 None,
             )
             candidate_id = match["id"] if match else None
+        objective = self.config["objective_name"]
+        value = objectives.get(objective)
+        uncertainty = uncertainties.get(objective)
         self.observations.append(
             {
                 "id": f"obs-{len(self.observations) + 1}",
                 "candidate_id": candidate_id,
                 "procedure": procedure,
-                "value": float(value),
-                "target": float(self.target_value(value)),
+                "objectives": {key: float(val) for key, val in objectives.items()},
+                "uncertainties": {
+                    key: float(val) for key, val in uncertainties.items() if val is not None
+                },
+                "value": float(value) if value is not None else None,
+                "target": float(self.target_value(value)) if value is not None else None,
                 "uncertainty": uncertainty,
                 "time": _now(),
             }
@@ -330,6 +481,12 @@ class LocalBOState:
     def suggest(self) -> Dict[str, Any]:
         with self.lock:
             self.last_error = None
+            active_observations = self.active_observations()
+            iteration_cap = int(self.config["iterations_per_trial"])
+            if iteration_cap and len(active_observations) >= iteration_cap:
+                self.suggestions = []
+                self.last_model_status = "Iteration cap reached."
+                return self.to_json()
             available = self.available_candidates()
             if not available:
                 self.suggestions = []
@@ -340,15 +497,19 @@ class LocalBOState:
                 self.last_model_status = "OpenAI API key missing. Showing random candidates."
                 self.log("Add OPENAI_API_KEY to enable embeddings and GPR.")
                 return self.to_json()
-            if len(self.observations) < 2:
+            if len(active_observations) < 2:
                 self.suggestions = self._random_suggestions(available)
                 self.last_model_status = "Add at least 2 observations before GPR suggestions."
+                return self.to_json()
+            if len(self._training_observations()) < 2:
+                self.suggestions = self._random_suggestions(available)
+                self.last_model_status = "Add at least 2 unique procedures before GPR suggestions."
                 return self.to_json()
 
             try:
                 self.suggestions = self._gpr_suggestions(available)
                 self.last_model_status = (
-                    f"Updated GPR on {len(self.observations)} observations."
+                    f"Updated GPR on {len(active_observations)} observations."
                 )
                 self.log(f"Updated suggestions with {self.config['acquisition']}.")
             except Exception as exc:  # pragma: no cover - needs live API/GPR deps
@@ -385,20 +546,26 @@ class LocalBOState:
         from boicl import AskTellGPR
 
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        n_obs = len(self.observations)
+        active_observations = self._training_observations()
+        n_obs = len(active_observations)
         n_neighbors = min(self.config["n_neighbors"], max(1, n_obs - 1))
         n_components = min(self.config["n_components"], max(1, n_obs - 1))
         model = AskTellGPR(
-            cache_path=str(self.embedding_cache_path),
+            cache_path=str(self.embedding_cache_path()),
+            embedding_model=self.config["embedding_model"],
             n_neighbors=n_neighbors,
             n_components=n_components,
             y_name=self.config["objective_name"],
             y_formatter=lambda y: f"{float(y):0.6g}",
         )
 
-        for obs in self.observations[:-1]:
+        for obs in active_observations[:-1]:
             model.tell(obs["procedure"], obs["target"], train=False)
-        model.tell(self.observations[-1]["procedure"], self.observations[-1]["target"], train=True)
+        model.tell(
+            active_observations[-1]["procedure"],
+            active_observations[-1]["target"],
+            train=True,
+        )
 
         subset = self._candidate_subset(available)
         procedures = [cand["procedure"] for cand in subset]
@@ -410,7 +577,7 @@ class LocalBOState:
             _lambda=self.config["ucb_lambda"],
         )
         if hasattr(model, "save_cache"):
-            model.save_cache(str(self.embedding_cache_path))
+            model.save_cache(str(self.embedding_cache_path()))
 
         selected, acquisition, means = raw[:3]
         stds = raw[3] if len(raw) > 3 else [None] * len(selected)
@@ -427,6 +594,24 @@ class LocalBOState:
             for procedure, aq, mean, std in zip(selected, acquisition, means, stds)
         ]
 
+    def _training_observations(self) -> List[Dict[str, Any]]:
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for obs in self.active_observations():
+            grouped.setdefault(obs["procedure"], []).append(obs)
+        rows = []
+        for procedure, obs_list in grouped.items():
+            targets = [obs["target"] for obs in obs_list if obs["target"] is not None]
+            if not targets:
+                continue
+            rows.append(
+                {
+                    "procedure": procedure,
+                    "target": float(np.mean(targets)),
+                    "value": float(np.mean([obs["value"] for obs in obs_list])),
+                }
+            )
+        return rows
+
     def reset_run(self) -> Dict[str, Any]:
         with self.lock:
             self.observations = []
@@ -439,21 +624,23 @@ class LocalBOState:
     def export_observations_csv(self) -> str:
         with self.lock:
             out = StringIO()
+            objective_fields = []
+            for name in self.objective_names:
+                objective_fields.extend([name, f"{name}_uncertainty"])
             writer = csv.DictWriter(
                 out,
-                fieldnames=["procedure", "value", "uncertainty", "time"],
+                fieldnames=["procedure", *objective_fields, "time"],
                 lineterminator="\n",
             )
             writer.writeheader()
             for obs in self.observations:
-                writer.writerow(
-                    {
-                        "procedure": obs["procedure"],
-                        "value": obs["value"],
-                        "uncertainty": "" if obs["uncertainty"] is None else obs["uncertainty"],
-                        "time": obs["time"],
-                    }
-                )
+                row = {"procedure": obs["procedure"], "time": obs["time"]}
+                for name in self.objective_names:
+                    row[name] = obs.get("objectives", {}).get(name, "")
+                    row[f"{name}_uncertainty"] = obs.get("uncertainties", {}).get(
+                        name, ""
+                    )
+                writer.writerow(row)
             return out.getvalue()
 
 
@@ -814,7 +1001,8 @@ INDEX_HTML = r"""<!doctype html>
         <h2>Settings</h2>
         <div class="field">
           <label for="objectiveName">Objective name</label>
-          <input id="objectiveName" value="objective">
+          <input id="objectiveName" value="objective" list="objectiveOptions">
+          <datalist id="objectiveOptions"></datalist>
         </div>
         <div class="row">
           <div class="field">
@@ -831,12 +1019,36 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="row">
           <div class="field">
+            <label for="embeddingModel">Embedding model</label>
+            <input id="embeddingModel" value="text-embedding-ada-002">
+          </div>
+          <div class="field">
+            <label for="predictionModel">Prediction LLM</label>
+            <input id="predictionModel" value="gpt-4o">
+          </div>
+        </div>
+        <div class="field">
+          <label for="inverseModel">Inverse design LLM</label>
+          <input id="inverseModel" value="gpt-4o">
+        </div>
+        <div class="row">
+          <div class="field">
             <label for="batchSize">Batch size</label>
             <input id="batchSize" type="number" min="1" max="25" value="1">
           </div>
           <div class="field">
             <label for="ucbLambda">UCB lambda</label>
             <input id="ucbLambda" type="number" step="0.1" value="0.5">
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="iterationsPerTrial">Iteration cap</label>
+            <input id="iterationsPerTrial" type="number" min="0" value="0">
+          </div>
+          <div class="field">
+            <label for="replicatesPerCandidate">Replicates</label>
+            <input id="replicatesPerCandidate" type="number" min="1" value="1">
           </div>
         </div>
         <div class="row">
@@ -848,6 +1060,10 @@ INDEX_HTML = r"""<!doctype html>
             <label for="nNeighbors">Neighbors</label>
             <input id="nNeighbors" type="number" min="1" value="5">
           </div>
+        </div>
+        <div class="field">
+          <label for="randomReplicates">Random baseline replicates</label>
+          <input id="randomReplicates" type="number" min="0" value="25">
         </div>
         <label class="switchline">
           <input id="autoSuggest" type="checkbox" checked>
@@ -958,7 +1174,13 @@ INDEX_HTML = r"""<!doctype html>
         objective_name: $('objectiveName').value,
         objective_direction: $('objectiveDirection').value,
         acquisition: $('acquisition').value,
+        embedding_model: $('embeddingModel').value,
+        prediction_model: $('predictionModel').value,
+        inverse_model: $('inverseModel').value,
         batch_size: Number($('batchSize').value || 1),
+        iterations_per_trial: Number($('iterationsPerTrial').value || 0),
+        replicates_per_candidate: Number($('replicatesPerCandidate').value || 1),
+        random_replicates: Number($('randomReplicates').value || 25),
         ucb_lambda: Number($('ucbLambda').value || 0.5),
         score_limit: Number($('scoreLimit').value || 250),
         n_neighbors: Number($('nNeighbors').value || 5),
@@ -988,8 +1210,17 @@ INDEX_HTML = r"""<!doctype html>
     function renderConfig() {
       const config = state.config;
       $('objectiveName').value = config.objective_name;
+      $('objectiveOptions').innerHTML = (state.objective_names || [])
+        .map((name) => `<option value="${escapeHtml(name)}"></option>`)
+        .join('');
       $('objectiveDirection').value = config.objective_direction;
+      $('embeddingModel').value = config.embedding_model;
+      $('predictionModel').value = config.prediction_model;
+      $('inverseModel').value = config.inverse_model;
       $('batchSize').value = config.batch_size;
+      $('iterationsPerTrial').value = config.iterations_per_trial;
+      $('replicatesPerCandidate').value = config.replicates_per_candidate;
+      $('randomReplicates').value = config.random_replicates;
       $('ucbLambda').value = config.ucb_lambda;
       $('scoreLimit').value = config.score_limit;
       $('nNeighbors').value = config.n_neighbors;
@@ -1004,8 +1235,7 @@ INDEX_HTML = r"""<!doctype html>
 
     function renderCandidateSelect() {
       const suggestions = state.suggestions || [];
-      const observed = new Set(state.observations.map((obs) => obs.candidate_id).filter(Boolean));
-      const candidates = (state.candidates || []).filter((cand) => !observed.has(cand.id)).slice(0, 500);
+      const candidates = (state.available_candidates || []).slice(0, 500);
       const options = ['<option value="">Manual procedure</option>'];
       suggestions.forEach((sug) => {
         options.push(`<option value="${escapeHtml(sug.candidate_id)}">Suggested: ${escapeHtml(sug.procedure.slice(0, 90))}</option>`);
@@ -1021,6 +1251,7 @@ INDEX_HTML = r"""<!doctype html>
     function renderPlot() {
       const host = $('plot');
       const trace = state.best_trace || [];
+      const randomTrace = state.random_walk_trace || [];
       if (!trace.length) {
         host.innerHTML = '<div class="empty" style="margin: 18px;">No observations yet</div>';
         return;
@@ -1029,17 +1260,19 @@ INDEX_HTML = r"""<!doctype html>
       const width = Math.max(560, host.clientWidth || 760);
       const height = 280;
       const pad = { left: 52, right: 22, top: 22, bottom: 42 };
-      const values = obs.flatMap((item) => {
+      const activeObs = obs.filter((item) => item.value !== null && item.value !== undefined);
+      const values = activeObs.flatMap((item) => {
         const unc = Number(item.uncertainty || 0);
         return [item.value - unc, item.value + unc, item.value];
-      }).concat(trace.map((item) => item.best));
+      }).concat(trace.map((item) => item.best), randomTrace.map((item) => item.best));
       let minY = Math.min(...values);
       let maxY = Math.max(...values);
       if (minY === maxY) { minY -= 1; maxY += 1; }
       const x = (i) => pad.left + ((i - 1) / Math.max(1, trace.length - 1)) * (width - pad.left - pad.right);
       const y = (value) => pad.top + (1 - ((value - minY) / (maxY - minY))) * (height - pad.top - pad.bottom);
       const bestPath = trace.map((item, idx) => `${idx ? 'L' : 'M'} ${x(item.index).toFixed(1)} ${y(item.best).toFixed(1)}`).join(' ');
-      const points = obs.map((item, idx) => {
+      const randomPath = randomTrace.map((item, idx) => `${idx ? 'L' : 'M'} ${x(item.index).toFixed(1)} ${y(item.best).toFixed(1)}`).join(' ');
+      const points = activeObs.map((item, idx) => {
         const cx = x(idx + 1);
         const cy = y(item.value);
         const unc = Number(item.uncertainty || 0);
@@ -1056,6 +1289,7 @@ INDEX_HTML = r"""<!doctype html>
         ${ticks}
         <line x1="${pad.left}" x2="${width - pad.right}" y1="${height - pad.bottom}" y2="${height - pad.bottom}" stroke="#cfd6e2" />
         <line x1="${pad.left}" x2="${pad.left}" y1="${pad.top}" y2="${height - pad.bottom}" stroke="#cfd6e2" />
+        ${randomPath ? `<path d="${randomPath}" fill="none" stroke="#b45309" stroke-width="2" stroke-dasharray="6 5" />` : ''}
         <path d="${bestPath}" fill="none" stroke="#0f766e" stroke-width="3" />
         ${points}
         <text x="${width / 2 - 28}" y="${height - 10}">experiment</text>

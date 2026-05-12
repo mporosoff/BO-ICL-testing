@@ -25,13 +25,20 @@ from openai import OpenAI
 
 class AskTellGPR(AskTellFewShot):
     def __init__(
-        self, n_components=32, pool=None, cache_path=None, n_neighbors=5, **kwargs
+        self,
+        n_components=32,
+        pool=None,
+        cache_path=None,
+        n_neighbors=5,
+        embedding_model="text-embedding-ada-002",
+        **kwargs,
     ):
         super().__init__(**kwargs)
         self._selector_k = None  # Forcing exemple_selector to not build context
         self._set_regressor()
         self.examples = []
-        self._embedding = OpenAIEmbeddings()
+        self.embedding_model = embedding_model
+        self._embedding = OpenAIEmbeddings(model=self.embedding_model)
         self._embeddings_cache = self._get_cache(cache_path)
         self.isomap = Isomap(n_components=n_components, n_neighbors=n_neighbors)
         self.pool = pool
@@ -47,10 +54,12 @@ class AskTellGPR(AskTellFewShot):
             cache = pd.read_csv(cache_path)
             if "embedding" in cache.columns:
                 cache["embedding"] = cache["embedding"].apply(self._parse_embedding)
+            if "embedding_model" not in cache.columns:
+                cache["embedding_model"] = self.embedding_model
             print(f"Loaded cache from {cache_path}.")
         except:
             print("Cached embeddings not found. Creating new cache table.")
-            cache = pd.DataFrame({"x": [], "embedding": []})
+            cache = pd.DataFrame({"x": [], "embedding": [], "embedding_model": []})
         return cache
 
     @staticmethod
@@ -83,7 +92,10 @@ class AskTellGPR(AskTellFewShot):
         Returns:
             List of embeddings corresponding to X.
         """
-        in_cache = self._embeddings_cache["x"].to_list()
+        model_cache = self._embeddings_cache[
+            self._embeddings_cache["embedding_model"] == self.embedding_model
+        ]
+        in_cache = model_cache["x"].to_list()
         not_in_cache = np.setdiff1d(X, in_cache).tolist()
 
         not_in_cache = [
@@ -106,7 +118,7 @@ class AskTellGPR(AskTellFewShot):
                 try:
                     response = client.embeddings.create(
                         input=batch,
-                        model="text-embedding-ada-002",
+                        model=self.embedding_model,
                         encoding_format="float",
                     )
 
@@ -121,7 +133,13 @@ class AskTellGPR(AskTellFewShot):
                 self._embeddings_cache = pd.concat(
                     [
                         self._embeddings_cache,
-                        pd.DataFrame({"x": not_in_cache, "embedding": new_embeddings}),
+                        pd.DataFrame(
+                            {
+                                "x": not_in_cache,
+                                "embedding": new_embeddings,
+                                "embedding_model": self.embedding_model,
+                            }
+                        ),
                     ],
                     ignore_index=True,
                 )
@@ -131,9 +149,10 @@ class AskTellGPR(AskTellFewShot):
 
         embedding = []
         for xi in X:
-            result = self._embeddings_cache[self._embeddings_cache["x"] == xi][
-                "embedding"
-            ].to_list()
+            result = self._embeddings_cache[
+                (self._embeddings_cache["x"] == xi)
+                & (self._embeddings_cache["embedding_model"] == self.embedding_model)
+            ]["embedding"].to_list()
             if result:
                 embedding.append(result[0])
             else:
