@@ -13,7 +13,9 @@ The launcher:
 - starts `python -m boicl.local_app` and opens the browser.
 
 Secrets stay in `.env`, which is ignored by Git. Do not paste real API keys into
-tracked files.
+tracked files. Keys entered in the browser app are also saved to this local
+`.env` file. On startup, the app reloads `.env` and lets it override stale shell
+environment variables.
 
 ## Dataset Format
 
@@ -103,6 +105,11 @@ independent settings. OpenAI model names use `OPENAI_API_KEY`, `openrouter/...`
 model names use `OPENROUTER_API_KEY`, and `claude-...` model names use
 `ANTHROPIC_API_KEY`.
 
+BO-ICL LLM mode includes default materials-synthesis system messages for
+prediction and inverse design, so the package should not warn about missing
+system messages. Edit those messages in the browser if a campaign needs a more
+specific instruction, such as explicitly maximizing an alpha carbide phase.
+
 The model dropdowns are presets, not a hard limit. You can type another provider
 model string if the installed SDK and your API account support it. Avoid older
 legacy presets such as GPT-3.5 or GPT-4 Turbo Preview for new runs; use GPT-5.1,
@@ -152,6 +159,10 @@ The paper-style numerical defaults are `Initial random = 1`, `Batch size = 1`,
 `BO iterations = 30`, `Workflow replicates = 5`, and `UCB lambda = 0.1`. Model
 names default to currently supported models rather than retired paper-era model
 IDs.
+
+For BO-ICL LLM runs on large pools, keep `Score limit` moderate at first
+(`100-250`) so each iteration scores a manageable subset. Increase it toward the
+full pool size only when you are comfortable with the added runtime and API cost.
 
 Click `Run & Append` to add the current configuration to the plot. Change the
 model or acquisition settings and click `Run & Append` again to compare another

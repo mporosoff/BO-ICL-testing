@@ -69,6 +69,24 @@ EMBEDDING_MODEL_PRESETS = [
 ]
 
 
+DEFAULT_PREDICTION_SYSTEM_MESSAGE = (
+    "You are a materials synthesis and phase-optimization assistant. Use the "
+    "provided labeled examples to estimate the numeric objective for candidate "
+    "experimental procedures. Treat the objective name in the prompt as the "
+    "quantity to optimize. When the prompt asks for a numeric prediction, "
+    "return only the number without units or prose."
+)
+
+
+DEFAULT_INVERSE_SYSTEM_MESSAGE = (
+    "You are a materials synthesis and phase-optimization assistant. Use the "
+    "provided examples and target objective value to propose realistic "
+    "experimental procedures in the same style as the dataset. Keep proposals "
+    "specific, physically plausible, and compatible with the described "
+    "synthesis workflow."
+)
+
+
 DEFAULT_CONFIG = {
     "workflow_mode": "live",
     "optimizer": "gpr",
@@ -79,8 +97,8 @@ DEFAULT_CONFIG = {
     "embedding_model": "text-embedding-ada-002",
     "prediction_model": "gpt-4o",
     "inverse_model": "gpt-4o",
-    "prediction_system_message": "",
-    "inverse_system_message": "",
+    "prediction_system_message": DEFAULT_PREDICTION_SYSTEM_MESSAGE,
+    "inverse_system_message": DEFAULT_INVERSE_SYSTEM_MESSAGE,
     "llm_samples": 5,
     "selector_k": 0,
     "inverse_filter": 0,
@@ -354,7 +372,7 @@ def _required_key_name(model_name: str) -> str:
 
 def _load_env_file(env_path: Path) -> None:
     if load_dotenv is not None:
-        load_dotenv(env_path, override=False)
+        load_dotenv(env_path, override=True)
         return
     if not env_path.exists():
         return
@@ -362,10 +380,20 @@ def _load_env_file(env_path: Path) -> None:
         if not line.strip() or line.lstrip().startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip())
+        os.environ[key.strip()] = value.strip()
+
+
+def _clean_api_key_value(value: str, key_name: str) -> str:
+    cleaned = (value or "").strip().strip("'\"")
+    if "=" in cleaned:
+        maybe_key, maybe_value = cleaned.split("=", 1)
+        if maybe_key.strip() == key_name:
+            cleaned = maybe_value.strip().strip("'\"")
+    return cleaned
 
 
 def _write_env_value(env_path: Path, key: str, value: str) -> None:
+    value = _clean_api_key_value(value, key)
     env_path.parent.mkdir(parents=True, exist_ok=True)
     lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
     found = False
@@ -581,6 +609,15 @@ class LocalBOState:
             float(cand["objectives"][objective])
             for cand in self.labelled_candidates(objective)
         ]
+
+    def prediction_system_message(self) -> str:
+        return (
+            self.config.get("prediction_system_message")
+            or DEFAULT_PREDICTION_SYSTEM_MESSAGE
+        )
+
+    def inverse_system_message(self) -> str:
+        return self.config.get("inverse_system_message") or DEFAULT_INVERSE_SYSTEM_MESSAGE
 
     def save_campaign(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         with self.lock:
@@ -1139,8 +1176,8 @@ class LocalBOState:
             inv_filter=0,
             aug_random_filter=len(procedures),
             _lambda=self.config["ucb_lambda"],
-            system_message=self.config["prediction_system_message"],
-            inv_system_message=self.config["inverse_system_message"],
+            system_message=self.prediction_system_message(),
+            inv_system_message=self.inverse_system_message(),
         )
         selected, acquisition, means = raw[:3]
         by_proc = {cand["procedure"]: cand for cand in subset}
@@ -1191,7 +1228,7 @@ class LocalBOState:
     def _generate_inverse_text(self, model, scaler: Optional[Dict[str, float]] = None) -> str:
         return model.inv_predict(
             self._inverse_target_model_value(scaler),
-            system_message=self.config["inverse_system_message"],
+            system_message=self.inverse_system_message(),
         )
 
     def generate_inverse_designs(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1517,9 +1554,15 @@ class LocalAppHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/api/save-key":
                 payload = self._read_json()
-                key = (payload.get("openai_api_key") or "").strip()
-                openrouter_key = (payload.get("openrouter_api_key") or "").strip()
-                anthropic_key = (payload.get("anthropic_api_key") or "").strip()
+                key = _clean_api_key_value(
+                    payload.get("openai_api_key") or "", "OPENAI_API_KEY"
+                )
+                openrouter_key = _clean_api_key_value(
+                    payload.get("openrouter_api_key") or "", "OPENROUTER_API_KEY"
+                )
+                anthropic_key = _clean_api_key_value(
+                    payload.get("anthropic_api_key") or "", "ANTHROPIC_API_KEY"
+                )
                 if key:
                     _write_env_value(self.state.env_path, "OPENAI_API_KEY", key)
                     self.state.log("Saved OPENAI_API_KEY to local .env.")
@@ -2837,6 +2880,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
         <li>Click <code>Run & Append</code>. Change settings and click it again to compare another configuration.</li>
       </ol>
       <div class="callout">Paper-style numerical defaults are <code>Initial random = 1</code>, <code>Batch size = 1</code>, <code>BO iterations = 30</code>, <code>Workflow replicates = 5</code>, and <code>UCB lambda = 0.1</code>. Current model defaults use supported modern model IDs rather than retired paper-era model names.</div>
+      <p>For BO-ICL LLM runs on large pools, start with <code>Score limit</code> around 100-250 so each iteration samples and scores a manageable candidate subset. Increase it only when you want a more exhaustive but slower/costlier run.</p>
       <p>The plot shows the mean best-so-far trajectory and a +/- 1 standard deviation band. The dashed random baseline is the paper notebook's random-mean quantile expectation. Full-dataset guide lines mark the mean, 75th, 95th, 99th percentile, and maximum.</p>
     </section>
 
@@ -2866,6 +2910,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
           <tr><td>Replicates</td><td>Live-mode repeated measurements allowed for the same candidate before it is removed from the available pool.</td></tr>
           <tr><td>Workflow replicates</td><td>Offline benchmark repeated runs of the whole BO workflow for averaging and spread bands.</td></tr>
           <tr><td>API keys</td><td>Keys are written only to the local ignored <code>.env</code> file. OpenAI keys are required for embeddings and OpenAI LLMs; OpenRouter and Anthropic keys are only needed for those model families.</td></tr>
+          <tr><td>System messages</td><td>Default materials-synthesis prompts are provided for BO-ICL LLM prediction and inverse design. Edit them for a specific campaign if you want to name the phase or objective explicitly.</td></tr>
         </tbody>
       </table>
     </section>

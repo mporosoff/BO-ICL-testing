@@ -5,11 +5,15 @@ import numpy as np
 from boicl import AskTellFewShotTopk, Pool
 from boicl.local_app import (
     DEFAULT_CONFIG,
+    DEFAULT_PREDICTION_SYSTEM_MESSAGE,
     LocalBOState,
     _best_trace,
+    _clean_api_key_value,
     _coerce_float,
     _dataset_stats,
+    _load_env_file,
     _paper_random_trace,
+    _write_env_value,
 )
 
 
@@ -67,6 +71,7 @@ def test_defaults_match_paper_style_numeric_settings():
     assert DEFAULT_CONFIG["benchmark_iterations"] == 30
     assert DEFAULT_CONFIG["benchmark_replicates"] == 5
     assert DEFAULT_CONFIG["ucb_lambda"] == 0.1
+    assert DEFAULT_CONFIG["prediction_system_message"]
 
 
 def test_replicates_keep_candidate_available_until_limit(tmp_path):
@@ -172,6 +177,25 @@ def test_float_coercion_rejects_empty_and_nonfinite():
     assert _coerce_float("1.5") == 1.5
     assert _coerce_float("") is None
     assert _coerce_float("nan") is None
+
+
+def test_api_key_save_sanitizes_prefixed_values_and_load_overrides(tmp_path, monkeypatch):
+    env_path = tmp_path / ".env"
+    _write_env_value(env_path, "OPENAI_API_KEY", "OPENAI_API_KEY='sk-local'")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-stale")
+
+    _load_env_file(env_path)
+
+    assert _clean_api_key_value("OPENAI_API_KEY=sk-new", "OPENAI_API_KEY") == "sk-new"
+    assert env_path.read_text(encoding="utf-8").strip() == "OPENAI_API_KEY=sk-local"
+    assert __import__("os").environ["OPENAI_API_KEY"] == "sk-local"
+
+
+def test_blank_saved_system_message_falls_back_to_default(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.config["prediction_system_message"] = ""
+
+    assert state.prediction_system_message() == DEFAULT_PREDICTION_SYSTEM_MESSAGE
 
 
 def test_browser_config_tracks_llm_and_inverse_models(tmp_path):
