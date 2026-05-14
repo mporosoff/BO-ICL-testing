@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO, StringIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
@@ -73,6 +73,7 @@ DEFAULT_CONFIG = {
     "optimizer": "gpr",
     "objective_name": "objective",
     "objective_direction": "maximize",
+    "objective_scaling": "off",
     "acquisition": "upper_confidence_bound",
     "embedding_model": "text-embedding-ada-002",
     "prediction_model": "gpt-4o",
@@ -89,13 +90,32 @@ DEFAULT_CONFIG = {
     "batch_size": 1,
     "iterations_per_trial": 0,
     "replicates_per_candidate": 1,
-    "random_replicates": 25,
+    "benchmark_iterations": 20,
+    "benchmark_replicates": 5,
+    "benchmark_initial_points": 1,
+    "benchmark_seed": 0,
+    "random_replicates": 0,
     "ucb_lambda": 0.5,
     "score_limit": 250,
     "n_neighbors": 5,
     "n_components": 16,
     "auto_suggest": True,
 }
+
+
+BENCHMARK_COLORS = [
+    "#0f766e",
+    "#2563eb",
+    "#7c3aed",
+    "#b45309",
+    "#c2410c",
+    "#be123c",
+    "#047857",
+    "#4338ca",
+]
+
+
+SCALING_MODES = ["off", "auto", "minmax", "zscore"]
 
 
 def _now() -> str:
@@ -158,26 +178,105 @@ def _best_trace(observations: List[Dict[str, Any]], direction: str) -> List[Dict
     return trace
 
 
-def _random_walk_trace(
-    observations: List[Dict[str, Any]], direction: str, replicates: int
+def _paper_random_trace(
+    values: List[float], direction: str, steps: int, buckets: int = 100
 ) -> List[Dict[str, Any]]:
-    values = [obs["value"] for obs in observations if obs["value"] is not None]
-    if len(values) < 2 or replicates <= 0:
+    clean_values = [float(value) for value in values if value is not None]
+    if not clean_values or steps <= 0:
         return []
-    traces = []
-    for _ in range(replicates):
-        shuffled = list(values)
-        random.shuffle(shuffled)
-        traces.append(_best_trace([{"value": value} for value in shuffled], direction))
-    out = []
-    for index in range(len(values)):
-        out.append(
-            {
-                "index": index + 1,
-                "best": float(np.mean([trace[index]["best"] for trace in traces])),
-            }
-        )
-    return out
+    sign = -1.0 if direction == "minimize" else 1.0
+    series = pd.Series([sign * value for value in clean_values])
+    quantiles = [float(series.quantile(i / buckets)) for i in range(buckets + 1)]
+    trace = []
+    for sample_count in range(1, steps + 1):
+        expected = 0.0
+        for bucket in range(1, buckets + 1):
+            probability = (bucket**sample_count - (bucket - 1) ** sample_count) * (
+                (1 / buckets) ** sample_count
+            )
+            expected += ((quantiles[bucket - 1] + quantiles[bucket]) / 2) * probability
+        trace.append({"index": sample_count, "best": float(sign * expected)})
+    return trace
+
+
+def _dataset_stats(values: List[float]) -> List[Dict[str, Any]]:
+    clean_values = [float(value) for value in values if value is not None]
+    if not clean_values:
+        return []
+    series = pd.Series(clean_values)
+    stats = [
+        ("mean", float(series.mean())),
+        ("75%", float(series.quantile(0.75))),
+        ("95%", float(series.quantile(0.95))),
+        ("99%", float(series.quantile(0.99))),
+        ("max", float(series.max())),
+    ]
+    return [{"label": label, "value": value} for label, value in stats]
+
+
+def _target_value(value: float, direction: str) -> float:
+    return -value if direction == "minimize" else value
+
+
+def _display_value(value: float, direction: str) -> float:
+    return -value if direction == "minimize" else value
+
+
+def _target_scaler(values: List[float], direction: str, mode: str) -> Dict[str, float]:
+    mode = mode if mode in SCALING_MODES else "off"
+    directed = np.array([_target_value(float(value), direction) for value in values])
+    directed = directed[np.isfinite(directed)]
+    if directed.size < 2:
+        return {"mode": "off"}
+    span = float(np.max(directed) - np.min(directed))
+    if span <= 1e-12:
+        return {"mode": "off"}
+    if mode == "auto":
+        mode = "minmax" if span > 1.0 or float(np.max(np.abs(directed))) > 1.0 else "off"
+    if mode == "minmax":
+        return {"mode": "minmax", "min": float(np.min(directed)), "span": span}
+    if mode == "zscore":
+        std = float(np.std(directed))
+        if std <= 1e-12:
+            return {"mode": "off"}
+        return {"mode": "zscore", "mean": float(np.mean(directed)), "std": std}
+    return {"mode": "off"}
+
+
+def _scale_target(value: float, direction: str, scaler: Dict[str, float]) -> float:
+    target = _target_value(float(value), direction)
+    if scaler.get("mode") == "minmax":
+        return (target - scaler["min"]) / scaler["span"]
+    if scaler.get("mode") == "zscore":
+        return (target - scaler["mean"]) / scaler["std"]
+    return target
+
+
+def _unscale_target(value: float, direction: str, scaler: Dict[str, float]) -> float:
+    target = float(value)
+    if scaler.get("mode") == "minmax":
+        target = target * scaler["span"] + scaler["min"]
+    elif scaler.get("mode") == "zscore":
+        target = target * scaler["std"] + scaler["mean"]
+    return _display_value(target, direction)
+
+
+def _group_training_observations(
+    observations: List[Dict[str, Any]], direction: str, scaling_mode: str
+) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for obs in observations:
+        grouped.setdefault(obs["procedure"], []).append(obs)
+    rows = []
+    for procedure, obs_list in grouped.items():
+        values = [obs["value"] for obs in obs_list if obs.get("value") is not None]
+        if not values:
+            continue
+        rows.append({"procedure": procedure, "value": float(np.mean(values))})
+    scaler = _target_scaler([row["value"] for row in rows], direction, scaling_mode)
+    for row in rows:
+        row["target"] = float(_scale_target(row["value"], direction, scaler))
+    return rows, scaler
 
 
 def _safe_cache_fragment(value: str) -> str:
@@ -254,6 +353,7 @@ class LocalBOState:
     observations: List[Dict[str, Any]] = field(default_factory=list)
     suggestions: List[Dict[str, Any]] = field(default_factory=list)
     inverse_designs: List[Dict[str, Any]] = field(default_factory=list)
+    benchmark_runs: List[Dict[str, Any]] = field(default_factory=list)
     events: List[Dict[str, str]] = field(default_factory=list)
     last_error: Optional[str] = None
     last_model_status: str = "No dataset loaded."
@@ -283,36 +383,80 @@ class LocalBOState:
             "openai_hint": f"...{key[-4:]}" if len(key) > 8 else "",
         }
 
+    def public_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": candidate["id"],
+            "row": candidate["row"],
+            "procedure": candidate["procedure"],
+        }
+
     def to_json(self) -> Dict[str, Any]:
         with self.lock:
             active_observations = self.active_observations()
             available_candidates = self.available_candidates()
+            labelled_values = self.candidate_objective_values()
+            plot_steps = self.plot_horizon(len(active_observations))
             return {
                 "config": self.config,
                 "objective_names": self.objective_names,
                 "key_status": self.key_status(),
-                "candidates": self.candidates[:500],
+                "candidates": [
+                    self.public_candidate(candidate) for candidate in self.candidates[:500]
+                ],
                 "candidate_count": len(self.candidates),
-                "available_candidates": available_candidates[:500],
+                "label_count": len(labelled_values),
+                "available_candidates": [
+                    self.public_candidate(candidate)
+                    for candidate in available_candidates[:500]
+                ],
                 "available_count": len(available_candidates),
                 "observations": self.observations,
                 "suggestions": self.suggestions,
                 "inverse_designs": self.inverse_designs,
+                "benchmark_runs": self.benchmark_runs,
                 "events": self.events,
                 "last_error": self.last_error,
                 "last_model_status": self.last_model_status,
                 "best_trace": _best_trace(
                     active_observations, self.config["objective_direction"]
                 ),
-                "random_walk_trace": _random_walk_trace(
-                    active_observations,
+                "random_walk_trace": _paper_random_trace(
+                    labelled_values,
                     self.config["objective_direction"],
-                    int(self.config["random_replicates"]),
+                    plot_steps,
                 ),
+                "dataset_stats": _dataset_stats(labelled_values),
                 "acquisition_functions": ACQUISITION_FUNCTIONS,
                 "model_presets": MODEL_PRESETS,
                 "embedding_model_presets": EMBEDDING_MODEL_PRESETS,
+                "scaling_modes": SCALING_MODES,
             }
+
+    def plot_horizon(self, live_count: int = 0) -> int:
+        horizon = max(
+            live_count,
+            int(self.config["benchmark_initial_points"])
+            + int(self.config["benchmark_iterations"]),
+        )
+        for run in self.benchmark_runs:
+            for point in run.get("summary", []):
+                horizon = max(horizon, int(point.get("index", 0)))
+        return horizon
+
+    def labelled_candidates(self, objective: Optional[str] = None) -> List[Dict[str, Any]]:
+        objective = objective or self.config["objective_name"]
+        return [
+            cand
+            for cand in self.candidates
+            if cand.get("objectives", {}).get(objective) is not None
+        ]
+
+    def candidate_objective_values(self, objective: Optional[str] = None) -> List[float]:
+        objective = objective or self.config["objective_name"]
+        return [
+            float(cand["objectives"][objective])
+            for cand in self.labelled_candidates(objective)
+        ]
 
     def active_observations(self) -> List[Dict[str, Any]]:
         objective = self.config["objective_name"]
@@ -347,12 +491,12 @@ class LocalBOState:
     def target_value(self, value: float) -> float:
         if value is None:
             return None
-        return -value if self.config["objective_direction"] == "minimize" else value
+        return _target_value(value, self.config["objective_direction"])
 
     def display_value(self, value: float) -> float:
         if value is None:
             return None
-        return -value if self.config["objective_direction"] == "minimize" else value
+        return _display_value(value, self.config["objective_direction"])
 
     def import_dataset(self, filename: str, raw: bytes) -> Dict[str, Any]:
         df = _read_table_from_bytes(filename, raw)
@@ -383,8 +527,11 @@ class LocalBOState:
             self.observations = []
             self.suggestions = []
             self.inverse_designs = []
+            self.benchmark_runs = []
             self.last_error = None
-            self.last_model_status = "Dataset loaded. Add observations to train GPR."
+            self.last_model_status = (
+                "Dataset loaded. Add live observations or run an offline benchmark."
+            )
             if value_columns:
                 self.objective_names = [str(column) for column in value_columns]
                 if self.config["objective_name"] not in self.objective_names:
@@ -396,12 +543,6 @@ class LocalBOState:
                 if pd.isna(row[first_col]) or not str(row[first_col]).strip():
                     continue
                 procedure = str(row[first_col]).strip()
-                candidate = {
-                    "id": f"cand-{len(self.candidates)}",
-                    "row": int(row_index) + 1,
-                    "procedure": procedure,
-                }
-                self.candidates.append(candidate)
                 objectives = {
                     str(column): _coerce_float(row[column]) for column in value_columns
                 }
@@ -415,19 +556,25 @@ class LocalBOState:
                 uncertainties = {
                     key: value for key, value in uncertainties.items() if value is not None
                 }
-                if objectives:
-                    self._add_observation_locked(
-                        procedure,
-                        objectives,
-                        uncertainties,
-                        candidate_id=candidate["id"],
-                    )
+                candidate = {
+                    "id": f"cand-{len(self.candidates)}",
+                    "row": int(row_index) + 1,
+                    "procedure": procedure,
+                    "objectives": {
+                        key: float(value) for key, value in objectives.items()
+                    },
+                    "uncertainties": {
+                        key: float(value) for key, value in uncertainties.items()
+                    },
+                }
+                self.candidates.append(candidate)
             self.refresh_active_objective()
             self.log(
                 f"Imported {len(self.candidates)} candidates from {Path(filename).name}."
             )
-            if self.observations:
-                self.log(f"Loaded {len(self.observations)} existing objective values.")
+            labelled = len(self.labelled_candidates())
+            if labelled:
+                self.log(f"Loaded {labelled} hidden labels for offline benchmarks.")
             return self.to_json()
 
     def update_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -440,6 +587,10 @@ class LocalBOState:
                     "batch_size",
                     "iterations_per_trial",
                     "replicates_per_candidate",
+                    "benchmark_iterations",
+                    "benchmark_replicates",
+                    "benchmark_initial_points",
+                    "benchmark_seed",
                     "random_replicates",
                     "llm_samples",
                     "selector_k",
@@ -468,6 +619,8 @@ class LocalBOState:
                 if self.config["objective_direction"] == "minimize"
                 else "maximize"
             )
+            if self.config["objective_scaling"] not in SCALING_MODES:
+                self.config["objective_scaling"] = "off"
             self.config["batch_size"] = max(1, min(25, int(self.config["batch_size"])))
             self.config["iterations_per_trial"] = max(
                 0, int(self.config["iterations_per_trial"])
@@ -475,6 +628,16 @@ class LocalBOState:
             self.config["replicates_per_candidate"] = max(
                 1, int(self.config["replicates_per_candidate"])
             )
+            self.config["benchmark_iterations"] = max(
+                1, int(self.config["benchmark_iterations"])
+            )
+            self.config["benchmark_replicates"] = max(
+                1, min(50, int(self.config["benchmark_replicates"]))
+            )
+            self.config["benchmark_initial_points"] = max(
+                1, int(self.config["benchmark_initial_points"])
+            )
+            self.config["benchmark_seed"] = int(self.config["benchmark_seed"])
             self.config["random_replicates"] = max(0, int(self.config["random_replicates"]))
             self.config["llm_samples"] = max(1, min(20, int(self.config["llm_samples"])))
             self.config["selector_k"] = max(0, int(self.config["selector_k"]))
@@ -635,17 +798,25 @@ class LocalBOState:
             for cand in sampled
         ]
 
-    def _candidate_subset(self, available: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _candidate_subset(
+        self, available: List[Dict[str, Any]], rng: Optional[random.Random] = None
+    ) -> List[Dict[str, Any]]:
         score_limit = min(self.config["score_limit"], len(available))
         if score_limit == len(available):
             return list(available)
-        return random.sample(available, score_limit)
+        return (rng or random).sample(available, score_limit)
 
-    def _gpr_suggestions(self, available: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _gpr_suggestions(
+        self,
+        available: List[Dict[str, Any]],
+        observations: Optional[List[Dict[str, Any]]] = None,
+        rng: Optional[random.Random] = None,
+        k: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         from boicl import AskTellGPR
 
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        active_observations = self._training_observations()
+        active_observations, scaler = self._training_rows_and_scaler(observations)
         n_obs = len(active_observations)
         n_neighbors = min(self.config["n_neighbors"], max(1, n_obs - 1))
         n_components = min(self.config["n_components"], max(1, n_obs - 1))
@@ -666,12 +837,12 @@ class LocalBOState:
             train=True,
         )
 
-        subset = self._candidate_subset(available)
+        subset = self._candidate_subset(available, rng)
         procedures = [cand["procedure"] for cand in subset]
         raw = model.ask(
             procedures,
             aq_fxn=self.config["acquisition"],
-            k=min(self.config["batch_size"], len(procedures)),
+            k=min(k or self.config["batch_size"], len(procedures)),
             aug_random_filter=len(procedures),
             _lambda=self.config["ucb_lambda"],
         )
@@ -686,17 +857,24 @@ class LocalBOState:
                 "candidate_id": by_proc[procedure]["id"],
                 "procedure": procedure,
                 "acquisition": float(aq),
-                "mean": self.display_value(float(mean)) if mean is not None else None,
+                "mean": _unscale_target(
+                    float(mean), self.config["objective_direction"], scaler
+                )
+                if mean is not None
+                else None,
                 "std": float(std) if std is not None else None,
                 "source": "gpr",
             }
             for procedure, aq, mean, std in zip(selected, acquisition, means, stds)
         ]
 
-    def _build_llm_model(self):
+    def _build_llm_model(
+        self, observations: Optional[List[Dict[str, Any]]] = None
+    ) -> Tuple[Any, Dict[str, float]]:
         from boicl import AskTellFewShotTopk
 
         selector_k = int(self.config["selector_k"]) or None
+        active_observations, scaler = self._training_rows_and_scaler(observations)
         model = AskTellFewShotTopk(
             model=self.config["prediction_model"],
             inverse_model=self.config["inverse_model"],
@@ -706,19 +884,25 @@ class LocalBOState:
             x_name="procedure",
             y_formatter=lambda y: f"{float(y):0.6g}",
         )
-        for obs in self._training_observations():
+        for obs in active_observations:
             model.tell(obs["procedure"], obs["target"])
-        return model
+        return model, scaler
 
-    def _llm_suggestions(self, available: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _llm_suggestions(
+        self,
+        available: List[Dict[str, Any]],
+        observations: Optional[List[Dict[str, Any]]] = None,
+        rng: Optional[random.Random] = None,
+        k: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         from boicl import Pool
 
-        model = self._build_llm_model()
-        subset = self._candidate_subset(available)
+        model, scaler = self._build_llm_model(observations)
+        subset = self._candidate_subset(available, rng)
         procedures = [cand["procedure"] for cand in subset]
         inverse_text = None
         if self.config["inverse_filter"] and procedures:
-            inverse_text = self._generate_inverse_text(model)
+            inverse_text = self._generate_inverse_text(model, scaler)
             pool = Pool(procedures, embedding_model=self.config["embedding_model"])
             filtered = pool.approx_sample(
                 inverse_text,
@@ -726,7 +910,7 @@ class LocalBOState:
             )
             remaining = [procedure for procedure in procedures if procedure not in filtered]
             random_count = min(int(self.config["inverse_random_candidates"]), len(remaining))
-            procedures = filtered + random.sample(remaining, random_count)
+            procedures = filtered + (rng or random).sample(remaining, random_count)
             self.inverse_designs.insert(
                 0,
                 {
@@ -744,7 +928,7 @@ class LocalBOState:
         raw = model.ask(
             procedures,
             aq_fxn=self.config["acquisition"],
-            k=min(self.config["batch_size"], len(procedures)),
+            k=min(k or self.config["batch_size"], len(procedures)),
             inv_filter=0,
             aug_random_filter=len(procedures),
             _lambda=self.config["ucb_lambda"],
@@ -758,7 +942,11 @@ class LocalBOState:
                 "candidate_id": by_proc[procedure]["id"],
                 "procedure": procedure,
                 "acquisition": float(aq),
-                "mean": self.display_value(float(mean)) if mean is not None else None,
+                "mean": _unscale_target(
+                    float(mean), self.config["objective_direction"], scaler
+                )
+                if mean is not None
+                else None,
                 "std": None,
                 "source": "llm",
                 "prediction_model": self.config["prediction_model"],
@@ -780,12 +968,18 @@ class LocalBOState:
         best = min(values) if self.config["objective_direction"] == "minimize" else max(values)
         return best * float(self.config["inverse_target_multiplier"])
 
-    def _inverse_target_model_value(self) -> float:
-        return self.target_value(self._inverse_target_display_value())
+    def _inverse_target_model_value(self, scaler: Optional[Dict[str, float]] = None) -> float:
+        if scaler is None:
+            _, scaler = self._training_rows_and_scaler()
+        return _scale_target(
+            self._inverse_target_display_value(),
+            self.config["objective_direction"],
+            scaler,
+        )
 
-    def _generate_inverse_text(self, model) -> str:
+    def _generate_inverse_text(self, model, scaler: Optional[Dict[str, float]] = None) -> str:
         return model.inv_predict(
-            self._inverse_target_model_value(),
+            self._inverse_target_model_value(scaler),
             system_message=self.config["inverse_system_message"],
         )
 
@@ -804,12 +998,12 @@ class LocalBOState:
                 raise ValueError("OPENAI_API_KEY is required for selector examples.")
             if len(self._training_observations()) < 1:
                 raise ValueError("Add at least one labeled procedure before inverse design.")
-            model = self._build_llm_model()
+            model, scaler = self._build_llm_model()
             generated = []
             for _ in range(int(self.config["inverse_design_count"])):
                 generated.append(
                     {
-                        "procedure": self._generate_inverse_text(model),
+                        "procedure": self._generate_inverse_text(model, scaler),
                         "target": self._inverse_target_display_value(),
                         "model": self.config["inverse_model"],
                         "time": _now(),
@@ -821,22 +1015,194 @@ class LocalBOState:
             self.log(f"Generated {len(generated)} inverse design proposal(s).")
             return self.to_json()
 
-    def _training_observations(self) -> List[Dict[str, Any]]:
-        grouped: Dict[str, List[Dict[str, Any]]] = {}
-        for obs in self.active_observations():
-            grouped.setdefault(obs["procedure"], []).append(obs)
-        rows = []
-        for procedure, obs_list in grouped.items():
-            targets = [obs["target"] for obs in obs_list if obs["target"] is not None]
-            if not targets:
+    def _observation_from_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        objective = self.config["objective_name"]
+        value = float(candidate["objectives"][objective])
+        uncertainty = candidate.get("uncertainties", {}).get(objective)
+        return {
+            "id": "",
+            "candidate_id": candidate["id"],
+            "procedure": candidate["procedure"],
+            "objectives": {objective: value},
+            "uncertainties": {objective: uncertainty} if uncertainty is not None else {},
+            "value": value,
+            "target": self.target_value(value),
+            "uncertainty": uncertainty,
+            "time": _now(),
+        }
+
+    def _missing_key_for_benchmark(self) -> Optional[str]:
+        if self.config["acquisition"] == "random":
+            return None
+        return self._missing_key_for_suggestions()
+
+    def _benchmark_name(self) -> str:
+        if self.config["optimizer"] == "llm":
+            model = self.config["prediction_model"]
+        else:
+            model = self.config["embedding_model"]
+        return (
+            f"{self.config['optimizer'].upper()} "
+            f"{self.config['acquisition'].replace('_', ' ')} "
+            f"({model})"
+        )
+
+    def _benchmark_next_candidate(
+        self,
+        available: List[Dict[str, Any]],
+        observations: List[Dict[str, Any]],
+        rng: random.Random,
+    ) -> Dict[str, Any]:
+        training_rows, _ = self._training_rows_and_scaler(observations)
+        if self.config["acquisition"] == "random" or len(training_rows) < 2:
+            return rng.choice(available)
+        if self.config["optimizer"] == "llm":
+            suggestions = self._llm_suggestions(available, observations, rng=rng, k=1)
+        else:
+            suggestions = self._gpr_suggestions(available, observations, rng=rng, k=1)
+        if not suggestions:
+            return rng.choice(available)
+        candidate_id = suggestions[0]["candidate_id"]
+        return next(
+            (candidate for candidate in available if candidate["id"] == candidate_id),
+            rng.choice(available),
+        )
+
+    def _summarize_replicate_traces(
+        self, replicate_traces: List[List[Dict[str, Any]]]
+    ) -> List[Dict[str, Any]]:
+        if not replicate_traces:
+            return []
+        max_len = max(len(trace) for trace in replicate_traces)
+        summary = []
+        for index in range(1, max_len + 1):
+            values = [
+                trace[index - 1]["best"]
+                for trace in replicate_traces
+                if len(trace) >= index
+            ]
+            if not values:
                 continue
-            rows.append(
+            mean = float(np.mean(values))
+            std = float(np.std(values)) if len(values) > 1 else 0.0
+            summary.append(
                 {
-                    "procedure": procedure,
-                    "target": float(np.mean(targets)),
-                    "value": float(np.mean([obs["value"] for obs in obs_list])),
+                    "index": index,
+                    "mean": mean,
+                    "std": std,
+                    "lower": mean - std,
+                    "upper": mean + std,
+                    "count": len(values),
                 }
             )
+        return summary
+
+    def run_benchmark(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        with self.lock:
+            self.last_error = None
+            labelled = self.labelled_candidates()
+            if not labelled:
+                raise ValueError(
+                    "Import a dataset with numeric labels before running an offline benchmark."
+                )
+            initial_points = min(
+                int(self.config["benchmark_initial_points"]), len(labelled)
+            )
+            iterations = int(self.config["benchmark_iterations"])
+            replicates = int(self.config["benchmark_replicates"])
+            if len(labelled) <= initial_points:
+                raise ValueError("Need more labelled candidates than initial random points.")
+            missing_key = self._missing_key_for_benchmark()
+            if missing_key:
+                raise ValueError(f"{missing_key} is required for this benchmark config.")
+
+            name = (payload.get("name") or "").strip() or self._benchmark_name()
+            seed = int(self.config["benchmark_seed"])
+            replicate_traces: List[List[Dict[str, Any]]] = []
+            for replicate in range(replicates):
+                rng = random.Random(seed + replicate)
+                shuffled = list(labelled)
+                rng.shuffle(shuffled)
+                selected_ids = set()
+                observations: List[Dict[str, Any]] = []
+                for candidate in shuffled[:initial_points]:
+                    observations.append(self._observation_from_candidate(candidate))
+                    selected_ids.add(candidate["id"])
+                for _ in range(iterations):
+                    available = [
+                        candidate
+                        for candidate in labelled
+                        if candidate["id"] not in selected_ids
+                    ]
+                    if not available:
+                        break
+                    candidate = self._benchmark_next_candidate(available, observations, rng)
+                    observations.append(self._observation_from_candidate(candidate))
+                    selected_ids.add(candidate["id"])
+                replicate_traces.append(
+                    _best_trace(observations, self.config["objective_direction"])
+                )
+
+            color = BENCHMARK_COLORS[len(self.benchmark_runs) % len(BENCHMARK_COLORS)]
+            run = {
+                "id": f"benchmark-{len(self.benchmark_runs) + 1}",
+                "name": name,
+                "color": color,
+                "time": _now(),
+                "config": {
+                    key: self.config[key]
+                    for key in [
+                        "optimizer",
+                        "objective_name",
+                        "objective_direction",
+                        "objective_scaling",
+                        "acquisition",
+                        "embedding_model",
+                        "prediction_model",
+                        "inverse_model",
+                        "llm_samples",
+                        "selector_k",
+                        "inverse_filter",
+                        "inverse_random_candidates",
+                        "ucb_lambda",
+                        "score_limit",
+                        "n_neighbors",
+                        "n_components",
+                        "benchmark_iterations",
+                        "benchmark_replicates",
+                        "benchmark_initial_points",
+                        "benchmark_seed",
+                    ]
+                },
+                "replicate_traces": replicate_traces,
+                "summary": self._summarize_replicate_traces(replicate_traces),
+            }
+            self.benchmark_runs.append(run)
+            self.last_model_status = f"Added benchmark run: {name}."
+            self.log(
+                f"Ran benchmark '{name}' with {replicates} replicate(s), "
+                f"{initial_points} initial point(s), and {iterations} BO iteration(s)."
+            )
+            return self.to_json()
+
+    def clear_benchmarks(self) -> Dict[str, Any]:
+        with self.lock:
+            self.benchmark_runs = []
+            self.last_model_status = "Cleared offline benchmark runs."
+            self.log("Cleared offline benchmark runs.")
+            return self.to_json()
+
+    def _training_rows_and_scaler(
+        self, observations: Optional[List[Dict[str, Any]]] = None
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
+        return _group_training_observations(
+            observations if observations is not None else self.active_observations(),
+            self.config["objective_direction"],
+            self.config["objective_scaling"],
+        )
+
+    def _training_observations(self) -> List[Dict[str, Any]]:
+        rows, _ = self._training_rows_and_scaler()
         return rows
 
     def reset_run(self) -> Dict[str, Any]:
@@ -960,6 +1326,10 @@ class LocalAppHandler(BaseHTTPRequestHandler):
                 self._send_json(self.state.suggest())
             elif parsed.path == "/api/inverse-design":
                 self._send_json(self.state.generate_inverse_designs(self._read_json()))
+            elif parsed.path == "/api/run-benchmark":
+                self._send_json(self.state.run_benchmark(self._read_json()))
+            elif parsed.path == "/api/clear-benchmarks":
+                self._send_json(self.state.clear_benchmarks())
             elif parsed.path == "/api/reset":
                 self._send_json(self.state.reset_run())
             else:
@@ -1265,6 +1635,15 @@ INDEX_HTML = r"""<!doctype html>
             <select id="acquisition"></select>
           </div>
         </div>
+        <div class="field">
+          <label for="objectiveScaling">Target scaling</label>
+          <select id="objectiveScaling">
+            <option value="off">Off</option>
+            <option value="auto">Auto range</option>
+            <option value="minmax">Min-max</option>
+            <option value="zscore">Z-score</option>
+          </select>
+        </div>
         <div class="row">
           <div class="field">
             <label for="embeddingModel">Embedding model</label>
@@ -1352,16 +1731,46 @@ INDEX_HTML = r"""<!doctype html>
           </div>
         </div>
         <div class="field">
-          <label for="randomReplicates">Random baseline replicates</label>
-          <input id="randomReplicates" type="number" min="0" value="25">
-        </div>
-        <label class="switchline">
+          <label class="switchline">
           <input id="autoSuggest" type="checkbox" checked>
           Auto update
         </label>
+        </div>
         <div class="toolbar" style="margin-top: 12px;">
           <button id="saveConfig">Apply</button>
           <button id="resetRun">Reset Run</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Offline Benchmark</h2>
+        <div class="field">
+          <label for="benchmarkName">Run label</label>
+          <input id="benchmarkName" placeholder="auto">
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="benchmarkInitialPoints">Initial random</label>
+            <input id="benchmarkInitialPoints" type="number" min="1" value="1">
+          </div>
+          <div class="field">
+            <label for="benchmarkIterations">BO iterations</label>
+            <input id="benchmarkIterations" type="number" min="1" value="20">
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="benchmarkReplicates">Workflow replicates</label>
+            <input id="benchmarkReplicates" type="number" min="1" max="50" value="5">
+          </div>
+          <div class="field">
+            <label for="benchmarkSeed">Seed</label>
+            <input id="benchmarkSeed" type="number" value="0">
+          </div>
+        </div>
+        <div class="toolbar">
+          <button class="primary" id="runBenchmark">Run & Append</button>
+          <button id="clearBenchmarks">Clear Runs</button>
         </div>
       </section>
     </aside>
@@ -1373,6 +1782,7 @@ INDEX_HTML = r"""<!doctype html>
           <a class="muted" href="/api/export-observations.csv">Export observations</a>
         </div>
         <div id="plot" class="plot"></div>
+        <div id="benchmarkRuns" style="margin-top: 12px;"></div>
       </section>
 
       <section class="panel">
@@ -1472,6 +1882,7 @@ INDEX_HTML = r"""<!doctype html>
         optimizer: $('optimizer').value,
         objective_name: $('objectiveName').value,
         objective_direction: $('objectiveDirection').value,
+        objective_scaling: $('objectiveScaling').value,
         acquisition: $('acquisition').value,
         embedding_model: $('embeddingModel').value,
         prediction_model: $('predictionModel').value,
@@ -1488,7 +1899,10 @@ INDEX_HTML = r"""<!doctype html>
         batch_size: Number($('batchSize').value || 1),
         iterations_per_trial: Number($('iterationsPerTrial').value || 0),
         replicates_per_candidate: Number($('replicatesPerCandidate').value || 1),
-        random_replicates: Number($('randomReplicates').value || 25),
+        benchmark_iterations: Number($('benchmarkIterations').value || 20),
+        benchmark_replicates: Number($('benchmarkReplicates').value || 5),
+        benchmark_initial_points: Number($('benchmarkInitialPoints').value || 1),
+        benchmark_seed: Number($('benchmarkSeed').value || 0),
         ucb_lambda: Number($('ucbLambda').value || 0.5),
         score_limit: Number($('scoreLimit').value || 250),
         n_neighbors: Number($('nNeighbors').value || 5),
@@ -1502,7 +1916,7 @@ INDEX_HTML = r"""<!doctype html>
       const keyCount = [state.key_status.openai_configured, state.key_status.openrouter_configured, state.key_status.anthropic_configured].filter(Boolean).length;
       $('keyStatus').textContent = keyCount ? `${keyCount} API key${keyCount > 1 ? 's' : ''} set` : 'API keys missing';
       $('keyStatus').className = `chip ${keyCount ? 'good' : 'warn'}`;
-      $('datasetStatus').textContent = `${state.candidate_count} candidates`;
+      $('datasetStatus').textContent = `${state.candidate_count} candidates, ${state.label_count || 0} labels`;
       $('datasetStatus').className = `chip ${state.candidate_count ? 'good' : 'warn'}`;
       $('observationStatus').textContent = `${state.observations.length} observations`;
       $('observationStatus').className = `chip ${state.observations.length ? 'good' : 'warn'}`;
@@ -1511,6 +1925,7 @@ INDEX_HTML = r"""<!doctype html>
       renderConfig();
       renderCandidateSelect();
       renderPlot();
+      renderBenchmarkRuns();
       renderSuggestions();
       renderInverseDesigns();
       renderObservations();
@@ -1531,6 +1946,7 @@ INDEX_HTML = r"""<!doctype html>
         .map((name) => `<option value="${escapeHtml(name)}"></option>`)
         .join('');
       $('objectiveDirection').value = config.objective_direction;
+      $('objectiveScaling').value = config.objective_scaling;
       $('embeddingModel').value = config.embedding_model;
       $('predictionModel').value = config.prediction_model;
       $('inverseModel').value = config.inverse_model;
@@ -1546,7 +1962,10 @@ INDEX_HTML = r"""<!doctype html>
       $('batchSize').value = config.batch_size;
       $('iterationsPerTrial').value = config.iterations_per_trial;
       $('replicatesPerCandidate').value = config.replicates_per_candidate;
-      $('randomReplicates').value = config.random_replicates;
+      $('benchmarkIterations').value = config.benchmark_iterations;
+      $('benchmarkReplicates').value = config.benchmark_replicates;
+      $('benchmarkInitialPoints').value = config.benchmark_initial_points;
+      $('benchmarkSeed').value = config.benchmark_seed;
       $('ucbLambda').value = config.ucb_lambda;
       $('scoreLimit').value = config.score_limit;
       $('nNeighbors').value = config.n_neighbors;
@@ -1578,26 +1997,62 @@ INDEX_HTML = r"""<!doctype html>
       const host = $('plot');
       const trace = state.best_trace || [];
       const randomTrace = state.random_walk_trace || [];
-      if (!trace.length) {
-        host.innerHTML = '<div class="empty" style="margin: 18px;">No observations yet</div>';
+      const benchmarkRuns = state.benchmark_runs || [];
+      const datasetStats = state.dataset_stats || [];
+      if (!trace.length && !benchmarkRuns.length) {
+        host.innerHTML = '<div class="empty" style="margin: 18px;">No observations or benchmark runs yet</div>';
         return;
       }
       const obs = state.observations;
       const width = Math.max(560, host.clientWidth || 760);
-      const height = 280;
-      const pad = { left: 52, right: 22, top: 22, bottom: 42 };
+      const height = 330;
+      const pad = { left: 56, right: 76, top: 26, bottom: 46 };
       const activeObs = obs.filter((item) => item.value !== null && item.value !== undefined);
+      const maxIndex = Math.max(
+        1,
+        ...trace.map((item) => item.index || 1),
+        ...randomTrace.map((item) => item.index || 1),
+        ...benchmarkRuns.flatMap((run) => (run.summary || []).map((item) => item.index || 1))
+      );
       const values = activeObs.flatMap((item) => {
         const unc = Number(item.uncertainty || 0);
         return [item.value - unc, item.value + unc, item.value];
-      }).concat(trace.map((item) => item.best), randomTrace.map((item) => item.best));
+      }).concat(
+        trace.map((item) => item.best),
+        randomTrace.map((item) => item.best),
+        benchmarkRuns.flatMap((run) => (run.summary || []).flatMap((item) => [item.lower, item.upper, item.mean])),
+        datasetStats.map((item) => item.value)
+      ).filter((value) => value !== null && value !== undefined && Number.isFinite(Number(value)));
+      if (!values.length) {
+        host.innerHTML = '<div class="empty" style="margin: 18px;">No plottable values yet</div>';
+        return;
+      }
       let minY = Math.min(...values);
       let maxY = Math.max(...values);
       if (minY === maxY) { minY -= 1; maxY += 1; }
-      const x = (i) => pad.left + ((i - 1) / Math.max(1, trace.length - 1)) * (width - pad.left - pad.right);
+      const yMargin = (maxY - minY) * 0.08;
+      minY -= yMargin;
+      maxY += yMargin;
+      const x = (i) => pad.left + ((i - 1) / Math.max(1, maxIndex - 1)) * (width - pad.left - pad.right);
       const y = (value) => pad.top + (1 - ((value - minY) / (maxY - minY))) * (height - pad.top - pad.bottom);
       const bestPath = trace.map((item, idx) => `${idx ? 'L' : 'M'} ${x(item.index).toFixed(1)} ${y(item.best).toFixed(1)}`).join(' ');
       const randomPath = randomTrace.map((item, idx) => `${idx ? 'L' : 'M'} ${x(item.index).toFixed(1)} ${y(item.best).toFixed(1)}`).join(' ');
+      const statLines = datasetStats.map((item, idx) => {
+        const yy = y(item.value);
+        return `<line x1="${pad.left}" x2="${width - pad.right}" y1="${yy}" y2="${yy}" stroke="#98a2b3" stroke-width="1" stroke-dasharray="4 5" opacity="${idx === 0 ? 0.7 : 0.55}" />
+          <text x="${width - pad.right + 8}" y="${yy + 4}">${escapeHtml(item.label)}</text>`;
+      }).join('');
+      const runLayers = benchmarkRuns.map((run) => {
+        const points = run.summary || [];
+        if (!points.length) return '';
+        const color = run.color || '#7c3aed';
+        const meanPath = points.map((item, idx) => `${idx ? 'L' : 'M'} ${x(item.index).toFixed(1)} ${y(item.mean).toFixed(1)}`).join(' ');
+        const band = points.length > 1
+          ? `M ${points.map((item) => `${x(item.index).toFixed(1)} ${y(item.upper).toFixed(1)}`).join(' L ')} L ${[...points].reverse().map((item) => `${x(item.index).toFixed(1)} ${y(item.lower).toFixed(1)}`).join(' L ')} Z`
+          : '';
+        return `${band ? `<path d="${band}" fill="${color}" opacity="0.14" />` : ''}
+          <path d="${meanPath}" fill="none" stroke="${color}" stroke-width="3" />`;
+      }).join('');
       const points = activeObs.map((item, idx) => {
         const cx = x(idx + 1);
         const cy = y(item.value);
@@ -1611,15 +2066,49 @@ INDEX_HTML = r"""<!doctype html>
         return `<line x1="${pad.left}" x2="${width - pad.right}" y1="${yy}" y2="${yy}" stroke="#edf0f5" />
           <text x="10" y="${yy + 4}">${fmt(value, 3)}</text>`;
       }).join('');
+      const legendItems = [
+        bestPath ? { label: 'live best', color: '#0f766e', dash: '' } : null,
+        randomPath ? { label: 'random mean', color: '#667085', dash: '5 5' } : null,
+        ...benchmarkRuns.map((run) => ({ label: run.name, color: run.color || '#7c3aed', dash: '' }))
+      ].filter(Boolean).slice(0, 6);
+      const legend = legendItems.map((item, idx) => {
+        const xx = pad.left + idx * 112;
+        return `<line x1="${xx}" x2="${xx + 22}" y1="16" y2="16" stroke="${item.color}" stroke-width="3" stroke-dasharray="${item.dash}" />
+          <text x="${xx + 28}" y="20">${escapeHtml(item.label).slice(0, 16)}</text>`;
+      }).join('');
       host.innerHTML = `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}" role="img">
+        ${legend}
         ${ticks}
+        ${statLines}
         <line x1="${pad.left}" x2="${width - pad.right}" y1="${height - pad.bottom}" y2="${height - pad.bottom}" stroke="#cfd6e2" />
         <line x1="${pad.left}" x2="${pad.left}" y1="${pad.top}" y2="${height - pad.bottom}" stroke="#cfd6e2" />
-        ${randomPath ? `<path d="${randomPath}" fill="none" stroke="#b45309" stroke-width="2" stroke-dasharray="6 5" />` : ''}
-        <path d="${bestPath}" fill="none" stroke="#0f766e" stroke-width="3" />
+        ${randomPath ? `<path d="${randomPath}" fill="none" stroke="#667085" stroke-width="2" stroke-dasharray="6 5" />` : ''}
+        ${runLayers}
+        ${bestPath ? `<path d="${bestPath}" fill="none" stroke="#0f766e" stroke-width="3" />` : ''}
         ${points}
-        <text x="${width / 2 - 28}" y="${height - 10}">experiment</text>
+        <text x="${width / 2 - 44}" y="${height - 12}">experiment count</text>
       </svg>`;
+    }
+
+    function renderBenchmarkRuns() {
+      const runs = state.benchmark_runs || [];
+      if (!runs.length) {
+        $('benchmarkRuns').innerHTML = '<div class="muted">No offline benchmark runs appended.</div>';
+        return;
+      }
+      $('benchmarkRuns').innerHTML = `<div class="scroll"><table>
+        <thead><tr><th>Run</th><th>Config</th><th>Last best</th><th>Spread</th></tr></thead>
+        <tbody>${runs.map((run) => {
+          const last = (run.summary || []).slice(-1)[0] || {};
+          const cfg = run.config || {};
+          return `<tr>
+            <td><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${escapeHtml(run.color || '#7c3aed')};"></span> ${escapeHtml(run.name)}</td>
+            <td>${escapeHtml(cfg.optimizer || '')} / ${escapeHtml((cfg.acquisition || '').replaceAll('_', ' '))}</td>
+            <td>${fmt(last.mean)}</td>
+            <td>${fmt(last.std)}</td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table></div>`;
     }
 
     function renderSuggestions() {
@@ -1788,6 +2277,19 @@ INDEX_HTML = r"""<!doctype html>
       });
     });
     $('resetRun').addEventListener('click', () => request('/api/reset', { method: 'POST' }));
+    $('runBenchmark').addEventListener('click', async () => {
+      await request('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payloadConfig())
+      });
+      await request('/api/run-benchmark', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: $('benchmarkName').value })
+      });
+    });
+    $('clearBenchmarks').addEventListener('click', () => request('/api/clear-benchmarks', { method: 'POST' }));
 
     refresh();
   </script>

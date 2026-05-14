@@ -42,7 +42,9 @@ procedure,C2 yield,selectivity,C2 yield uncertainty
 
 The local runner optimizes one active objective at a time. Switch the active
 objective in the settings panel to retrain/replot against another uploaded
-objective.
+objective. Imported labels are stored as hidden candidate truth for offline
+benchmarks; live observations are only created when you click `Add Observation`
+or when an offline benchmark simulation selects a candidate.
 
 ## Running
 
@@ -62,7 +64,10 @@ Or run manually:
 
 The current objective model is maximization-first, with a minimization option in
 the local runner that internally negates the entered objective values before
-training. Entered uncertainty is stored, exported, and plotted as an error bar.
+training. `Target scaling` is off by default. `Auto range`, `Min-max`, and
+`Z-score` scale the model target while plots and exports stay in the original
+objective units. Entered uncertainty is stored, exported, and plotted as an
+error bar.
 The current BO-ICL `AskTellGPR` implementation does not yet use per-observation
 uncertainty as fixed noise during GP fitting.
 
@@ -92,9 +97,28 @@ examples and the active objective target. Use those proposals directly as manual
 procedures, or use `Inverse filter` to turn inverse-design output into ranked
 candidates from the uploaded pool.
 
-`Batch size` controls how many candidates are suggested per update.
-`Iteration cap` stops suggestions after that many active-objective observations;
-`0` means no cap. `Replicates` controls how many times the same candidate can be
-selected before it is removed from the available pool. Replicate observations
-are averaged by procedure before training the GP. `Random baseline replicates`
-controls the dashed random best-so-far overlay in the plot.
+`Batch size` controls how many candidates are suggested per update in live mode.
+`Iteration cap` stops live suggestions after that many active-objective
+observations; `0` means no cap. `Replicates` controls how many live repeats of
+the same candidate are allowed before it is removed from the available pool.
+Replicate observations are averaged by procedure before model training.
+
+## Offline BO Benchmarks
+
+Use `Offline Benchmark` when the uploaded dataset already contains labels and
+you want paper-style controlled experiments. Set the current suggestion engine,
+acquisition function, model settings, objective, and scaling, then choose:
+
+- `Initial random`: number of random starting points, usually 1 or 2.
+- `BO iterations`: number of sequential active-learning choices after the
+  initial points.
+- `Workflow replicates`: repeated runs of the same configuration, usually 5.
+- `Seed`: reproducible starting seed for the replicate set.
+
+Click `Run & Append` to add the current configuration to the plot. Change the
+model or acquisition settings and click `Run & Append` again to compare another
+configuration without clearing the first one. The plot shows the mean
+best-so-far trajectory with a +/- 1 standard deviation band. The dashed random
+baseline is the paper-style quantile expectation for random sampling, not a
+Monte Carlo replicate. When full labels are available, dashed guide lines mark
+the dataset mean, 75th, 95th, 99th percentile, and maximum.

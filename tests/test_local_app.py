@@ -1,5 +1,11 @@
 from boicl import AskTellFewShotTopk, Pool
-from boicl.local_app import LocalBOState, _best_trace, _coerce_float
+from boicl.local_app import (
+    LocalBOState,
+    _best_trace,
+    _coerce_float,
+    _dataset_stats,
+    _paper_random_trace,
+)
 
 
 def test_import_dataset_uses_first_column_and_optional_values(tmp_path):
@@ -14,8 +20,11 @@ def test_import_dataset_uses_first_column_and_optional_values(tmp_path):
         "proc b",
         "proc c",
     ]
-    assert [obs["value"] for obs in payload["observations"]] == [1.2, 2.5]
-    assert payload["observations"][0]["uncertainty"] == 0.1
+    assert payload["observations"] == []
+    assert payload["label_count"] == 2
+    assert "objectives" not in payload["candidates"][0]
+    assert state.candidates[0]["objectives"]["value"] == 1.2
+    assert state.candidates[0]["uncertainties"]["value"] == 0.1
     assert payload["objective_names"] == ["value"]
 
 
@@ -27,8 +36,10 @@ def test_import_dataset_can_select_between_multiple_objectives(tmp_path):
     payload = state.update_config({"objective_name": "selectivity"})
 
     assert payload["objective_names"] == ["yield", "selectivity"]
-    assert [obs["value"] for obs in payload["observations"]] == [8.0, 7.0]
-    assert payload["observations"][0]["objectives"]["yield"] == 1.2
+    assert payload["observations"] == []
+    assert payload["label_count"] == 2
+    assert state.candidates[0]["objectives"]["yield"] == 1.2
+    assert payload["dataset_stats"][0]["label"] == "mean"
 
 
 def test_replicates_keep_candidate_available_until_limit(tmp_path):
@@ -60,6 +71,46 @@ def test_best_trace_respects_direction():
         3.0,
         3.0,
     ]
+
+
+def test_paper_random_trace_is_monotonic_for_maximization():
+    trace = _paper_random_trace([1.0, 2.0, 4.0], "maximize", steps=4)
+
+    assert len(trace) == 4
+    assert [point["index"] for point in trace] == [1, 2, 3, 4]
+    assert trace[-1]["best"] >= trace[0]["best"]
+
+
+def test_dataset_stats_include_paper_guides():
+    stats = {item["label"]: item["value"] for item in _dataset_stats([1, 2, 3, 4])}
+
+    assert stats["mean"] == 2.5
+    assert "75%" in stats
+    assert "95%" in stats
+    assert "99%" in stats
+
+
+def test_offline_benchmark_appends_random_config_without_live_observations(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset("dataset.csv", b"procedure,value\nproc a,1\nproc b,2\nproc c,3\n")
+    state.update_config(
+        {
+            "acquisition": "random",
+            "benchmark_iterations": 2,
+            "benchmark_replicates": 3,
+            "benchmark_initial_points": 1,
+            "benchmark_seed": 7,
+        }
+    )
+
+    payload = state.run_benchmark({"name": "random smoke"})
+
+    assert payload["observations"] == []
+    assert len(payload["benchmark_runs"]) == 1
+    run = payload["benchmark_runs"][0]
+    assert run["name"] == "random smoke"
+    assert len(run["replicate_traces"]) == 3
+    assert run["summary"][-1]["count"] == 3
 
 
 def test_float_coercion_rejects_empty_and_nonfinite():
