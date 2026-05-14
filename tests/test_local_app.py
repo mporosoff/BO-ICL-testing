@@ -151,6 +151,8 @@ def test_offline_benchmark_appends_random_config_without_live_observations(tmp_p
     assert run["name"] == "random smoke"
     assert len(run["replicate_traces"]) == 3
     assert run["summary"][-1]["count"] == 3
+    assert payload["progress"]["status"] == "complete"
+    assert payload["progress"]["percent"] == 100
 
 
 def test_campaign_save_load_and_autosave_roundtrip(tmp_path):
@@ -205,6 +207,18 @@ def test_cached_approx_sample_uses_saved_embeddings_without_api(tmp_path):
     assert state._cached_approx_sample(["proc a", "proc b"], "target", 1) == [
         "proc a"
     ]
+    assert state.progress_snapshot()["status"] == "complete"
+
+
+def test_progress_snapshot_tracks_terminal_style_updates(tmp_path):
+    state = LocalBOState(tmp_path)
+
+    state.set_progress("Testing progress", 2, 4, "halfway")
+    payload = state.to_json()
+
+    assert payload["progress"]["label"] == "Testing progress"
+    assert payload["progress"]["percent"] == 50
+    assert state.progress_snapshot()["detail"] == "halfway"
 
 
 def test_float_coercion_rejects_empty_and_nonfinite():

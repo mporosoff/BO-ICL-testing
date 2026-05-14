@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 import pandas as pd
+from openai import OpenAI
 
 try:
     from dotenv import load_dotenv
@@ -425,6 +426,17 @@ class LocalBOState:
     last_model_status: str = "No dataset loaded."
     campaign_id: Optional[str] = None
     campaign_name: str = ""
+    progress: Dict[str, Any] = field(
+        default_factory=lambda: {
+            "status": "idle",
+            "label": "",
+            "detail": "",
+            "current": 0,
+            "total": 0,
+            "percent": 0,
+            "updated": "",
+        }
+    )
 
     def __post_init__(self) -> None:
         self.lock = threading.RLock()
@@ -436,6 +448,43 @@ class LocalBOState:
     def log(self, message: str) -> None:
         self.events.insert(0, {"time": _now(), "message": message})
         self.events = self.events[:20]
+
+    def set_progress(
+        self,
+        label: str,
+        current: int,
+        total: int,
+        detail: str = "",
+        status: str = "running",
+    ) -> None:
+        total = max(0, int(total))
+        current = max(0, min(int(current), total if total else int(current)))
+        percent = int(round((current / total) * 100)) if total else 0
+        self.progress = {
+            "status": status,
+            "label": label,
+            "detail": detail,
+            "current": current,
+            "total": total,
+            "percent": percent,
+            "updated": _now(),
+        }
+        message = f"{label}: {current}/{total}"
+        if detail:
+            message += f" - {detail}"
+        print(f"[{self.progress['updated']}] {message}", flush=True)
+
+    def finish_progress(self, label: str, detail: str = "") -> None:
+        total = int(self.progress.get("total") or 0)
+        self.set_progress(label, total, total, detail=detail, status="complete")
+
+    def fail_progress(self, label: str, detail: str = "") -> None:
+        current = int(self.progress.get("current") or 0)
+        total = int(self.progress.get("total") or 0)
+        self.set_progress(label, current, total, detail=detail, status="error")
+
+    def progress_snapshot(self) -> Dict[str, Any]:
+        return dict(self.progress)
 
     def campaign_file(self, campaign_id: str) -> Path:
         return self.campaigns_dir / campaign_id / "campaign.json"
@@ -490,6 +539,7 @@ class LocalBOState:
             "inverse_designs": self.inverse_designs,
             "benchmark_runs": self.benchmark_runs,
             "last_model_status": self.last_model_status,
+            "progress": self.progress,
             "events": self.events[:20],
         }
 
@@ -591,6 +641,7 @@ class LocalBOState:
                 "events": self.events,
                 "last_error": self.last_error,
                 "last_model_status": self.last_model_status,
+                "progress": self.progress,
                 "best_trace": _best_trace(
                     active_observations, self.config["objective_direction"]
                 ),
@@ -654,10 +705,63 @@ class LocalBOState:
             y_name=self.config["objective_name"],
         )
 
-    def _cached_embeddings(self, texts: List[str]) -> List[List[float]]:
+    def _cached_embeddings(
+        self, texts: List[str], progress_label: str = "Preparing embeddings"
+    ) -> List[List[float]]:
         if not texts:
             return []
         model = self._embedding_cache_model()
+        unique_texts = list(dict.fromkeys(str(text) for text in texts if str(text).strip()))
+        model_cache = model._embeddings_cache[
+            model._embeddings_cache["embedding_model"] == self.config["embedding_model"]
+        ]
+        cached_texts = set(model_cache["x"].astype(str).tolist())
+        missing = [text for text in unique_texts if text not in cached_texts]
+        if missing:
+            client = OpenAI()
+            batch_size = 25
+            self.set_progress(
+                progress_label,
+                0,
+                len(missing),
+                detail=f"Embedding new texts with {self.config['embedding_model']}",
+            )
+            rows = []
+            for start in range(0, len(missing), batch_size):
+                batch = missing[start : start + batch_size]
+                response = client.embeddings.create(
+                    input=batch,
+                    model=self.config["embedding_model"],
+                    encoding_format="float",
+                )
+                rows.extend(
+                    {
+                        "x": text,
+                        "embedding": data.embedding,
+                        "embedding_model": self.config["embedding_model"],
+                    }
+                    for text, data in zip(batch, response.data)
+                )
+                self.set_progress(
+                    progress_label,
+                    min(start + len(batch), len(missing)),
+                    len(missing),
+                    detail=f"Cached {min(start + len(batch), len(missing))} new embedding(s)",
+                )
+            if rows:
+                model._embeddings_cache = pd.concat(
+                    [model._embeddings_cache, pd.DataFrame(rows)],
+                    ignore_index=True,
+                )
+                model.save_cache(str(self.embedding_cache_path()))
+        else:
+            self.set_progress(
+                progress_label,
+                len(unique_texts),
+                len(unique_texts),
+                detail="All requested embeddings were already cached.",
+                status="complete",
+            )
         embeddings = model._query_cache(texts)
         model.save_cache(str(self.embedding_cache_path()))
         return embeddings
@@ -670,7 +774,7 @@ class LocalBOState:
                 raise ValueError("OPENAI_API_KEY is required to prepare embeddings.")
             procedures = [candidate["procedure"] for candidate in self.candidates]
             before = self.embedding_cache_status()["cached_count"]
-            self._cached_embeddings(procedures)
+            self._cached_embeddings(procedures, "Preparing dataset embeddings")
             after_status = self.embedding_cache_status()
             added = after_status["cached_count"] - before
             self.last_model_status = (
@@ -680,6 +784,10 @@ class LocalBOState:
             self.log(
                 f"Prepared {max(0, added)} new embedding(s) using "
                 f"{self.config['embedding_model']}."
+            )
+            self.finish_progress(
+                "Preparing dataset embeddings",
+                f"{after_status['cached_count']} of {after_status['total_count']} cached.",
             )
             self._autosave_locked()
             return self.to_json()
@@ -719,6 +827,9 @@ class LocalBOState:
             self.suggestions = list(data.get("suggestions") or [])
             self.inverse_designs = list(data.get("inverse_designs") or [])
             self.benchmark_runs = list(data.get("benchmark_runs") or [])
+            self.progress = data.get("progress") or self.progress
+            if self.progress.get("status") == "running":
+                self.finish_progress("Loaded campaign", "Previous run was interrupted.")
             self.events = list(data.get("events") or [])[:20]
             self.last_error = None
             self.last_model_status = (
@@ -1026,17 +1137,25 @@ class LocalBOState:
     def suggest(self) -> Dict[str, Any]:
         with self.lock:
             self.last_error = None
+            self.set_progress(
+                "Updating suggestions",
+                0,
+                1,
+                detail=f"{self.config['optimizer'].upper()} / {self.config['acquisition']}",
+            )
             active_observations = self.active_observations()
             iteration_cap = int(self.config["iterations_per_trial"])
             if iteration_cap and len(active_observations) >= iteration_cap:
                 self.suggestions = []
                 self.last_model_status = "Iteration cap reached."
+                self.finish_progress("Updating suggestions", "Iteration cap reached.")
                 self._autosave_locked()
                 return self.to_json()
             available = self.available_candidates()
             if not available:
                 self.suggestions = []
                 self.last_model_status = "No unevaluated candidates remain."
+                self.finish_progress("Updating suggestions", "No unevaluated candidates remain.")
                 self._autosave_locked()
                 return self.to_json()
             missing_key = self._missing_key_for_suggestions()
@@ -1044,20 +1163,33 @@ class LocalBOState:
                 self.suggestions = self._random_suggestions(available)
                 self.last_model_status = f"{missing_key} missing. Showing random candidates."
                 self.log(f"Add {missing_key} to enable {self.config['optimizer'].upper()} suggestions.")
+                self.finish_progress("Updating suggestions", f"{missing_key} missing.")
                 self._autosave_locked()
                 return self.to_json()
             if len(active_observations) < 2:
                 self.suggestions = self._random_suggestions(available)
                 self.last_model_status = "Add at least 2 observations before model suggestions."
+                self.finish_progress(
+                    "Updating suggestions", "Showing random candidates until 2 observations."
+                )
                 self._autosave_locked()
                 return self.to_json()
             if len(self._training_observations()) < 2:
                 self.suggestions = self._random_suggestions(available)
                 self.last_model_status = "Add at least 2 unique procedures before model suggestions."
+                self.finish_progress(
+                    "Updating suggestions", "Showing random candidates until 2 unique procedures."
+                )
                 self._autosave_locked()
                 return self.to_json()
 
             try:
+                self.set_progress(
+                    "Updating suggestions",
+                    0,
+                    1,
+                    detail=f"Scoring up to {min(self.config['score_limit'], len(available))} candidate(s)",
+                )
                 if self.config["optimizer"] == "llm":
                     self.suggestions = self._llm_suggestions(available)
                 else:
@@ -1066,6 +1198,10 @@ class LocalBOState:
                     f"Updated {self.config['optimizer'].upper()} on {len(active_observations)} observations."
                 )
                 self.log(f"Updated suggestions with {self.config['acquisition']}.")
+                self.finish_progress(
+                    "Updating suggestions",
+                    f"Generated {len(self.suggestions)} suggestion(s).",
+                )
             except Exception as exc:  # pragma: no cover - needs live API/GPR deps
                 self.suggestions = self._random_suggestions(available)
                 self.last_error = "".join(
@@ -1073,6 +1209,7 @@ class LocalBOState:
                 ).strip()
                 self.last_model_status = "Model update failed. Showing random candidates."
                 self.log("Model update failed; see status panel.")
+                self.fail_progress("Updating suggestions", self.last_error)
             self._autosave_locked()
             return self.to_json()
 
@@ -1129,6 +1266,12 @@ class LocalBOState:
         n_obs = len(active_observations)
         n_neighbors = min(self.config["n_neighbors"], max(1, n_obs - 1))
         n_components = min(self.config["n_components"], max(1, n_obs - 1))
+        subset = self._candidate_subset(available, rng)
+        procedures = [cand["procedure"] for cand in subset]
+        self._cached_embeddings(
+            [obs["procedure"] for obs in active_observations] + procedures,
+            "Preparing embeddings for GPR",
+        )
         model = AskTellGPR(
             cache_path=str(self.embedding_cache_path()),
             embedding_model=self.config["embedding_model"],
@@ -1146,8 +1289,6 @@ class LocalBOState:
             train=True,
         )
 
-        subset = self._candidate_subset(available, rng)
-        procedures = [cand["procedure"] for cand in subset]
         raw = model.ask(
             procedures,
             aq_fxn=self.config["acquisition"],
@@ -1446,6 +1587,16 @@ class LocalBOState:
             name = (payload.get("name") or "").strip() or self._benchmark_name()
             seed = int(self.config["benchmark_seed"])
             replicate_traces: List[List[Dict[str, Any]]] = []
+            total_steps = max(1, replicates * iterations)
+            self.set_progress(
+                f"Running benchmark: {name}",
+                0,
+                total_steps,
+                detail=(
+                    f"{replicates} replicate(s), {iterations} BO iteration(s), "
+                    f"{self.config['optimizer'].upper()}"
+                ),
+            )
             for replicate in range(replicates):
                 rng = random.Random(seed + replicate)
                 shuffled = list(labelled)
@@ -1455,7 +1606,7 @@ class LocalBOState:
                 for candidate in shuffled[:initial_points]:
                     observations.append(self._observation_from_candidate(candidate))
                     selected_ids.add(candidate["id"])
-                for _ in range(iterations):
+                for iteration in range(iterations):
                     available = [
                         candidate
                         for candidate in labelled
@@ -1466,6 +1617,15 @@ class LocalBOState:
                     candidate = self._benchmark_next_candidate(available, observations, rng)
                     observations.append(self._observation_from_candidate(candidate))
                     selected_ids.add(candidate["id"])
+                    self.set_progress(
+                        f"Running benchmark: {name}",
+                        replicate * iterations + iteration + 1,
+                        total_steps,
+                        detail=(
+                            f"Replicate {replicate + 1}/{replicates}, "
+                            f"iteration {iteration + 1}/{iterations}"
+                        ),
+                    )
                 replicate_traces.append(
                     _best_trace(observations, self.config["objective_direction"])
                 )
@@ -1509,6 +1669,10 @@ class LocalBOState:
             self.log(
                 f"Ran benchmark '{name}' with {replicates} replicate(s), "
                 f"{initial_points} initial point(s), and {iterations} BO iteration(s)."
+            )
+            self.finish_progress(
+                f"Running benchmark: {name}",
+                f"Appended {len(replicate_traces)} replicate trace(s).",
             )
             self._autosave_locked()
             return self.to_json()
@@ -1601,6 +1765,8 @@ class LocalAppHandler(BaseHTTPRequestHandler):
 
     def _handle_error(self, exc: Exception, status: int = 400) -> None:
         self.state.last_error = str(exc)
+        if self.state.progress.get("status") == "running":
+            self.state.fail_progress(self.state.progress.get("label") or "Request", str(exc))
         self._send_json({"error": str(exc), "state": self.state.to_json()}, status)
 
     def do_GET(self) -> None:  # noqa: N802
@@ -1611,6 +1777,8 @@ class LocalAppHandler(BaseHTTPRequestHandler):
             self._send_text(USER_GUIDE_HTML, "text/html")
         elif parsed.path == "/api/state":
             self._send_json(self.state.to_json())
+        elif parsed.path == "/api/progress":
+            self._send_json({"progress": self.state.progress_snapshot()})
         elif parsed.path == "/api/campaigns":
             self._send_json({"campaigns": self.state.list_campaigns()})
         elif parsed.path == "/api/export-observations.csv":
@@ -1926,6 +2094,27 @@ INDEX_HTML = r"""<!doctype html>
       background: #fbfcfe;
       font-size: 13px;
     }
+    .progressbox {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 12px;
+      background: #fbfcfe;
+    }
+    .progressbar {
+      width: 100%;
+      height: 9px;
+      border-radius: 999px;
+      background: #e4e7ec;
+      overflow: hidden;
+      margin: 8px 0 4px;
+    }
+    .progressbar > div {
+      height: 100%;
+      width: 0%;
+      background: var(--accent);
+      transition: width 180ms ease;
+    }
     .hidden {
       display: none !important;
     }
@@ -2187,6 +2376,14 @@ INDEX_HTML = r"""<!doctype html>
           <a class="muted" href="/api/export-observations.csv">Export observations</a>
         </div>
         <div id="workflowBanner" class="notice" style="margin-bottom: 12px;"></div>
+        <div id="progressPanel" class="progressbox hidden">
+          <div class="toolbar" style="justify-content: space-between;">
+            <strong id="progressLabel">Working</strong>
+            <span class="muted" id="progressCount">0%</span>
+          </div>
+          <div class="progressbar"><div id="progressBar"></div></div>
+          <div class="muted" id="progressDetail"></div>
+        </div>
         <div id="plot" class="plot"></div>
         <div id="benchmarkRuns" style="margin-top: 12px;"></div>
       </section>
@@ -2242,6 +2439,7 @@ INDEX_HTML = r"""<!doctype html>
   <script>
     let state = null;
     let busy = false;
+    let progressTimer = null;
 
     const $ = (id) => document.getElementById(id);
 
@@ -2337,6 +2535,7 @@ INDEX_HTML = r"""<!doctype html>
 
     async function request(path, options = {}) {
       setBusy(true);
+      startProgressPolling();
       try {
         const response = await fetch(path, options);
         const payload = await response.json();
@@ -2348,6 +2547,8 @@ INDEX_HTML = r"""<!doctype html>
         renderError(error.message);
       } finally {
         setBusy(false);
+        stopProgressPolling();
+        if (state) renderProgress(state.progress || {});
       }
     }
 
@@ -2360,6 +2561,29 @@ INDEX_HTML = r"""<!doctype html>
       const response = await fetch('/api/state');
       state = await response.json();
       render();
+    }
+
+    async function pollProgress() {
+      try {
+        const response = await fetch('/api/progress', { cache: 'no-store' });
+        const payload = await response.json();
+        renderProgress(payload.progress || {});
+      } catch (_) {
+        // Progress polling is best-effort; the main request still owns errors.
+      }
+    }
+
+    function startProgressPolling() {
+      stopProgressPolling();
+      pollProgress();
+      progressTimer = window.setInterval(pollProgress, 900);
+    }
+
+    function stopProgressPolling() {
+      if (progressTimer) {
+        window.clearInterval(progressTimer);
+        progressTimer = null;
+      }
     }
 
     function payloadConfig() {
@@ -2423,6 +2647,7 @@ INDEX_HTML = r"""<!doctype html>
       renderCampaigns();
       renderConfig();
       renderWorkflowMode();
+      renderProgress(state.progress || {});
       renderCandidateSelect();
       renderPlot();
       renderBenchmarkRuns();
@@ -2505,6 +2730,23 @@ INDEX_HTML = r"""<!doctype html>
       } else {
         $('workflowBanner').textContent = 'Live campaign mode: use Update Suggestions to choose the next procedure, run the experiment offline, then enter the result with Add Observation.';
       }
+    }
+
+    function renderProgress(progress) {
+      const status = progress.status || 'idle';
+      const active = status === 'running' || status === 'complete' || status === 'error';
+      $('progressPanel').classList.toggle('hidden', !active);
+      if (!active) return;
+      const percent = Number(progress.percent || 0);
+      $('progressLabel').textContent = progress.label || 'Working';
+      $('progressCount').textContent = progress.total
+        ? `${progress.current || 0}/${progress.total} (${percent}%)`
+        : `${percent}%`;
+      $('progressBar').style.width = `${Math.max(0, Math.min(100, percent))}%`;
+      $('progressDetail').textContent = [progress.detail, progress.updated]
+        .filter(Boolean)
+        .join(' - ');
+      $('progressPanel').classList.toggle('error', status === 'error');
     }
 
     function renderCandidateSelect() {
@@ -2955,6 +3197,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
       <h2>Embedding Cache</h2>
       <p>Embeddings are saved locally under <code>.cache/</code>, one cache per embedding model. After importing a dataset, click <code>Prepare Embeddings</code> once to embed the full candidate pool. Later GPR runs, inverse-filter steps, repeated benchmark configurations, and app restarts reuse those saved embeddings instead of embedding the same procedures again.</p>
       <p>If you change the embedding model, prepare embeddings again for that model. Existing cache files remain available for the previous model.</p>
+      <p>Long-running actions show a progress panel in the browser and print progress lines in the terminal window. Browser controls may be disabled while an action is running, but the progress panel should continue updating.</p>
     </section>
 
     <section>

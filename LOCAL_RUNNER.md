@@ -111,6 +111,12 @@ candidate pool with the selected embedding model. The embeddings are saved under
 repeated benchmark configurations, and app restarts. If you change the embedding
 model, prepare embeddings once for the new model too.
 
+Long-running actions show live progress in the browser and print progress lines
+to the terminal window that launched the app. This includes embedding
+preparation, benchmark runs, and suggestion updates. If the browser controls are
+temporarily disabled, check the progress panel rather than assuming the app is
+frozen.
+
 BO-ICL LLM mode includes default materials-synthesis system messages for
 prediction and inverse design, so the package should not warn about missing
 system messages. Edit those messages in the browser if a campaign needs a more
