@@ -90,12 +90,12 @@ DEFAULT_CONFIG = {
     "batch_size": 1,
     "iterations_per_trial": 0,
     "replicates_per_candidate": 1,
-    "benchmark_iterations": 20,
+    "benchmark_iterations": 30,
     "benchmark_replicates": 5,
     "benchmark_initial_points": 1,
     "benchmark_seed": 0,
     "random_replicates": 0,
-    "ucb_lambda": 0.5,
+    "ucb_lambda": 0.1,
     "score_limit": 250,
     "n_neighbors": 5,
     "n_components": 16,
@@ -142,7 +142,44 @@ def _read_table_from_bytes(filename: str, raw: bytes) -> pd.DataFrame:
         return pd.read_excel(BytesIO(raw))
     if suffix in {".csv", ".txt"}:
         return pd.read_csv(BytesIO(raw))
-    raise ValueError("Use a CSV or Excel file.")
+    if suffix == ".npy":
+        return _read_npy_table(raw)
+    raise ValueError("Use a CSV, Excel, or NPY file.")
+
+
+def _read_npy_table(raw: bytes) -> pd.DataFrame:
+    try:
+        loaded = np.load(BytesIO(raw), allow_pickle=True)
+    except Exception as exc:
+        raise ValueError("Could not read the NPY file.") from exc
+    if isinstance(loaded, np.lib.npyio.NpzFile):
+        raise ValueError("Use a .npy array file, not a .npz archive.")
+    array = np.asarray(loaded)
+    if array.dtype.names:
+        return pd.DataFrame.from_records(array)
+    if array.ndim == 0:
+        item = array.item()
+        if isinstance(item, dict):
+            return pd.DataFrame(item)
+        if isinstance(item, list):
+            return pd.DataFrame(item)
+        raise ValueError("The NPY file must contain a table-like array.")
+    if array.ndim == 1:
+        if array.dtype == object and len(array) and isinstance(array[0], dict):
+            return pd.DataFrame(list(array))
+        return pd.DataFrame({"procedure": array.tolist()})
+    if array.ndim == 2:
+        if array.shape[1] < 1:
+            raise ValueError("The NPY table must include a procedure column.")
+        columns = ["procedure"]
+        if array.shape[1] == 2:
+            columns.append("objective")
+        else:
+            columns.extend(
+                f"objective_{index}" for index in range(1, array.shape[1])
+            )
+        return pd.DataFrame(array, columns=columns)
+    raise ValueError("The NPY file must be a 1D or 2D table-like array.")
 
 
 def _clean_procedures(df: pd.DataFrame) -> List[str]:
@@ -1277,6 +1314,8 @@ class LocalAppHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/":
             self._send_text(INDEX_HTML, "text/html")
+        elif parsed.path == "/guide":
+            self._send_text(USER_GUIDE_HTML, "text/html")
         elif parsed.path == "/api/state":
             self._send_json(self.state.to_json())
         elif parsed.path == "/api/export-observations.csv":
@@ -1411,6 +1450,19 @@ INDEX_HTML = r"""<!doctype html>
       border-color: #bfdbfe;
       color: #1d4ed8;
     }
+    .button-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 38px;
+      padding: 9px 12px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #fff;
+      color: var(--text);
+      text-decoration: none;
+      font-size: 13px;
+    }
     button:disabled {
       opacity: 0.55;
       cursor: wait;
@@ -1433,6 +1485,14 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 680;
       color: #344054;
       margin: 0 0 6px;
+    }
+    label.has-help {
+      cursor: help;
+    }
+    label.has-help::after {
+      content: " ?";
+      color: var(--accent-2);
+      font-weight: 760;
     }
     .shell {
       display: grid;
@@ -1574,6 +1634,7 @@ INDEX_HTML = r"""<!doctype html>
       <span class="chip" id="keyStatus">Key status</span>
       <span class="chip" id="datasetStatus">No dataset</span>
       <span class="chip" id="observationStatus">0 observations</span>
+      <a class="button-link" href="/guide" target="_blank" rel="noopener" title="Open the local user guide in a new browser tab.">User Guide</a>
       <button class="secondary" id="suggestTop">Update Suggestions</button>
     </div>
   </header>
@@ -1600,8 +1661,8 @@ INDEX_HTML = r"""<!doctype html>
       <section class="panel">
         <h2>Dataset</h2>
         <div class="field">
-          <label for="datasetFile">CSV or Excel file</label>
-          <input id="datasetFile" type="file" accept=".csv,.txt,.xlsx,.xls">
+          <label for="datasetFile">CSV, Excel, or NPY file</label>
+          <input id="datasetFile" type="file" accept=".csv,.txt,.xlsx,.xls,.npy">
         </div>
         <button id="importDataset">Import Dataset</button>
       </section>
@@ -1673,7 +1734,7 @@ INDEX_HTML = r"""<!doctype html>
           </div>
           <div class="field">
             <label for="ucbLambda">UCB lambda</label>
-            <input id="ucbLambda" type="number" step="0.1" value="0.5">
+            <input id="ucbLambda" type="number" step="0.1" value="0.1">
           </div>
         </div>
         <div class="row">
@@ -1755,7 +1816,7 @@ INDEX_HTML = r"""<!doctype html>
           </div>
           <div class="field">
             <label for="benchmarkIterations">BO iterations</label>
-            <input id="benchmarkIterations" type="number" min="1" value="20">
+            <input id="benchmarkIterations" type="number" min="1" value="30">
           </div>
         </div>
         <div class="row">
@@ -1839,6 +1900,46 @@ INDEX_HTML = r"""<!doctype html>
 
     const $ = (id) => document.getElementById(id);
 
+    const HELP_TEXT = {
+      openaiKey: 'Stored only in the local .env file. Required for OpenAI LLMs and embedding-based GPR.',
+      openrouterKey: 'Stored only in the local .env file. Required only for model names that start with openrouter/.',
+      anthropicKey: 'Stored only in the local .env file. Required only for Claude model names.',
+      datasetFile: 'Accepted formats: CSV, TXT, XLS, XLSX, and NPY. The first column must be procedure text; later numeric columns are objectives.',
+      optimizer: 'Choose GPR with embeddings for the GP baseline, or BO-ICL LLM for in-context LLM predictions over the uploaded pool.',
+      objectiveName: 'The numeric label column to optimize. If multiple objective columns were uploaded, choose one here.',
+      objectiveDirection: 'Maximize for yields/selectivity/scores; minimize for losses, errors, or costs.',
+      acquisition: 'Candidate ranking rule. The paper notebook default sweep included upper confidence bound, greedy, random, and random mean baseline.',
+      objectiveScaling: 'Off keeps labels in their original units for model fitting. Auto/min-max/z-score scale only the model target; plots stay in original units.',
+      embeddingModel: 'OpenAI embedding model used to featurize procedures for GPR and nearest-neighbor inverse filtering.',
+      predictionModel: 'LLM used by BO-ICL to predict objective values and acquisition scores for candidate procedures.',
+      inverseModel: 'LLM used only when generating inverse-design text or inverse-filter candidates.',
+      predictionSystemMessage: 'Optional domain instruction prepended to BO-ICL prediction prompts.',
+      inverseSystemMessage: 'Optional domain instruction prepended to inverse-design prompts.',
+      batchSize: 'Number of candidates suggested at once in live experimentation. The paper BO loop used 1.',
+      ucbLambda: 'Exploration weight for upper confidence bound. The paper notebook default was 0.1.',
+      llmSamples: 'Number of LLM prediction samples per candidate for BO-ICL uncertainty estimates.',
+      selectorK: 'Number of nearest labeled examples to include in prompts. 0 uses the normal few-shot history.',
+      inverseFilter: 'Number of pool candidates to retrieve using inverse-design text before scoring. 0 disables inverse filtering.',
+      inverseRandomCandidates: 'Extra random pool candidates mixed with inverse-filter hits before scoring.',
+      inverseTargetValue: 'Manual target for inverse design. Leave blank to use the current best value times the multiplier.',
+      inverseTargetMultiplier: 'Multiplier used for automatic inverse-design targets when no explicit target is entered.',
+      inverseDesignCount: 'Number of free-form inverse-design proposals to generate.',
+      iterationsPerTrial: 'Live-mode stopping point after this many active-objective observations. 0 means no cap.',
+      replicatesPerCandidate: 'How many live measurements are allowed for the same candidate before it leaves the available pool.',
+      scoreLimit: 'Maximum number of available pool candidates scored per suggestion update. Lower values make large pools faster.',
+      nNeighbors: 'GPR embedding neighbor count used by the local GP featurization pipeline.',
+      autoSuggest: 'When checked, adding a live result immediately refreshes suggestions.',
+      benchmarkName: 'Optional label for this appended offline benchmark curve.',
+      benchmarkInitialPoints: 'Number of random starting examples. The paper default was 1; 2 is also common for small pools.',
+      benchmarkIterations: 'Number of BO choices after initialization. The paper notebook default was 30.',
+      benchmarkReplicates: 'Number of repeated runs for the same workflow. The paper notebook default was 5.',
+      benchmarkSeed: 'Starting random seed for reproducible benchmark replicates.',
+      candidateSelect: 'Choose a suggested or uploaded pool candidate for live result entry.',
+      manualProcedure: 'Procedure text for a live observation. This fills automatically when you select a candidate.',
+      objectiveValue: 'Measured objective value in original units.',
+      objectiveUncertainty: 'Optional measurement uncertainty or standard deviation in original units.'
+    };
+
     function escapeHtml(value) {
       return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -1848,6 +1949,37 @@ INDEX_HTML = r"""<!doctype html>
     function fmt(value, digits = 4) {
       if (value === null || value === undefined || Number.isNaN(Number(value))) return '';
       return Number(value).toLocaleString(undefined, { maximumSignificantDigits: digits });
+    }
+
+    function applyHelpText() {
+      Object.entries(HELP_TEXT).forEach(([id, text]) => {
+        const element = $(id);
+        if (element) {
+          element.title = text;
+          element.setAttribute('aria-label', text);
+        }
+        const label = document.querySelector(`label[for="${id}"]`);
+        if (label) {
+          label.title = text;
+          label.classList.add('has-help');
+        }
+      });
+      const buttonHelp = {
+        saveKey: 'Save pasted keys into the local ignored .env file.',
+        importDataset: 'Load candidates and hidden labels from the selected file.',
+        saveConfig: 'Apply the current settings without running a suggestion.',
+        resetRun: 'Clear live observations and suggestions while keeping the uploaded dataset.',
+        runBenchmark: 'Run the current configuration against hidden labels and append it to the plot.',
+        clearBenchmarks: 'Remove appended offline benchmark curves from the plot.',
+        addObservation: 'Record a live measurement for the selected or typed procedure.',
+        suggest: 'Update live-mode candidate suggestions.',
+        suggestTop: 'Update live-mode candidate suggestions.',
+        inverseDesign: 'Generate free-form inverse-design proposals from labeled examples.'
+      };
+      Object.entries(buttonHelp).forEach(([id, text]) => {
+        const element = $(id);
+        if (element) element.title = text;
+      });
     }
 
     async function request(path, options = {}) {
@@ -1899,11 +2031,11 @@ INDEX_HTML = r"""<!doctype html>
         batch_size: Number($('batchSize').value || 1),
         iterations_per_trial: Number($('iterationsPerTrial').value || 0),
         replicates_per_candidate: Number($('replicatesPerCandidate').value || 1),
-        benchmark_iterations: Number($('benchmarkIterations').value || 20),
+        benchmark_iterations: Number($('benchmarkIterations').value || 30),
         benchmark_replicates: Number($('benchmarkReplicates').value || 5),
         benchmark_initial_points: Number($('benchmarkInitialPoints').value || 1),
         benchmark_seed: Number($('benchmarkSeed').value || 0),
-        ucb_lambda: Number($('ucbLambda').value || 0.5),
+        ucb_lambda: Number($('ucbLambda').value || 0.1),
         score_limit: Number($('scoreLimit').value || 250),
         n_neighbors: Number($('nNeighbors').value || 5),
         auto_suggest: $('autoSuggest').checked
@@ -2291,8 +2423,137 @@ INDEX_HTML = r"""<!doctype html>
     });
     $('clearBenchmarks').addEventListener('click', () => request('/api/clear-benchmarks', { method: 'POST' }));
 
+    applyHelpText();
     refresh();
   </script>
+</body>
+</html>
+"""
+
+
+USER_GUIDE_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BO-ICL Local Runner Guide</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Inter, Segoe UI, system-ui, -apple-system, sans-serif;
+      color: #17202a;
+      background: #f6f7f8;
+      line-height: 1.55;
+    }
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 28px 22px 44px;
+    }
+    section {
+      background: #fff;
+      border: 1px solid #d9dee7;
+      border-radius: 8px;
+      padding: 18px 20px;
+      margin: 0 0 16px;
+      box-shadow: 0 8px 24px rgba(18, 31, 53, 0.08);
+    }
+    h1 { font-size: 26px; margin: 0 0 10px; letter-spacing: 0; }
+    h2 { font-size: 18px; margin: 0 0 8px; letter-spacing: 0; }
+    h3 { font-size: 15px; margin: 16px 0 6px; letter-spacing: 0; }
+    code {
+      background: #eef2f6;
+      border-radius: 5px;
+      padding: 2px 5px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+      margin-top: 8px;
+    }
+    th, td {
+      border-bottom: 1px solid #edf0f5;
+      text-align: left;
+      vertical-align: top;
+      padding: 8px;
+    }
+    th { color: #475467; background: #fbfcfe; }
+    .muted { color: #667085; }
+    .callout {
+      border-left: 3px solid #0f766e;
+      background: #f0fdfa;
+      padding: 10px 12px;
+      border-radius: 6px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>BO-ICL Local Runner Guide</h1>
+    <p class="muted">Use this local browser tool for Bayesian-optimization active learning over a finite pool of procedures.</p>
+
+    <section>
+      <h2>Accepted Dataset Formats</h2>
+      <p>The first column is always interpreted as the procedure text. Later numeric columns are treated as objective labels. Columns with names containing <code>uncert</code>, <code>std</code>, <code>stdev</code>, <code>sigma</code>, or <code>error</code> are treated as uncertainty columns.</p>
+      <table>
+        <thead><tr><th>Format</th><th>Expected shape</th></tr></thead>
+        <tbody>
+          <tr><td><code>.csv</code>, <code>.txt</code></td><td>Comma-separated table. First column procedures, later numeric objective columns.</td></tr>
+          <tr><td><code>.xlsx</code>, <code>.xls</code></td><td>First sheet is read as a table using the same first-column procedure rule.</td></tr>
+          <tr><td><code>.npy</code></td><td>1D array for procedure-only pools, 2D array with first column procedures and later objective columns, or structured array with named fields.</td></tr>
+        </tbody>
+      </table>
+      <h3>Example CSV</h3>
+      <pre><code>procedure,C2 yield,C2 yield uncertainty,selectivity
+"Procedure A",12.4,0.3,71.0
+"Procedure B",10.1,0.4,77.5
+"Procedure C",,,</code></pre>
+    </section>
+
+    <section>
+      <h2>Paper-Style Offline Benchmark</h2>
+      <p>Use this when you already have labels for the full pool and want to test BO performance without revealing labels to the model until each simulated experiment is selected.</p>
+      <ol>
+        <li>Import a labeled dataset.</li>
+        <li>Choose the active objective and whether to maximize or minimize it.</li>
+        <li>Choose the suggestion engine, model, acquisition function, and target scaling.</li>
+        <li>Set <code>Initial random</code>, <code>BO iterations</code>, <code>Workflow replicates</code>, and <code>Seed</code>.</li>
+        <li>Click <code>Run & Append</code>. Change settings and click it again to compare another configuration.</li>
+      </ol>
+      <div class="callout">Paper-style numerical defaults are <code>Initial random = 1</code>, <code>Batch size = 1</code>, <code>BO iterations = 30</code>, <code>Workflow replicates = 5</code>, and <code>UCB lambda = 0.1</code>. Current model defaults use supported modern model IDs rather than retired paper-era model names.</div>
+      <p>The plot shows the mean best-so-far trajectory and a +/- 1 standard deviation band. The dashed random baseline is the paper notebook's random-mean quantile expectation. Full-dataset guide lines mark the mean, 75th, 95th, 99th percentile, and maximum.</p>
+    </section>
+
+    <section>
+      <h2>Live Experimentation</h2>
+      <p>Use this when you have a pool of procedures but labels are produced by experiments over time.</p>
+      <ol>
+        <li>Import a procedure pool. Labels can be blank or absent.</li>
+        <li>Add one or two initial measured results with <code>Add Observation</code>.</li>
+        <li>Click <code>Update Suggestions</code> to choose the next candidate from the uploaded pool.</li>
+        <li>Run the physical experiment offline, then enter the measured value and optional uncertainty.</li>
+        <li>Repeat until the iteration cap is reached or you decide to stop.</li>
+      </ol>
+      <p>Objective values should be entered in original units. Scaling is only used internally for fitting if enabled, and the plot remains in original units.</p>
+    </section>
+
+    <section>
+      <h2>Settings Reference</h2>
+      <table>
+        <thead><tr><th>Setting</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td>Suggestion engine</td><td><code>GPR with embeddings</code> uses OpenAI embeddings plus a Gaussian process. <code>BO-ICL LLM</code> uses the selected LLM for in-context predictions.</td></tr>
+          <tr><td>Acquisition</td><td>Rule for ranking the next experiment. UCB balances mean and uncertainty; expected improvement favors likely gains; greedy uses predicted best; random is a control.</td></tr>
+          <tr><td>Target scaling</td><td>Off by default. Auto/min-max/z-score can help GPR numerics when bounded labels are not already near unit scale.</td></tr>
+          <tr><td>Score limit</td><td>Caps how many pool candidates are scored per update. Use lower values for very large pools to keep local runs responsive.</td></tr>
+          <tr><td>Replicates</td><td>Live-mode repeated measurements allowed for the same candidate before it is removed from the available pool.</td></tr>
+          <tr><td>Workflow replicates</td><td>Offline benchmark repeated runs of the whole BO workflow for averaging and spread bands.</td></tr>
+          <tr><td>API keys</td><td>Keys are written only to the local ignored <code>.env</code> file. OpenAI keys are required for embeddings and OpenAI LLMs; OpenRouter and Anthropic keys are only needed for those model families.</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
 </body>
 </html>
 """

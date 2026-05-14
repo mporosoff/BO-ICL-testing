@@ -1,5 +1,10 @@
+from io import BytesIO
+
+import numpy as np
+
 from boicl import AskTellFewShotTopk, Pool
 from boicl.local_app import (
+    DEFAULT_CONFIG,
     LocalBOState,
     _best_trace,
     _coerce_float,
@@ -40,6 +45,27 @@ def test_import_dataset_can_select_between_multiple_objectives(tmp_path):
     assert payload["label_count"] == 2
     assert state.candidates[0]["objectives"]["yield"] == 1.2
     assert payload["dataset_stats"][0]["label"] == "mean"
+
+
+def test_import_dataset_accepts_npy_table(tmp_path):
+    state = LocalBOState(tmp_path)
+    out = BytesIO()
+    np.save(out, np.array([["proc a", 1.2], ["proc b", 2.5]], dtype=object))
+
+    payload = state.import_dataset("dataset.npy", out.getvalue())
+
+    assert payload["candidate_count"] == 2
+    assert payload["label_count"] == 2
+    assert payload["objective_names"] == ["objective"]
+    assert state.candidates[1]["objectives"]["objective"] == 2.5
+
+
+def test_defaults_match_paper_style_numeric_settings():
+    assert DEFAULT_CONFIG["benchmark_initial_points"] == 1
+    assert DEFAULT_CONFIG["batch_size"] == 1
+    assert DEFAULT_CONFIG["benchmark_iterations"] == 30
+    assert DEFAULT_CONFIG["benchmark_replicates"] == 5
+    assert DEFAULT_CONFIG["ucb_lambda"] == 0.1
 
 
 def test_replicates_keep_candidate_available_until_limit(tmp_path):

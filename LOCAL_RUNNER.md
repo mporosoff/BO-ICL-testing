@@ -17,11 +17,12 @@ tracked files.
 
 ## Dataset Format
 
-Import a `.csv`, `.xlsx`, or `.xls` file. The first column must contain the
-procedure text. Any later numeric columns are treated as objective functions,
-unless the column name looks like uncertainty, standard deviation, sigma, or
-error. Uncertainty columns are paired with an objective when their name contains
-the objective name, or with the only objective when there is just one.
+Import a `.csv`, `.txt`, `.xlsx`, `.xls`, or `.npy` file. The first column must
+contain the procedure text. Any later numeric columns are treated as objective
+functions, unless the column name looks like uncertainty, standard deviation,
+sigma, or error. Uncertainty columns are paired with an objective when their
+name contains the objective name, or with the only objective when there is just
+one.
 
 Example:
 
@@ -45,6 +46,10 @@ objective in the settings panel to retrain/replot against another uploaded
 objective. Imported labels are stored as hidden candidate truth for offline
 benchmarks; live observations are only created when you click `Add Observation`
 or when an offline benchmark simulation selects a candidate.
+
+For `.npy` files, use a 1D array for procedure-only pools, a 2D array where the
+first column is procedure text and later columns are labels, or a structured
+array with named fields.
 
 ## Running
 
@@ -105,15 +110,23 @@ Replicate observations are averaged by procedure before model training.
 
 ## Offline BO Benchmarks
 
+Click `User Guide` in the app header to open the built-in local guide in a new
+browser tab. Hover over settings labels in the app for quick explanations.
+
 Use `Offline Benchmark` when the uploaded dataset already contains labels and
 you want paper-style controlled experiments. Set the current suggestion engine,
 acquisition function, model settings, objective, and scaling, then choose:
 
 - `Initial random`: number of random starting points, usually 1 or 2.
 - `BO iterations`: number of sequential active-learning choices after the
-  initial points.
+  initial points. The paper-style default is 30.
 - `Workflow replicates`: repeated runs of the same configuration, usually 5.
 - `Seed`: reproducible starting seed for the replicate set.
+
+The paper-style numerical defaults are `Initial random = 1`, `Batch size = 1`,
+`BO iterations = 30`, `Workflow replicates = 5`, and `UCB lambda = 0.1`. Model
+names default to currently supported models rather than retired paper-era model
+IDs.
 
 Click `Run & Append` to add the current configuration to the plot. Change the
 model or acquisition settings and click `Run & Append` again to compare another
