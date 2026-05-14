@@ -139,6 +139,26 @@ def test_offline_benchmark_appends_random_config_without_live_observations(tmp_p
     assert run["summary"][-1]["count"] == 3
 
 
+def test_campaign_save_load_and_autosave_roundtrip(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset("dataset.csv", b"procedure,value\nproc a,1\nproc b,2\n")
+    state.add_observation({"candidate_id": "cand-0", "value": 1.0})
+
+    saved = state.save_campaign({"name": "Week one campaign"})
+    campaign_id = saved["campaign"]["id"]
+    assert campaign_id
+    assert (tmp_path / "saved_experiments" / campaign_id / "campaign.json").exists()
+
+    state.add_observation({"candidate_id": "cand-1", "value": 2.0})
+    reloaded = LocalBOState(tmp_path)
+    payload = reloaded.load_campaign({"id": campaign_id})
+
+    assert payload["campaign"]["name"] == "Week one campaign"
+    assert payload["candidate_count"] == 2
+    assert len(payload["observations"]) == 2
+    assert payload["observations"][-1]["value"] == 2.0
+
+
 def test_float_coercion_rejects_empty_and_nonfinite():
     assert _coerce_float("1.5") == 1.5
     assert _coerce_float("") is None

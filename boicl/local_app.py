@@ -394,16 +394,96 @@ class LocalBOState:
     events: List[Dict[str, str]] = field(default_factory=list)
     last_error: Optional[str] = None
     last_model_status: str = "No dataset loaded."
+    campaign_id: Optional[str] = None
+    campaign_name: str = ""
 
     def __post_init__(self) -> None:
         self.lock = threading.RLock()
         self.env_path = self.root / ".env"
         self.cache_dir = self.root / ".cache"
+        self.campaigns_dir = self.root / "saved_experiments"
         _load_env_file(self.env_path)
 
     def log(self, message: str) -> None:
         self.events.insert(0, {"time": _now(), "message": message})
         self.events = self.events[:20]
+
+    def campaign_file(self, campaign_id: str) -> Path:
+        return self.campaigns_dir / campaign_id / "campaign.json"
+
+    def list_campaigns(self) -> List[Dict[str, Any]]:
+        if not self.campaigns_dir.exists():
+            return []
+        campaigns = []
+        for path in sorted(self.campaigns_dir.glob("*/campaign.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            meta = payload.get("meta", {})
+            campaigns.append(
+                {
+                    "id": meta.get("id") or path.parent.name,
+                    "name": meta.get("name") or path.parent.name,
+                    "updated": meta.get("updated") or "",
+                    "candidate_count": len(payload.get("candidates", [])),
+                    "observation_count": len(payload.get("observations", [])),
+                }
+            )
+        campaigns.sort(key=lambda item: item.get("updated", ""), reverse=True)
+        return campaigns
+
+    def _unique_campaign_id(self, name: str) -> str:
+        base = _safe_cache_fragment(name.lower()) or "campaign"
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        candidate_id = f"{base}_{stamp}"
+        counter = 2
+        while self.campaign_file(candidate_id).exists():
+            candidate_id = f"{base}_{stamp}_{counter}"
+            counter += 1
+        return candidate_id
+
+    def _campaign_payload_locked(self) -> Dict[str, Any]:
+        now = _now()
+        return {
+            "version": 1,
+            "meta": {
+                "id": self.campaign_id,
+                "name": self.campaign_name,
+                "saved": now,
+                "updated": now,
+            },
+            "config": self.config,
+            "objective_names": self.objective_names,
+            "candidates": self.candidates,
+            "observations": self.observations,
+            "suggestions": self.suggestions,
+            "inverse_designs": self.inverse_designs,
+            "benchmark_runs": self.benchmark_runs,
+            "last_model_status": self.last_model_status,
+            "events": self.events[:20],
+        }
+
+    def _write_campaign_locked(self) -> None:
+        if not self.campaign_id:
+            return
+        path = self.campaign_file(self.campaign_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self._campaign_payload_locked()
+        existing_created = None
+        if path.exists():
+            try:
+                existing_created = json.loads(path.read_text(encoding="utf-8")).get(
+                    "meta", {}
+                ).get("created")
+            except (OSError, json.JSONDecodeError):
+                existing_created = None
+        payload["meta"]["created"] = existing_created or payload["meta"]["saved"]
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def _autosave_locked(self) -> None:
+        if self.campaign_id:
+            self._write_campaign_locked()
 
     def embedding_cache_path(self) -> Path:
         fragment = _safe_cache_fragment(self.config["embedding_model"])
@@ -435,6 +515,12 @@ class LocalBOState:
             plot_steps = self.plot_horizon(len(active_observations))
             return {
                 "config": self.config,
+                "campaign": {
+                    "id": self.campaign_id,
+                    "name": self.campaign_name,
+                    "saved": bool(self.campaign_id),
+                },
+                "campaigns": self.list_campaigns(),
                 "objective_names": self.objective_names,
                 "key_status": self.key_status(),
                 "candidates": [
@@ -494,6 +580,72 @@ class LocalBOState:
             float(cand["objectives"][objective])
             for cand in self.labelled_candidates(objective)
         ]
+
+    def save_campaign(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        with self.lock:
+            name = (payload.get("name") or self.campaign_name or "").strip()
+            if not name:
+                name = f"BO campaign {time.strftime('%Y-%m-%d %H:%M')}"
+            save_as = bool(payload.get("save_as"))
+            if save_as or not self.campaign_id:
+                self.campaign_id = self._unique_campaign_id(name)
+            self.campaign_name = name
+            self._write_campaign_locked()
+            self.last_model_status = f"Saved campaign: {name}."
+            self.log(f"Saved campaign '{name}'.")
+            return self.to_json()
+
+    def load_campaign(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        campaign_id = _safe_cache_fragment(str(payload.get("id") or "").lower())
+        if not campaign_id:
+            raise ValueError("Choose a saved campaign to load.")
+        path = self.campaign_file(campaign_id).resolve()
+        root = self.campaigns_dir.resolve()
+        if root not in path.parents or not path.exists():
+            raise ValueError("Saved campaign was not found.")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        meta = data.get("meta", {})
+        with self.lock:
+            self.campaign_id = meta.get("id") or campaign_id
+            self.campaign_name = meta.get("name") or campaign_id
+            self.config = dict(DEFAULT_CONFIG)
+            self.config.update(data.get("config", {}))
+            self.objective_names = list(data.get("objective_names") or ["objective"])
+            self.candidates = list(data.get("candidates") or [])
+            self.observations = list(data.get("observations") or [])
+            self.suggestions = list(data.get("suggestions") or [])
+            self.inverse_designs = list(data.get("inverse_designs") or [])
+            self.benchmark_runs = list(data.get("benchmark_runs") or [])
+            self.events = list(data.get("events") or [])[:20]
+            self.last_error = None
+            self.last_model_status = (
+                data.get("last_model_status")
+                or f"Loaded campaign: {self.campaign_name}."
+            )
+            self.refresh_active_objective()
+            self.log(f"Loaded campaign '{self.campaign_name}'.")
+            return self.to_json()
+
+    def delete_campaign(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        campaign_id = _safe_cache_fragment(str(payload.get("id") or "").lower())
+        if not campaign_id:
+            raise ValueError("Choose a saved campaign to delete.")
+        path = self.campaign_file(campaign_id).resolve()
+        root = self.campaigns_dir.resolve()
+        if root not in path.parents or not path.exists():
+            raise ValueError("Saved campaign was not found.")
+        with self.lock:
+            path.unlink()
+            try:
+                path.parent.rmdir()
+            except OSError:
+                pass
+            if self.campaign_id == campaign_id:
+                self.campaign_id = None
+                self.campaign_name = ""
+            self.last_model_status = "Deleted saved campaign."
+            self.log("Deleted saved campaign.")
+            return self.to_json()
 
     def active_observations(self) -> List[Dict[str, Any]]:
         objective = self.config["objective_name"]
@@ -612,6 +764,7 @@ class LocalBOState:
             labelled = len(self.labelled_candidates())
             if labelled:
                 self.log(f"Loaded {labelled} hidden labels for offline benchmarks.")
+            self._autosave_locked()
             return self.to_json()
 
     def update_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -692,6 +845,7 @@ class LocalBOState:
                 self.objective_names.append(self.config["objective_name"])
             self.refresh_active_objective()
             self.log("Updated run settings.")
+            self._autosave_locked()
             return self.to_json()
 
     def add_observation(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -723,6 +877,7 @@ class LocalBOState:
             self.last_error = None
             self.last_model_status = "Observation added. Suggestions need an update."
             self.log(f"Added objective value {value:g}.")
+            self._autosave_locked()
             return self.to_json()
 
     def _add_observation_locked(
@@ -765,25 +920,30 @@ class LocalBOState:
             if iteration_cap and len(active_observations) >= iteration_cap:
                 self.suggestions = []
                 self.last_model_status = "Iteration cap reached."
+                self._autosave_locked()
                 return self.to_json()
             available = self.available_candidates()
             if not available:
                 self.suggestions = []
                 self.last_model_status = "No unevaluated candidates remain."
+                self._autosave_locked()
                 return self.to_json()
             missing_key = self._missing_key_for_suggestions()
             if missing_key:
                 self.suggestions = self._random_suggestions(available)
                 self.last_model_status = f"{missing_key} missing. Showing random candidates."
                 self.log(f"Add {missing_key} to enable {self.config['optimizer'].upper()} suggestions.")
+                self._autosave_locked()
                 return self.to_json()
             if len(active_observations) < 2:
                 self.suggestions = self._random_suggestions(available)
                 self.last_model_status = "Add at least 2 observations before model suggestions."
+                self._autosave_locked()
                 return self.to_json()
             if len(self._training_observations()) < 2:
                 self.suggestions = self._random_suggestions(available)
                 self.last_model_status = "Add at least 2 unique procedures before model suggestions."
+                self._autosave_locked()
                 return self.to_json()
 
             try:
@@ -802,6 +962,7 @@ class LocalBOState:
                 ).strip()
                 self.last_model_status = "Model update failed. Showing random candidates."
                 self.log("Model update failed; see status panel.")
+            self._autosave_locked()
             return self.to_json()
 
     def _missing_key_for_suggestions(self) -> Optional[str]:
@@ -1050,6 +1211,7 @@ class LocalBOState:
             self.inverse_designs = generated + self.inverse_designs
             self.inverse_designs = self.inverse_designs[:20]
             self.log(f"Generated {len(generated)} inverse design proposal(s).")
+            self._autosave_locked()
             return self.to_json()
 
     def _observation_from_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
@@ -1220,6 +1382,7 @@ class LocalBOState:
                 f"Ran benchmark '{name}' with {replicates} replicate(s), "
                 f"{initial_points} initial point(s), and {iterations} BO iteration(s)."
             )
+            self._autosave_locked()
             return self.to_json()
 
     def clear_benchmarks(self) -> Dict[str, Any]:
@@ -1227,6 +1390,7 @@ class LocalBOState:
             self.benchmark_runs = []
             self.last_model_status = "Cleared offline benchmark runs."
             self.log("Cleared offline benchmark runs.")
+            self._autosave_locked()
             return self.to_json()
 
     def _training_rows_and_scaler(
@@ -1249,6 +1413,7 @@ class LocalBOState:
             self.last_error = None
             self.last_model_status = "Run reset. Dataset is still loaded."
             self.log("Cleared observations and suggestions.")
+            self._autosave_locked()
             return self.to_json()
 
     def export_observations_csv(self) -> str:
@@ -1318,6 +1483,8 @@ class LocalAppHandler(BaseHTTPRequestHandler):
             self._send_text(USER_GUIDE_HTML, "text/html")
         elif parsed.path == "/api/state":
             self._send_json(self.state.to_json())
+        elif parsed.path == "/api/campaigns":
+            self._send_json({"campaigns": self.state.list_campaigns()})
         elif parsed.path == "/api/export-observations.csv":
             payload = self.state.export_observations_csv()
             raw = payload.encode("utf-8")
@@ -1357,6 +1524,12 @@ class LocalAppHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/import-dataset":
                 filename = parse_qs(parsed.query).get("filename", ["dataset.csv"])[0]
                 self._send_json(self.state.import_dataset(filename, self._read_raw()))
+            elif parsed.path == "/api/save-campaign":
+                self._send_json(self.state.save_campaign(self._read_json()))
+            elif parsed.path == "/api/load-campaign":
+                self._send_json(self.state.load_campaign(self._read_json()))
+            elif parsed.path == "/api/delete-campaign":
+                self._send_json(self.state.delete_campaign(self._read_json()))
             elif parsed.path == "/api/config":
                 self._send_json(self.state.update_config(self._read_json()))
             elif parsed.path == "/api/observe":
@@ -1632,6 +1805,7 @@ INDEX_HTML = r"""<!doctype html>
     </div>
     <div class="toolbar">
       <span class="chip" id="keyStatus">Key status</span>
+      <span class="chip" id="campaignStatus">Unsaved campaign</span>
       <span class="chip" id="datasetStatus">No dataset</span>
       <span class="chip" id="observationStatus">0 observations</span>
       <a class="button-link" href="/guide" target="_blank" rel="noopener" title="Open the local user guide in a new browser tab.">User Guide</a>
@@ -1656,6 +1830,24 @@ INDEX_HTML = r"""<!doctype html>
           <input id="anthropicKey" type="password" autocomplete="off" placeholder="optional">
         </div>
         <button class="primary" id="saveKey">Save Locally</button>
+      </section>
+
+      <section class="panel">
+        <h2>Campaign</h2>
+        <div class="field">
+          <label for="campaignName">Campaign name</label>
+          <input id="campaignName" placeholder="new campaign">
+        </div>
+        <div class="field">
+          <label for="savedCampaign">Saved campaigns</label>
+          <select id="savedCampaign"></select>
+        </div>
+        <div class="toolbar">
+          <button class="primary" id="saveCampaign">Save</button>
+          <button id="saveAsCampaign">Save As New</button>
+          <button id="loadCampaign">Load</button>
+          <button id="deleteCampaign">Delete</button>
+        </div>
       </section>
 
       <section class="panel">
@@ -1904,6 +2096,8 @@ INDEX_HTML = r"""<!doctype html>
       openaiKey: 'Stored only in the local .env file. Required for OpenAI LLMs and embedding-based GPR.',
       openrouterKey: 'Stored only in the local .env file. Required only for model names that start with openrouter/.',
       anthropicKey: 'Stored only in the local .env file. Required only for Claude model names.',
+      campaignName: 'Local campaign name. Save once, then future changes autosave into saved_experiments.',
+      savedCampaign: 'Previously saved local campaigns that can be loaded without re-uploading the dataset.',
       datasetFile: 'Accepted formats: CSV, TXT, XLS, XLSX, and NPY. The first column must be procedure text; later numeric columns are objectives.',
       optimizer: 'Choose GPR with embeddings for the GP baseline, or BO-ICL LLM for in-context LLM predictions over the uploaded pool.',
       objectiveName: 'The numeric label column to optimize. If multiple objective columns were uploaded, choose one here.',
@@ -1966,6 +2160,10 @@ INDEX_HTML = r"""<!doctype html>
       });
       const buttonHelp = {
         saveKey: 'Save pasted keys into the local ignored .env file.',
+        saveCampaign: 'Save or overwrite the current local campaign.',
+        saveAsCampaign: 'Create a separate saved campaign copy with the current state.',
+        loadCampaign: 'Reload the selected saved campaign and continue where it left off.',
+        deleteCampaign: 'Delete the selected local campaign save folder.',
         importDataset: 'Load candidates and hidden labels from the selected file.',
         saveConfig: 'Apply the current settings without running a suggestion.',
         resetRun: 'Clear live observations and suggestions while keeping the uploaded dataset.',
@@ -2048,12 +2246,16 @@ INDEX_HTML = r"""<!doctype html>
       const keyCount = [state.key_status.openai_configured, state.key_status.openrouter_configured, state.key_status.anthropic_configured].filter(Boolean).length;
       $('keyStatus').textContent = keyCount ? `${keyCount} API key${keyCount > 1 ? 's' : ''} set` : 'API keys missing';
       $('keyStatus').className = `chip ${keyCount ? 'good' : 'warn'}`;
+      const campaign = state.campaign || {};
+      $('campaignStatus').textContent = campaign.saved ? `Saved: ${campaign.name || campaign.id}` : 'Unsaved campaign';
+      $('campaignStatus').className = `chip ${campaign.saved ? 'good' : 'warn'}`;
       $('datasetStatus').textContent = `${state.candidate_count} candidates, ${state.label_count || 0} labels`;
       $('datasetStatus').className = `chip ${state.candidate_count ? 'good' : 'warn'}`;
       $('observationStatus').textContent = `${state.observations.length} observations`;
       $('observationStatus').className = `chip ${state.observations.length ? 'good' : 'warn'}`;
       $('modelStatus').textContent = state.last_model_status || '';
 
+      renderCampaigns();
       renderConfig();
       renderCandidateSelect();
       renderPlot();
@@ -2062,6 +2264,20 @@ INDEX_HTML = r"""<!doctype html>
       renderInverseDesigns();
       renderObservations();
       renderMessages();
+    }
+
+    function renderCampaigns() {
+      const campaign = state.campaign || {};
+      $('campaignName').value = campaign.name || '';
+      const campaigns = state.campaigns || [];
+      const options = ['<option value="">Choose saved campaign</option>'].concat(
+        campaigns.map((item) => {
+          const label = `${item.name} (${item.observation_count || 0} obs, ${item.candidate_count || 0} candidates)`;
+          return `<option value="${escapeHtml(item.id)}">${escapeHtml(label)}</option>`;
+        })
+      );
+      $('savedCampaign').innerHTML = options.join('');
+      if (campaign.id) $('savedCampaign').value = campaign.id;
     }
 
     function renderConfig() {
@@ -2351,6 +2567,41 @@ INDEX_HTML = r"""<!doctype html>
       $('anthropicKey').value = '';
     });
 
+    $('saveCampaign').addEventListener('click', async () => {
+      await request('/api/save-campaign', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: $('campaignName').value, save_as: false })
+      });
+    });
+
+    $('saveAsCampaign').addEventListener('click', async () => {
+      await request('/api/save-campaign', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: $('campaignName').value, save_as: true })
+      });
+    });
+
+    $('loadCampaign').addEventListener('click', async () => {
+      if (!$('savedCampaign').value) return renderError('Choose a saved campaign.');
+      await request('/api/load-campaign', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: $('savedCampaign').value })
+      });
+    });
+
+    $('deleteCampaign').addEventListener('click', async () => {
+      if (!$('savedCampaign').value) return renderError('Choose a saved campaign.');
+      if (!window.confirm('Delete this saved campaign from disk?')) return;
+      await request('/api/delete-campaign', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: $('savedCampaign').value })
+      });
+    });
+
     $('importDataset').addEventListener('click', async () => {
       const file = $('datasetFile').files[0];
       if (!file) return renderError('Choose a CSV or Excel file.');
@@ -2492,6 +2743,18 @@ USER_GUIDE_HTML = r"""<!doctype html>
   <main>
     <h1>BO-ICL Local Runner Guide</h1>
     <p class="muted">Use this local browser tool for Bayesian-optimization active learning over a finite pool of procedures.</p>
+
+    <section>
+      <h2>Saving Long-Running Campaigns</h2>
+      <p>Live experimental campaigns can run for days or weeks. Save the campaign once before you start, then the app autosaves later changes into a local folder under <code>saved_experiments/</code>. That folder is ignored by Git so lab data and API context stay on this computer.</p>
+      <ol>
+        <li>Enter a <code>Campaign name</code> and click <code>Save</code>.</li>
+        <li>Import the dataset, choose settings, add observations, and update suggestions as usual.</li>
+        <li>Close the browser whenever needed. The saved campaign contains the uploaded pool, labels if present, observations, suggestions, settings, inverse designs, and benchmark runs.</li>
+        <li>Later, start the local runner, choose the campaign in <code>Saved campaigns</code>, and click <code>Load</code>.</li>
+      </ol>
+      <p>Use <code>Save As New</code> to branch a campaign into a separate local copy before trying a different strategy.</p>
+    </section>
 
     <section>
       <h2>Accepted Dataset Formats</h2>

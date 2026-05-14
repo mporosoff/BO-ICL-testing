@@ -13,6 +13,7 @@ IBMPlexMono-Regular.ttf
 .vscode
 .cache/
 .boicl-local/
+saved_experiments/
 *.embedding-cache.csv
 **.DS_Store
 **paper

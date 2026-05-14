@@ -113,6 +113,19 @@ Replicate observations are averaged by procedure before model training.
 Click `User Guide` in the app header to open the built-in local guide in a new
 browser tab. Hover over settings labels in the app for quick explanations.
 
+## Saved Campaigns
+
+Use the `Campaign` panel for live experiments that run over days or weeks. Enter
+a campaign name and click `Save` once. The app writes a local JSON snapshot under
+`saved_experiments/`, which is ignored by Git, and then autosaves later changes
+to that same campaign.
+
+Saved campaigns include the uploaded candidate pool, hidden labels if present,
+settings, observations, current suggestions, inverse-design proposals, benchmark
+runs, and recent event context. Restart the app later, choose the saved campaign,
+and click `Load` to continue without re-uploading the dataset. Use `Save As New`
+to branch a campaign before trying a different strategy.
+
 Use `Offline Benchmark` when the uploaded dataset already contains labels and
 you want paper-style controlled experiments. Set the current suggestion engine,
 acquisition function, model settings, objective, and scaling, then choose:
