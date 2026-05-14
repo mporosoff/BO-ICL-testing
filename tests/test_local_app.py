@@ -173,6 +173,40 @@ def test_campaign_save_load_and_autosave_roundtrip(tmp_path):
     assert payload["observations"][-1]["value"] == 2.0
 
 
+def test_embedding_cache_status_counts_current_dataset_and_model(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset("dataset.csv", b"procedure,value\nproc a,1\nproc b,2\n")
+    state.cache_dir.mkdir()
+    state.embedding_cache_path().write_text(
+        "x,embedding,embedding_model\n"
+        '"proc a","[1.0, 0.0]",text-embedding-ada-002\n'
+        '"other","[0.0, 1.0]",text-embedding-ada-002\n',
+        encoding="utf-8",
+    )
+
+    status = state.embedding_cache_status()
+
+    assert status["cached_count"] == 1
+    assert status["total_count"] == 2
+    assert status["missing_count"] == 1
+
+
+def test_cached_approx_sample_uses_saved_embeddings_without_api(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.cache_dir.mkdir()
+    state.embedding_cache_path().write_text(
+        "x,embedding,embedding_model\n"
+        '"proc a","[1.0, 0.0]",text-embedding-ada-002\n'
+        '"proc b","[0.0, 1.0]",text-embedding-ada-002\n'
+        '"target","[0.95, 0.05]",text-embedding-ada-002\n',
+        encoding="utf-8",
+    )
+
+    assert state._cached_approx_sample(["proc a", "proc b"], "target", 1) == [
+        "proc a"
+    ]
+
+
 def test_float_coercion_rejects_empty_and_nonfinite():
     assert _coerce_float("1.5") == 1.5
     assert _coerce_float("") is None

@@ -105,6 +105,12 @@ independent settings. OpenAI model names use `OPENAI_API_KEY`, `openrouter/...`
 model names use `OPENROUTER_API_KEY`, and `claude-...` model names use
 `ANTHROPIC_API_KEY`.
 
+After importing a dataset, click `Prepare Embeddings` to embed the full
+candidate pool with the selected embedding model. The embeddings are saved under
+`.cache/` and reused for later GPR runs, inverse-filter candidate matching,
+repeated benchmark configurations, and app restarts. If you change the embedding
+model, prepare embeddings once for the new model too.
+
 BO-ICL LLM mode includes default materials-synthesis system messages for
 prediction and inverse design, so the package should not warn about missing
 system messages. Edit those messages in the browser if a campaign needs a more

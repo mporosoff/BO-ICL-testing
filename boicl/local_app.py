@@ -518,6 +518,28 @@ class LocalBOState:
         fragment = _safe_cache_fragment(self.config["embedding_model"])
         return self.cache_dir / f"boicl_embeddings_{fragment}.csv"
 
+    def embedding_cache_status(self) -> Dict[str, Any]:
+        procedures = [candidate["procedure"] for candidate in self.candidates]
+        total = len(procedures)
+        cached = 0
+        path = self.embedding_cache_path()
+        if total and path.exists():
+            try:
+                cache = pd.read_csv(path, usecols=["x", "embedding_model"])
+                model_cache = cache[cache["embedding_model"] == self.config["embedding_model"]]
+                cached_texts = set(model_cache["x"].astype(str).tolist())
+                cached = sum(1 for procedure in procedures if procedure in cached_texts)
+            except (OSError, ValueError, KeyError, pd.errors.ParserError):
+                cached = 0
+        return {
+            "model": self.config["embedding_model"],
+            "path": str(path),
+            "cached_count": cached,
+            "total_count": total,
+            "missing_count": max(0, total - cached),
+            "ready": total > 0 and cached >= total,
+        }
+
     def key_status(self) -> Dict[str, Any]:
         key = os.environ.get("OPENAI_API_KEY", "")
         openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
@@ -581,6 +603,7 @@ class LocalBOState:
                 "acquisition_functions": ACQUISITION_FUNCTIONS,
                 "model_presets": MODEL_PRESETS,
                 "embedding_model_presets": EMBEDDING_MODEL_PRESETS,
+                "embedding_cache": self.embedding_cache_status(),
                 "scaling_modes": SCALING_MODES,
             }
 
@@ -618,6 +641,48 @@ class LocalBOState:
 
     def inverse_system_message(self) -> str:
         return self.config.get("inverse_system_message") or DEFAULT_INVERSE_SYSTEM_MESSAGE
+
+    def _embedding_cache_model(self):
+        from boicl import AskTellGPR
+
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        return AskTellGPR(
+            cache_path=str(self.embedding_cache_path()),
+            embedding_model=self.config["embedding_model"],
+            n_neighbors=1,
+            n_components=1,
+            y_name=self.config["objective_name"],
+        )
+
+    def _cached_embeddings(self, texts: List[str]) -> List[List[float]]:
+        if not texts:
+            return []
+        model = self._embedding_cache_model()
+        embeddings = model._query_cache(texts)
+        model.save_cache(str(self.embedding_cache_path()))
+        return embeddings
+
+    def precompute_embeddings(self) -> Dict[str, Any]:
+        with self.lock:
+            if not self.candidates:
+                raise ValueError("Import a dataset before preparing embeddings.")
+            if not os.environ.get("OPENAI_API_KEY"):
+                raise ValueError("OPENAI_API_KEY is required to prepare embeddings.")
+            procedures = [candidate["procedure"] for candidate in self.candidates]
+            before = self.embedding_cache_status()["cached_count"]
+            self._cached_embeddings(procedures)
+            after_status = self.embedding_cache_status()
+            added = after_status["cached_count"] - before
+            self.last_model_status = (
+                f"Prepared embeddings for {after_status['cached_count']} of "
+                f"{after_status['total_count']} candidates."
+            )
+            self.log(
+                f"Prepared {max(0, added)} new embedding(s) using "
+                f"{self.config['embedding_model']}."
+            )
+            self._autosave_locked()
+            return self.to_json()
 
     def save_campaign(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         with self.lock:
@@ -1139,16 +1204,14 @@ class LocalBOState:
         rng: Optional[random.Random] = None,
         k: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        from boicl import Pool
-
         model, scaler = self._build_llm_model(observations)
         subset = self._candidate_subset(available, rng)
         procedures = [cand["procedure"] for cand in subset]
         inverse_text = None
         if self.config["inverse_filter"] and procedures:
             inverse_text = self._generate_inverse_text(model, scaler)
-            pool = Pool(procedures, embedding_model=self.config["embedding_model"])
-            filtered = pool.approx_sample(
+            filtered = self._cached_approx_sample(
+                procedures,
                 inverse_text,
                 min(int(self.config["inverse_filter"]), len(procedures)),
             )
@@ -1200,6 +1263,21 @@ class LocalBOState:
             for procedure, aq, mean in zip(selected, acquisition, means)
             if procedure in by_proc
         ]
+
+    def _cached_approx_sample(
+        self, procedures: List[str], query: str, k: int
+    ) -> List[str]:
+        if k <= 0 or not procedures:
+            return []
+        embeddings = np.array(self._cached_embeddings([*procedures, query]), dtype=float)
+        candidate_vectors = embeddings[: len(procedures)]
+        query_vector = embeddings[-1]
+        candidate_norms = np.linalg.norm(candidate_vectors, axis=1)
+        query_norm = np.linalg.norm(query_vector)
+        denom = np.maximum(candidate_norms * query_norm, 1e-12)
+        scores = (candidate_vectors @ query_vector) / denom
+        order = np.argsort(scores)[::-1]
+        return [procedures[index] for index in order[:k]]
 
     def _inverse_target_display_value(self) -> float:
         configured = _coerce_float(self.config.get("inverse_target_value"))
@@ -1588,6 +1666,8 @@ class LocalAppHandler(BaseHTTPRequestHandler):
                 self._send_json(self.state.delete_campaign(self._read_json()))
             elif parsed.path == "/api/config":
                 self._send_json(self.state.update_config(self._read_json()))
+            elif parsed.path == "/api/precompute-embeddings":
+                self._send_json(self.state.precompute_embeddings())
             elif parsed.path == "/api/observe":
                 self._send_json(self.state.add_observation(self._read_json()))
             elif parsed.path == "/api/suggest":
@@ -1867,6 +1947,7 @@ INDEX_HTML = r"""<!doctype html>
       <span class="chip" id="campaignStatus">Unsaved campaign</span>
       <span class="chip" id="workflowStatus">Workflow</span>
       <span class="chip" id="datasetStatus">No dataset</span>
+      <span class="chip" id="embeddingStatus">Embeddings</span>
       <span class="chip" id="observationStatus">0 observations</span>
       <a class="button-link" href="/guide" target="_blank" rel="noopener" title="Open the local user guide in a new browser tab.">User Guide</a>
       <button class="secondary" id="suggestTop">Update Suggestions</button>
@@ -1916,7 +1997,11 @@ INDEX_HTML = r"""<!doctype html>
           <label for="datasetFile">CSV, Excel, or NPY file</label>
           <input id="datasetFile" type="file" accept=".csv,.txt,.xlsx,.xls,.npy">
         </div>
-        <button id="importDataset">Import Dataset</button>
+        <div class="toolbar">
+          <button id="importDataset">Import Dataset</button>
+          <button id="prepareEmbeddings">Prepare Embeddings</button>
+        </div>
+        <div class="muted" id="embeddingDetail" style="margin-top: 8px;"></div>
       </section>
 
       <section class="panel">
@@ -2234,6 +2319,7 @@ INDEX_HTML = r"""<!doctype html>
         loadCampaign: 'Reload the selected saved campaign and continue where it left off.',
         deleteCampaign: 'Delete the selected local campaign save folder.',
         importDataset: 'Load candidates and hidden labels from the selected file.',
+        prepareEmbeddings: 'Generate and save local embeddings for the current dataset and embedding model.',
         saveConfig: 'Apply the current settings without running a suggestion.',
         resetRun: 'Clear live observations and suggestions while keeping the uploaded dataset.',
         runBenchmark: 'Run the current configuration against hidden labels and append it to the plot.',
@@ -2324,6 +2410,12 @@ INDEX_HTML = r"""<!doctype html>
       $('workflowStatus').className = `chip ${state.config.workflow_mode === 'offline' ? 'good' : 'warn'}`;
       $('datasetStatus').textContent = `${state.candidate_count} candidates, ${state.label_count || 0} labels`;
       $('datasetStatus').className = `chip ${state.candidate_count ? 'good' : 'warn'}`;
+      const cache = state.embedding_cache || {};
+      $('embeddingStatus').textContent = `${cache.cached_count || 0}/${cache.total_count || 0} embedded`;
+      $('embeddingStatus').className = `chip ${cache.ready ? 'good' : (cache.total_count ? 'warn' : '')}`;
+      $('embeddingDetail').textContent = cache.total_count
+        ? `${cache.cached_count || 0} of ${cache.total_count || 0} candidates embedded with ${cache.model || ''}.`
+        : 'Import a dataset before preparing embeddings.';
       $('observationStatus').textContent = `${state.observations.length} observations`;
       $('observationStatus').className = `chip ${state.observations.length ? 'good' : 'warn'}`;
       $('modelStatus').textContent = state.last_model_status || '';
@@ -2693,11 +2785,20 @@ INDEX_HTML = r"""<!doctype html>
 
     $('importDataset').addEventListener('click', async () => {
       const file = $('datasetFile').files[0];
-      if (!file) return renderError('Choose a CSV or Excel file.');
+      if (!file) return renderError('Choose a CSV, Excel, or NPY file.');
       await request(`/api/import-dataset?filename=${encodeURIComponent(file.name)}`, {
         method: 'POST',
         body: await file.arrayBuffer()
       });
+    });
+
+    $('prepareEmbeddings').addEventListener('click', async () => {
+      await request('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payloadConfig())
+      });
+      await request('/api/precompute-embeddings', { method: 'POST' });
     });
 
     $('saveConfig').addEventListener('click', async () => {
@@ -2848,6 +2949,12 @@ USER_GUIDE_HTML = r"""<!doctype html>
         <li>Later, start the local runner, choose the campaign in <code>Saved campaigns</code>, and click <code>Load</code>.</li>
       </ol>
       <p>Use <code>Save As New</code> to branch a campaign into a separate local copy before trying a different strategy.</p>
+    </section>
+
+    <section>
+      <h2>Embedding Cache</h2>
+      <p>Embeddings are saved locally under <code>.cache/</code>, one cache per embedding model. After importing a dataset, click <code>Prepare Embeddings</code> once to embed the full candidate pool. Later GPR runs, inverse-filter steps, repeated benchmark configurations, and app restarts reuse those saved embeddings instead of embedding the same procedures again.</p>
+      <p>If you change the embedding model, prepare embeddings again for that model. Existing cache files remain available for the previous model.</p>
     </section>
 
     <section>
