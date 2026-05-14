@@ -1,4 +1,6 @@
-from io import BytesIO
+import csv
+import random
+from io import BytesIO, StringIO
 
 import numpy as np
 
@@ -8,13 +10,17 @@ from boicl.local_app import (
     DEFAULT_PREDICTION_SYSTEM_MESSAGE,
     GENERATED_INVERSE_PROMPT_PREFIX,
     GENERATED_PREDICTION_PROMPT_PREFIX,
+    INDEX_HTML,
     LocalBOState,
+    POOL_BUILDER_HTML,
+    RunCancelled,
     _best_trace,
     _clean_api_key_value,
     _coerce_float,
     _dataset_stats,
     _load_env_file,
     _paper_random_trace,
+    _retry_delay_seconds,
     _write_env_value,
 )
 
@@ -46,6 +52,53 @@ def test_import_dataset_uses_first_column_and_optional_values(tmp_path):
     )
     assert "proc a" in payload["config"]["prediction_system_message"]
     assert "1.2" not in payload["config"]["prediction_system_message"]
+
+
+def test_pool_builder_import_shape_is_unlabelled_live_pool(tmp_path):
+    state = LocalBOState(tmp_path)
+    raw = (
+        "procedure\n"
+        "\"Reduction experiment of WO3/SiO2: ramp to 400 C at 10 C/min, "
+        "soak for 4 h.\"\n"
+    ).encode("utf-8")
+
+    payload = state.import_dataset(
+        "wo3_sio2_reduction_pool.csv", raw, objective_name="alpha phase (%)"
+    )
+
+    assert payload["candidate_count"] == 1
+    assert payload["label_count"] == 0
+    assert payload["config"]["workflow_mode"] == "live"
+    assert payload["config"]["objective_name"] == "alpha phase (%)"
+    assert payload["objective_names"] == ["alpha phase (%)"]
+
+
+def test_pool_builder_page_contains_import_controls():
+    assert "WO3/SiO2 reduction template" in POOL_BUILDER_HTML
+    assert "/api/import-dataset?filename=wo3_sio2_reduction_pool.csv" in POOL_BUILDER_HTML
+    assert "Pool size" in POOL_BUILDER_HTML
+    assert "Pool cap" not in POOL_BUILDER_HTML
+    assert "Alpha phase (%) - Im-3m" in POOL_BUILDER_HTML
+    assert "Beta phase (%) - Pm-3n" in POOL_BUILDER_HTML
+    assert "Minimum" in POOL_BUILDER_HTML
+    assert "Maximum" in POOL_BUILDER_HTML
+    assert "Step" in POOL_BUILDER_HTML
+    assert "boicl_pool_builder" in POOL_BUILDER_HTML
+    assert "boicl_runner" in POOL_BUILDER_HTML
+    assert "Open/Focus Runner" in POOL_BUILDER_HTML
+    assert "Save the campaign in the runner to keep it for later" in POOL_BUILDER_HTML
+    assert "BroadcastChannel" in POOL_BUILDER_HTML
+
+
+def test_main_app_candidate_labels_surface_variable_values():
+    assert "candidateProcedureSummary" in INDEX_HTML
+    assert "candidateOptionLabel" in INDEX_HTML
+    assert "candidatePreview" in INDEX_HTML
+    assert "enter 73.5 for 73.5%, not 0.735" in INDEX_HTML
+    assert "openPoolBuilder" in INDEX_HTML
+    assert "boicl_pool_builder" in INDEX_HTML
+    assert "Pool Builder imported" in INDEX_HTML
+    assert "BroadcastChannel" in INDEX_HTML
 
 
 def test_import_dataset_can_select_between_multiple_objectives(tmp_path):
@@ -80,7 +133,16 @@ def test_defaults_match_paper_style_numeric_settings():
     assert DEFAULT_CONFIG["batch_size"] == 1
     assert DEFAULT_CONFIG["benchmark_iterations"] == 30
     assert DEFAULT_CONFIG["benchmark_replicates"] == 5
+    assert DEFAULT_CONFIG["benchmark_starting_baseline"] == "none"
     assert DEFAULT_CONFIG["ucb_lambda"] == 0.1
+    assert DEFAULT_CONFIG["llm_samples"] == 3
+    assert DEFAULT_CONFIG["inverse_filter"] == 16
+    assert DEFAULT_CONFIG["inverse_random_candidates"] == 0
+    assert DEFAULT_CONFIG["inverse_target_multiplier"] == 1.2
+    assert DEFAULT_CONFIG["inverse_target_jitter"] == 0.05
+    assert DEFAULT_CONFIG["inverse_target_floor_value"] == ""
+    assert DEFAULT_CONFIG["greedy_final_iteration"] is False
+    assert DEFAULT_CONFIG["api_rate_limit_cooldown_seconds"] == 10.0
     assert DEFAULT_CONFIG["prediction_system_message"]
 
 
@@ -123,12 +185,38 @@ def test_best_trace_respects_direction():
     ]
 
 
+def test_best_trace_mean_baseline_can_hide_initial_context_rows():
+    observations = [{"value": 1.0}, {"value": 5.0}]
+
+    trace = _best_trace(
+        observations,
+        "maximize",
+        baseline_value=3.0,
+        skip_observations=1,
+    )
+
+    assert trace == [
+        {"index": 1, "value": 3.0, "best": 3.0, "baseline": True},
+        {"index": 2, "value": 5.0, "best": 5.0},
+    ]
+
+
 def test_paper_random_trace_is_monotonic_for_maximization():
     trace = _paper_random_trace([1.0, 2.0, 4.0], "maximize", steps=4)
 
     assert len(trace) == 4
     assert [point["index"] for point in trace] == [1, 2, 3, 4]
     assert trace[-1]["best"] >= trace[0]["best"]
+
+
+def test_paper_random_trace_can_start_from_mean_baseline():
+    trace = _paper_random_trace(
+        [1.0, 3.0, 5.0], "maximize", steps=2, baseline_value=3.0
+    )
+
+    assert trace[0] == {"index": 1, "best": 3.0, "baseline": True}
+    assert [point["index"] for point in trace] == [1, 2, 3]
+    assert trace[1]["best"] >= 3.0
 
 
 def test_dataset_stats_include_paper_guides():
@@ -163,6 +251,31 @@ def test_offline_benchmark_appends_random_config_without_live_observations(tmp_p
     assert run["summary"][-1]["count"] == 3
     assert payload["progress"]["status"] == "complete"
     assert payload["progress"]["percent"] == 100
+
+
+def test_offline_benchmark_can_start_plot_from_dataset_mean(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset("dataset.csv", b"procedure,value\nproc a,1\nproc b,3\nproc c,5\n")
+    state.update_config(
+        {
+            "acquisition": "random",
+            "benchmark_iterations": 1,
+            "benchmark_replicates": 1,
+            "benchmark_initial_points": 1,
+            "benchmark_starting_baseline": "mean",
+        }
+    )
+
+    payload = state.run_benchmark({"name": "mean baseline"})
+    run = payload["benchmark_runs"][0]
+
+    assert run["summary"][0]["index"] == 1
+    assert run["summary"][0]["mean"] == 3.0
+    assert run["replicate_traces"][0][0]["baseline"] is True
+    assert run["replicate_traces"][0][1]["index"] == 2
+    assert len(run["summary"]) == 2
+    assert all(point["index"] >= 1 for point in run["replicate_traces"][0])
+    assert len(run["replicate_observations"][0]) == 2
 
 
 def test_campaign_save_load_and_autosave_roundtrip(tmp_path):
@@ -217,7 +330,7 @@ def test_cached_approx_sample_uses_saved_embeddings_without_api(tmp_path):
     assert state._cached_approx_sample(["proc a", "proc b"], "target", 1) == [
         "proc a"
     ]
-    assert state.progress_snapshot()["status"] == "complete"
+    assert state.progress_snapshot()["status"] == "idle"
 
 
 def test_progress_snapshot_tracks_terminal_style_updates(tmp_path):
@@ -229,6 +342,187 @@ def test_progress_snapshot_tracks_terminal_style_updates(tmp_path):
     assert payload["progress"]["label"] == "Testing progress"
     assert payload["progress"]["percent"] == 50
     assert state.progress_snapshot()["detail"] == "halfway"
+
+
+def test_cancel_request_marks_progress_without_state_lock(tmp_path):
+    state = LocalBOState(tmp_path)
+
+    state.set_progress("Long task", 1, 10, "working")
+    progress = state.request_cancel()
+
+    assert progress["status"] == "cancelling"
+    assert state.cancel_event.is_set()
+    try:
+        state.check_cancelled()
+    except RunCancelled as exc:
+        assert "stopped" in str(exc)
+    else:  # pragma: no cover - explicit assertion path
+        raise AssertionError("Expected RunCancelled")
+
+
+def test_cancelled_benchmark_saves_partial_run_for_export_and_resume(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset(
+        "dataset.csv",
+        b"procedure,value\nproc a,1\nproc b,2\nproc c,3\nproc d,4\n",
+    )
+    state.update_config(
+        {
+            "acquisition": "random",
+            "optimizer": "gpr",
+            "benchmark_iterations": 2,
+            "benchmark_replicates": 1,
+            "benchmark_initial_points": 2,
+        }
+    )
+    original_next_candidate = state._benchmark_next_candidate
+
+    def stop_before_select(available, observations, rng, acquisition=None):
+        state.request_cancel()
+        return original_next_candidate(available, observations, rng, acquisition)
+
+    state._benchmark_next_candidate = stop_before_select
+    payload = state.run_benchmark({"name": "cancel smoke"})
+
+    assert len(payload["benchmark_runs"]) == 1
+    partial = payload["benchmark_runs"][0]
+    assert partial["partial"] is True
+    assert partial["status"] == "stopped"
+    assert len(partial["replicate_observations"][0]) == 2
+    assert payload["progress"]["status"] == "cancelled"
+    assert "stopped" in payload["last_model_status"].lower()
+
+    rows = list(csv.DictReader(StringIO(state.export_observations_csv())))
+    assert len(rows) == 2
+    assert {row["source"] for row in rows} == {"offline_benchmark"}
+    assert rows[0]["run_status"] == "stopped"
+
+    state._benchmark_next_candidate = original_next_candidate
+    resumed = state.run_benchmark({"resume_id": partial["id"]})
+
+    run = resumed["benchmark_runs"][0]
+    assert run["partial"] is False
+    assert run["status"] == "complete"
+    assert len(run["replicate_observations"][0]) == 4
+    assert resumed["progress"]["status"] == "complete"
+
+
+def test_benchmark_can_use_greedy_final_iteration(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset(
+        "dataset.csv",
+        b"procedure,value\nproc a,1\nproc b,2\nproc c,3\nproc d,4\nproc e,5\n",
+    )
+    state.update_config(
+        {
+            "acquisition": "expected_improvement",
+            "optimizer": "gpr",
+            "benchmark_iterations": 3,
+            "benchmark_replicates": 2,
+            "benchmark_initial_points": 1,
+            "greedy_final_iteration": True,
+        }
+    )
+    seen = []
+
+    def choose_first(available, observations, rng, acquisition=None):
+        seen.append(acquisition)
+        return available[0]
+
+    state._benchmark_next_candidate = choose_first
+    payload = state.run_benchmark({"name": "greedy final smoke"})
+
+    assert seen == [None, None, "greedy", None, None, "greedy"]
+    assert payload["benchmark_runs"][0]["config"]["greedy_final_iteration"] is True
+    assert payload["progress"]["status"] == "complete"
+
+
+def test_inverse_target_can_use_supplied_benchmark_observations(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.update_config({"inverse_target_multiplier": 1.2, "inverse_target_jitter": 0})
+    observations = [
+        {"procedure": "proc a", "value": 2.0},
+        {"procedure": "proc b", "value": 3.0},
+    ]
+
+    assert np.isclose(state._inverse_target_display_value(observations), 3.6)
+
+
+def test_inverse_target_uses_seeded_multiplier_jitter(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.update_config({"inverse_target_multiplier": 1.2, "inverse_target_jitter": 0.05})
+    observations = [{"procedure": "proc b", "value": 3.0}]
+    expected_rng = random.Random(11)
+    expected = 3.0 * expected_rng.normalvariate(1.2, 0.05)
+
+    assert np.isclose(
+        state._inverse_target_display_value(observations, rng=random.Random(11)),
+        expected,
+    )
+
+
+def test_inverse_target_floor_prevents_zero_anchored_maximize_target(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.update_config(
+        {
+            "inverse_target_multiplier": 1.2,
+            "inverse_target_jitter": 0,
+            "inverse_target_floor_value": "5",
+        }
+    )
+    observations = [{"procedure": "proc zero", "value": 0.0}]
+
+    assert state._inverse_target_display_value(observations) == 5.0
+
+
+def test_llm_scored_candidate_count_uses_shortlist(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.update_config(
+        {
+            "optimizer": "llm",
+            "score_limit": 250,
+            "inverse_filter": 16,
+            "inverse_random_candidates": 4,
+        }
+    )
+
+    assert state._llm_scored_candidate_count(500) == 20
+
+    state.update_config({"inverse_filter": 0})
+
+    assert state._llm_scored_candidate_count(500) == 250
+
+
+def test_api_retry_recovers_from_rate_limit_message(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.update_config(
+        {
+            "api_pause_seconds": 0,
+            "api_retry_attempts": 3,
+            "api_rate_limit_cooldown_seconds": 0,
+        }
+    )
+    attempts = {"count": 0}
+
+    def flaky_call():
+        attempts["count"] += 1
+        if attempts["count"] < 2:
+            raise RuntimeError("Error code: 429 - rate limit reached. Please try again in 1ms.")
+        return "ok"
+
+    assert state._api_call_with_retries("Retry smoke", flaky_call) == "ok"
+    assert attempts["count"] == 2
+
+
+def test_tpm_rate_limit_uses_cooldown_even_with_short_provider_delay():
+    error = RuntimeError(
+        "Rate limit reached for gpt-4o on tokens per min (TPM). "
+        "Please try again in 666ms."
+    )
+
+    delay = _retry_delay_seconds(error, 0, 0.5, 60, rate_limit_cooldown=10)
+
+    assert delay >= 10
 
 
 def test_float_coercion_rejects_empty_and_nonfinite():

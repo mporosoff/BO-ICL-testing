@@ -39,23 +39,7 @@ if errorlevel 1 goto :pip_failed
 ".venv\Scripts\python.exe" -m pip install -e ".[gpr]" -r dev-requirements.txt
 if errorlevel 1 goto :pip_failed
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$envPath = '.env';" ^
-  "$content = if (Test-Path $envPath) { Get-Content -Raw $envPath } else { '' };" ^
-  "function Save-Key($name) {" ^
-  "  if ($content -notmatch ('(?m)^' + [regex]::Escape($name) + '=.+')) {" ^
-  "    $secure = Read-Host ('Paste ' + $name + ' (hidden; press Enter to skip)') -AsSecureString;" ^
-  "    $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure);" ^
-  "    try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) };" ^
-  "    if ($plain) {" ^
-  "      if ($script:content -match ('(?m)^' + [regex]::Escape($name) + '=.*$')) { $script:content = [regex]::Replace($script:content, ('(?m)^' + [regex]::Escape($name) + '=.*$'), ($name + '=' + $plain)) }" ^
-  "      else { $script:content = $script:content.TrimEnd() + \"`r`n$name=$plain`r`n\" };" ^
-  "      Set-Content -Path $envPath -Value $script:content -NoNewline;" ^
-  "      Write-Host ('Saved ' + $name + ' to local .env');" ^
-  "    }" ^
-  "  }" ^
-  "};" ^
-  "Save-Key 'OPENAI_API_KEY'; Save-Key 'OPENROUTER_API_KEY'; Save-Key 'ANTHROPIC_API_KEY';"
+echo API keys are entered only inside the browser app and saved to the local .env file.
 
 echo.
 echo Starting browser app...

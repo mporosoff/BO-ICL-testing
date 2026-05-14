@@ -8,14 +8,12 @@ The launcher:
 - creates `.env` from `.env.example` when needed;
 - creates `.venv` when needed;
 - installs BO-ICL with the GPR extra and local app dependencies;
-- prompts for `OPENAI_API_KEY` without echoing it to the terminal;
-- optionally prompts for `OPENROUTER_API_KEY` and `ANTHROPIC_API_KEY`;
 - starts `python -m boicl.local_app` and opens the browser.
 
 Secrets stay in `.env`, which is ignored by Git. Do not paste real API keys into
-tracked files. Keys entered in the browser app are also saved to this local
-`.env` file. On startup, the app reloads `.env` and lets it override stale shell
-environment variables.
+tracked files. Enter API keys only in the browser app with `Save Locally`; they
+are saved to this local `.env` file. On startup, the app reloads `.env` and lets
+it override stale shell environment variables.
 
 ## Dataset Format
 
@@ -111,11 +109,23 @@ candidate pool with the selected embedding model. The embeddings are saved under
 repeated benchmark configurations, and app restarts. If you change the embedding
 model, prepare embeddings once for the new model too.
 
+Use `Pool Builder` to open or focus one reusable side window for generating an
+unlabeled live experiment pool from the WO3/SiO2 reduction template. The first
+version varies ramp rate, maximum temperature, and dwell time, displays the
+calculated pool size, and imports a procedure-only CSV so the runner stays in
+live-campaign mode instead of treating those numeric variables as objective
+labels. After import, the builder confirms the transfer and the runner refreshes
+with a matching notice. Choose the live objective as `alpha phase (%)` for Im-3m
+or `beta phase (%)` for Pm-3n, then enter the XRD-calculated phase percentage
+from 0 to 100 in `Add Result`. Use whole percent units: enter `73.5` for 73.5%,
+not `0.735`.
+
 Long-running actions show live progress in the browser and print progress lines
 to the terminal window that launched the app. This includes embedding
 preparation, benchmark runs, and suggestion updates. If the browser controls are
 temporarily disabled, check the progress panel rather than assuming the app is
-frozen.
+frozen. The progress panel includes a `Stop` button that asks the current task to
+cancel after the current API call returns.
 
 BO-ICL LLM mode includes dataset-aware system messages for prediction and
 inverse design, so the package should not warn about missing system messages.
@@ -124,7 +134,7 @@ procedure style, candidate count, and objective column names without exposing
 hidden labels or label statistics. Click `Use Dataset Prompts` to replace an old
 or hand-edited prompt with a fresh dataset-specific version. Edit those messages
 in the browser if a campaign needs a more specific instruction, such as
-explicitly maximizing an alpha carbide phase.
+explicitly maximizing alpha phase (%) from Im-3m or beta phase (%) from Pm-3n.
 
 The model dropdowns are presets, not a hard limit. You can type another provider
 model string if the installed SDK and your API account support it. Avoid older
@@ -134,8 +144,20 @@ instead.
 
 The `Inverse Design` panel can generate free-form proposals from the labeled
 examples and the active objective target. Use those proposals directly as manual
-procedures, or use `Inverse filter` to turn inverse-design output into ranked
-candidates from the uploaded pool.
+procedures, or use `LLM shortlist` to turn inverse-design output into ranked
+candidates from the uploaded pool before LLM completions are requested. `Broad
+pool` is the wider random candidate pool considered first. With the default
+`Broad pool = 250`, `LLM shortlist = 16`, `Random add-ons = 0`, and `LLM samples
+= 3`, each BO-ICL step scores at most 16 candidates with 48 sampled
+completions, not 250 candidates.
+
+LLM benchmark runtime scales with `(LLM shortlist + Random add-ons) x LLM
+samples x BO iterations x Workflow replicates` when the shortlist is enabled.
+If `LLM shortlist = 0`, runtime falls back to `Broad pool x LLM samples x BO
+iterations x Workflow replicates`. Rate-limit errors are retried automatically;
+increase `429 cooldown (s)`, increase `API pause (s)`, or lower the
+shortlist/samples if 429s keep appearing. `API pause` spaces out successful
+calls; `429 cooldown` controls the longer wait after a rate-limit error.
 
 `Batch size` controls how many candidates are suggested per update in live mode.
 `Iteration cap` stops live suggestions after that many active-objective
@@ -169,7 +191,15 @@ acquisition function, model settings, objective, and scaling, then choose:
 - `BO iterations`: number of sequential active-learning choices after the
   initial points. The paper-style default is 30.
 - `Workflow replicates`: repeated runs of the same configuration, usually 5.
-- `Seed`: reproducible starting seed for the replicate set.
+- `Seed`: reproducible random-number seed for shuffling/selecting initial
+  points. It is not an objective-value starting point.
+- `Starting baseline`: optional plot-only incumbent for the best-so-far
+  calculation. `Dataset mean incumbent` draws the full-dataset mean as the first
+  marker at x=1 without adding a fake labeled procedure to the LLM context;
+  scored experiments advance from the next x position.
+- `Greedy for final iteration`: use the selected acquisition function for the
+  run, but switch only the final BO choice in each replicate to greedy
+  exploitation.
 
 The paper-style numerical defaults are `Initial random = 1`, `Batch size = 1`,
 `BO iterations = 30`, `Workflow replicates = 5`, and `UCB lambda = 0.1`. Model
@@ -179,6 +209,19 @@ IDs.
 For BO-ICL LLM runs on large pools, keep `Score limit` moderate at first
 (`100-250`) so each iteration scores a manageable subset. Increase it toward the
 full pool size only when you are comfortable with the added runtime and API cost.
+In LLM mode, `LLM shortlist` first generates an inverse-design query from the
+current replicate history. With the default automatic target settings, that
+target is `current best x Normal(1.2, 0.05)`, which matches the paper-style
+stochastic inverse-filter target. Set `Auto target jitter = 0` if you want a
+deterministic `current best x multiplier` target instead. The app then uses
+cached embeddings and MMR/cosine similarity to choose the subpool scored by LLM
+completions.
+
+For sparse-zero campaigns, `current best x multiplier` can stay pinned at zero.
+Use `Auto target floor` to set a minimum automatic inverse-design target without
+creating a fake observation. For phase percentages, enter whole percent units
+such as `5` or `10`. A manual `Inverse target` still overrides both the
+multiplier and floor.
 
 Click `Run & Append` to add the current configuration to the plot. Change the
 model or acquisition settings and click `Run & Append` again to compare another
