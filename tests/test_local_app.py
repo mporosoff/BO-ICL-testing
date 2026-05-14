@@ -6,6 +6,8 @@ from boicl import AskTellFewShotTopk, Pool
 from boicl.local_app import (
     DEFAULT_CONFIG,
     DEFAULT_PREDICTION_SYSTEM_MESSAGE,
+    GENERATED_INVERSE_PROMPT_PREFIX,
+    GENERATED_PREDICTION_PROMPT_PREFIX,
     LocalBOState,
     _best_trace,
     _clean_api_key_value,
@@ -36,6 +38,14 @@ def test_import_dataset_uses_first_column_and_optional_values(tmp_path):
     assert state.candidates[0]["objectives"]["value"] == 1.2
     assert state.candidates[0]["uncertainties"]["value"] == 0.1
     assert payload["objective_names"] == ["value"]
+    assert payload["config"]["prediction_system_message"].startswith(
+        GENERATED_PREDICTION_PROMPT_PREFIX
+    )
+    assert payload["config"]["inverse_system_message"].startswith(
+        GENERATED_INVERSE_PROMPT_PREFIX
+    )
+    assert "proc a" in payload["config"]["prediction_system_message"]
+    assert "1.2" not in payload["config"]["prediction_system_message"]
 
 
 def test_import_dataset_can_select_between_multiple_objectives(tmp_path):
@@ -244,6 +254,28 @@ def test_blank_saved_system_message_falls_back_to_default(tmp_path):
     state.config["prediction_system_message"] = ""
 
     assert state.prediction_system_message() == DEFAULT_PREDICTION_SYSTEM_MESSAGE
+
+
+def test_dataset_prompt_regeneration_preserves_custom_prompt_on_import(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.config["prediction_system_message"] = "custom prediction prompt"
+    state.config["inverse_system_message"] = "custom inverse prompt"
+
+    payload = state.import_dataset("dataset.csv", b"procedure,value\nproc a,1.2\n")
+
+    assert payload["config"]["prediction_system_message"] == "custom prediction prompt"
+    assert payload["config"]["inverse_system_message"] == "custom inverse prompt"
+
+    payload = state.regenerate_prompts()
+
+    assert payload["config"]["prediction_system_message"].startswith(
+        GENERATED_PREDICTION_PROMPT_PREFIX
+    )
+    assert "value" in payload["config"]["prediction_system_message"]
+    assert payload["config"]["inverse_system_message"].startswith(
+        GENERATED_INVERSE_PROMPT_PREFIX
+    )
+    assert "1.2" not in payload["config"]["inverse_system_message"]
 
 
 def test_browser_config_tracks_llm_and_inverse_models(tmp_path):

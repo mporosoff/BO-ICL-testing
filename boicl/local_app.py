@@ -88,6 +88,14 @@ DEFAULT_INVERSE_SYSTEM_MESSAGE = (
 )
 
 
+GENERATED_PREDICTION_PROMPT_PREFIX = (
+    "You are a careful experimental-design surrogate for Bayesian optimization."
+)
+GENERATED_INVERSE_PROMPT_PREFIX = (
+    "You are a careful inverse-design assistant for Bayesian optimization."
+)
+
+
 DEFAULT_CONFIG = {
     "workflow_mode": "live",
     "optimizer": "gpr",
@@ -136,6 +144,96 @@ BENCHMARK_COLORS = [
 
 
 SCALING_MODES = ["off", "auto", "minmax", "zscore"]
+
+
+def _short_prompt_text(value: str, limit: int = 650) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def _prompt_examples(candidates: List[Dict[str, Any]], limit: int = 5) -> List[str]:
+    if not candidates:
+        return []
+    if len(candidates) <= limit:
+        selected = candidates
+    else:
+        indexes = np.linspace(0, len(candidates) - 1, limit, dtype=int)
+        selected = [candidates[int(index)] for index in indexes]
+    examples = []
+    seen = set()
+    for candidate in selected:
+        procedure = _short_prompt_text(candidate.get("procedure", ""))
+        if procedure and procedure not in seen:
+            seen.add(procedure)
+            examples.append(procedure)
+    return examples
+
+
+def _is_auto_prediction_prompt(value: Optional[str]) -> bool:
+    text = (value or "").strip()
+    return not text or text == DEFAULT_PREDICTION_SYSTEM_MESSAGE or text.startswith(
+        GENERATED_PREDICTION_PROMPT_PREFIX
+    )
+
+
+def _is_auto_inverse_prompt(value: Optional[str]) -> bool:
+    text = (value or "").strip()
+    return not text or text == DEFAULT_INVERSE_SYSTEM_MESSAGE or text.startswith(
+        GENERATED_INVERSE_PROMPT_PREFIX
+    )
+
+
+def _dataset_prompt_summary(
+    candidates: List[Dict[str, Any]], objective_names: List[str]
+) -> str:
+    objectives = ", ".join(objective_names) if objective_names else "objective"
+    lines = [
+        f"Uploaded dataset summary: {len(candidates)} candidate procedures.",
+        f"Objective columns available to the tool: {objectives}.",
+        "The first uploaded column is the procedure text. Numeric labels, if present, "
+        "are used by the tool only when an experiment is observed or simulated.",
+    ]
+    examples = _prompt_examples(candidates)
+    if examples:
+        lines.append("Procedure style examples from the uploaded pool:")
+        lines.extend(f"{index}. {example}" for index, example in enumerate(examples, 1))
+    return "\n".join(lines)
+
+
+def _dataset_prediction_prompt(
+    candidates: List[Dict[str, Any]], objective_names: List[str]
+) -> str:
+    return (
+        f"{GENERATED_PREDICTION_PROMPT_PREFIX} You will receive relevant labeled "
+        "examples and then one candidate experimental procedure from an uploaded "
+        "dataset. Predict the numeric objective named in the prompt. Rely primarily "
+        "on the examples, the procedure text, and the objective name; use general "
+        "scientific knowledge only as a weak prior when examples are sparse. Do not "
+        "claim access to current literature, hidden labels, or information outside "
+        "the prompt. Return exactly one numeric value in the original objective "
+        "units. Do not include units, JSON, ranges, uncertainty, citations, "
+        "explanations, or extra text.\n\n"
+        f"{_dataset_prompt_summary(candidates, objective_names)}"
+    )
+
+
+def _dataset_inverse_prompt(
+    candidates: List[Dict[str, Any]], objective_names: List[str]
+) -> str:
+    return (
+        f"{GENERATED_INVERSE_PROMPT_PREFIX} You will receive labeled examples and "
+        "a target objective value. Generate one procedure-like design that would "
+        "plausibly reach the requested target and matches the uploaded dataset "
+        "style. If the workflow uses a finite candidate pool, your output is used "
+        "as a retrieval query to find real candidates from that uploaded pool; do "
+        "not invent measurements or labels. Stay within the apparent design space: "
+        "reuse parameter names, units, syntax, reagents, ranges, and workflow steps "
+        "seen in the examples unless the prompt explicitly allows otherwise. Return "
+        "only the procedure text, with no explanation or formatting.\n\n"
+        f"{_dataset_prompt_summary(candidates, objective_names)}"
+    )
 
 
 def _now() -> str:
@@ -693,6 +791,34 @@ class LocalBOState:
     def inverse_system_message(self) -> str:
         return self.config.get("inverse_system_message") or DEFAULT_INVERSE_SYSTEM_MESSAGE
 
+    def _refresh_dataset_prompts_locked(self, force: bool = False) -> bool:
+        if not self.candidates:
+            if force:
+                raise ValueError("Import a dataset before generating dataset prompts.")
+            return False
+        changed = False
+        if force or _is_auto_prediction_prompt(
+            self.config.get("prediction_system_message")
+        ):
+            self.config["prediction_system_message"] = _dataset_prediction_prompt(
+                self.candidates, self.objective_names
+            )
+            changed = True
+        if force or _is_auto_inverse_prompt(self.config.get("inverse_system_message")):
+            self.config["inverse_system_message"] = _dataset_inverse_prompt(
+                self.candidates, self.objective_names
+            )
+            changed = True
+        if changed:
+            self.log("Generated dataset-specific BO-ICL system messages.")
+        return changed
+
+    def regenerate_prompts(self) -> Dict[str, Any]:
+        with self.lock:
+            self._refresh_dataset_prompts_locked(force=True)
+            self._autosave_locked()
+            return self.to_json()
+
     def _embedding_cache_model(self):
         from boicl import AskTellGPR
 
@@ -972,6 +1098,7 @@ class LocalBOState:
                 }
                 self.candidates.append(candidate)
             self.refresh_active_objective()
+            self._refresh_dataset_prompts_locked()
             self.log(
                 f"Imported {len(self.candidates)} candidates from {Path(filename).name}."
             )
@@ -1834,6 +1961,8 @@ class LocalAppHandler(BaseHTTPRequestHandler):
                 self._send_json(self.state.delete_campaign(self._read_json()))
             elif parsed.path == "/api/config":
                 self._send_json(self.state.update_config(self._read_json()))
+            elif parsed.path == "/api/regenerate-prompts":
+                self._send_json(self.state.regenerate_prompts())
             elif parsed.path == "/api/precompute-embeddings":
                 self._send_json(self.state.precompute_embeddings())
             elif parsed.path == "/api/observe":
@@ -2260,6 +2389,9 @@ INDEX_HTML = r"""<!doctype html>
           <label for="inverseSystemMessage">Inverse design system message</label>
           <textarea id="inverseSystemMessage"></textarea>
         </div>
+        <div class="toolbar">
+          <button id="regeneratePrompts">Use Dataset Prompts</button>
+        </div>
         <div class="row">
           <div class="field">
             <label for="batchSize">Batch size</label>
@@ -2459,8 +2591,8 @@ INDEX_HTML = r"""<!doctype html>
       embeddingModel: 'OpenAI embedding model used to featurize procedures for GPR and nearest-neighbor inverse filtering.',
       predictionModel: 'LLM used by BO-ICL to predict objective values and acquisition scores for candidate procedures.',
       inverseModel: 'LLM used only when generating inverse-design text or inverse-filter candidates.',
-      predictionSystemMessage: 'Optional domain instruction prepended to BO-ICL prediction prompts.',
-      inverseSystemMessage: 'Optional domain instruction prepended to inverse-design prompts.',
+      predictionSystemMessage: 'Dataset-aware instruction prepended to BO-ICL prediction prompts. It is generated from procedure style examples without hidden labels.',
+      inverseSystemMessage: 'Dataset-aware instruction prepended to inverse-design prompts. It constrains proposals to the uploaded procedure style.',
       batchSize: 'Number of candidates suggested at once in live experimentation. The paper BO loop used 1.',
       ucbLambda: 'Exploration weight for upper confidence bound. The paper notebook default was 0.1.',
       llmSamples: 'Number of LLM prediction samples per candidate for BO-ICL uncertainty estimates.',
@@ -2518,6 +2650,7 @@ INDEX_HTML = r"""<!doctype html>
         deleteCampaign: 'Delete the selected local campaign save folder.',
         importDataset: 'Load candidates and hidden labels from the selected file.',
         prepareEmbeddings: 'Generate and save local embeddings for the current dataset and embedding model.',
+        regeneratePrompts: 'Replace both system messages with prompts generated from the uploaded dataset structure and procedure examples.',
         saveConfig: 'Apply the current settings without running a suggestion.',
         resetRun: 'Clear live observations and suggestions while keeping the uploaded dataset.',
         runBenchmark: 'Run the current configuration against hidden labels and append it to the plot.',
@@ -3043,6 +3176,10 @@ INDEX_HTML = r"""<!doctype html>
       await request('/api/precompute-embeddings', { method: 'POST' });
     });
 
+    $('regeneratePrompts').addEventListener('click', async () => {
+      await request('/api/regenerate-prompts', { method: 'POST' });
+    });
+
     $('saveConfig').addEventListener('click', async () => {
       await request('/api/config', {
         method: 'POST',
@@ -3219,6 +3356,12 @@ USER_GUIDE_HTML = r"""<!doctype html>
     </section>
 
     <section>
+      <h2>Dataset-Aware System Messages</h2>
+      <p>When a dataset is imported, the app generates BO-ICL prediction and inverse-design system messages from the uploaded procedure style. These prompts include the number of candidates, objective column names, and a few procedure examples, but they do not include hidden label values or label statistics.</p>
+      <p>Use <code>Use Dataset Prompts</code> whenever you switch to a new dataset or want to replace an old OCM-specific prompt. You can still edit either prompt manually for a campaign-specific constraint, such as requiring a named phase, a fixed instrument, or a permitted parameter range.</p>
+    </section>
+
+    <section>
       <h2>Paper-Style Offline Benchmark</h2>
       <p>Use this when you already have labels for the full pool and want to test BO performance without revealing labels to the model until each simulated experiment is selected.</p>
       <ol>
@@ -3260,7 +3403,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
           <tr><td>Replicates</td><td>Live-mode repeated measurements allowed for the same candidate before it is removed from the available pool.</td></tr>
           <tr><td>Workflow replicates</td><td>Offline benchmark repeated runs of the whole BO workflow for averaging and spread bands.</td></tr>
           <tr><td>API keys</td><td>Keys are written only to the local ignored <code>.env</code> file. OpenAI keys are required for embeddings and OpenAI LLMs; OpenRouter and Anthropic keys are only needed for those model families.</td></tr>
-          <tr><td>System messages</td><td>Default materials-synthesis prompts are provided for BO-ICL LLM prediction and inverse design. Edit them for a specific campaign if you want to name the phase or objective explicitly.</td></tr>
+          <tr><td>System messages</td><td>Generated from the uploaded dataset by default. They constrain the LLM to numeric predictions or procedure-style inverse designs without exposing hidden labels.</td></tr>
         </tbody>
       </table>
     </section>

@@ -117,10 +117,14 @@ preparation, benchmark runs, and suggestion updates. If the browser controls are
 temporarily disabled, check the progress panel rather than assuming the app is
 frozen.
 
-BO-ICL LLM mode includes default materials-synthesis system messages for
-prediction and inverse design, so the package should not warn about missing
-system messages. Edit those messages in the browser if a campaign needs a more
-specific instruction, such as explicitly maximizing an alpha carbide phase.
+BO-ICL LLM mode includes dataset-aware system messages for prediction and
+inverse design, so the package should not warn about missing system messages.
+When a dataset is imported, the app generates prompts from the uploaded
+procedure style, candidate count, and objective column names without exposing
+hidden labels or label statistics. Click `Use Dataset Prompts` to replace an old
+or hand-edited prompt with a fresh dataset-specific version. Edit those messages
+in the browser if a campaign needs a more specific instruction, such as
+explicitly maximizing an alpha carbide phase.
 
 The model dropdowns are presets, not a hard limit. You can type another provider
 model string if the installed SDK and your API account support it. Avoid older
