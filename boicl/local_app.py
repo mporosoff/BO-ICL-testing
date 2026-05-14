@@ -70,6 +70,7 @@ EMBEDDING_MODEL_PRESETS = [
 
 
 DEFAULT_CONFIG = {
+    "workflow_mode": "live",
     "optimizer": "gpr",
     "objective_name": "objective",
     "objective_direction": "maximize",
@@ -763,7 +764,10 @@ class LocalBOState:
             )
             labelled = len(self.labelled_candidates())
             if labelled:
+                self.config["workflow_mode"] = "offline"
                 self.log(f"Loaded {labelled} hidden labels for offline benchmarks.")
+            else:
+                self.config["workflow_mode"] = "live"
             self._autosave_locked()
             return self.to_json()
 
@@ -801,6 +805,11 @@ class LocalBOState:
                 self.config[key] = value
             self.config["optimizer"] = (
                 "llm" if self.config["optimizer"] == "llm" else "gpr"
+            )
+            self.config["workflow_mode"] = (
+                "offline"
+                if self.config["workflow_mode"] == "offline"
+                else "live"
             )
             if self.config["acquisition"] not in ACQUISITION_FUNCTIONS:
                 self.config["acquisition"] = DEFAULT_CONFIG["acquisition"]
@@ -1161,7 +1170,11 @@ class LocalBOState:
             return configured
         observations = self.active_observations()
         if not observations:
-            raise ValueError("Add observations or enter an inverse target value first.")
+            raise ValueError(
+                "Inverse design needs live observations or an explicit inverse target. "
+                "For a fully labeled dataset, use Offline Benchmark > Run & Append "
+                "instead of Generate Proposals."
+            )
         values = [obs["value"] for obs in observations if obs["value"] is not None]
         best = min(values) if self.config["objective_direction"] == "minimize" else max(values)
         return best * float(self.config["inverse_target_multiplier"])
@@ -1790,6 +1803,9 @@ INDEX_HTML = r"""<!doctype html>
       background: #fbfcfe;
       font-size: 13px;
     }
+    .hidden {
+      display: none !important;
+    }
     @media (max-width: 980px) {
       header { align-items: flex-start; flex-direction: column; }
       .shell { grid-template-columns: 1fr; padding: 14px; }
@@ -1806,6 +1822,7 @@ INDEX_HTML = r"""<!doctype html>
     <div class="toolbar">
       <span class="chip" id="keyStatus">Key status</span>
       <span class="chip" id="campaignStatus">Unsaved campaign</span>
+      <span class="chip" id="workflowStatus">Workflow</span>
       <span class="chip" id="datasetStatus">No dataset</span>
       <span class="chip" id="observationStatus">0 observations</span>
       <a class="button-link" href="/guide" target="_blank" rel="noopener" title="Open the local user guide in a new browser tab.">User Guide</a>
@@ -1861,6 +1878,13 @@ INDEX_HTML = r"""<!doctype html>
 
       <section class="panel">
         <h2>Settings</h2>
+        <div class="field">
+          <label for="workflowMode">Workflow mode</label>
+          <select id="workflowMode">
+            <option value="offline">Automatic benchmark: full labeled dataset</option>
+            <option value="live">Live campaign: add results manually</option>
+          </select>
+        </div>
         <div class="field">
           <label for="optimizer">Suggestion engine</label>
           <select id="optimizer">
@@ -1995,7 +2019,7 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </section>
 
-      <section class="panel">
+      <section class="panel" id="offlineBenchmarkPanel">
         <h2>Offline Benchmark</h2>
         <div class="field">
           <label for="benchmarkName">Run label</label>
@@ -2034,11 +2058,12 @@ INDEX_HTML = r"""<!doctype html>
           <h2 style="margin:0;">Best So Far</h2>
           <a class="muted" href="/api/export-observations.csv">Export observations</a>
         </div>
+        <div id="workflowBanner" class="notice" style="margin-bottom: 12px;"></div>
         <div id="plot" class="plot"></div>
         <div id="benchmarkRuns" style="margin-top: 12px;"></div>
       </section>
 
-      <section class="panel">
+      <section class="panel" id="liveResultPanel">
         <h2>Add Result</h2>
         <div class="field">
           <label for="candidateSelect">Candidate</label>
@@ -2061,7 +2086,7 @@ INDEX_HTML = r"""<!doctype html>
         <button class="primary" id="addObservation">Add Observation</button>
       </section>
 
-      <section class="panel">
+      <section class="panel" id="suggestionsPanel">
         <div class="toolbar" style="justify-content: space-between; margin-bottom: 12px;">
           <h2 style="margin:0;">Suggestions</h2>
           <button id="suggest">Update Suggestions</button>
@@ -2069,7 +2094,7 @@ INDEX_HTML = r"""<!doctype html>
         <div id="suggestions"></div>
       </section>
 
-      <section class="panel">
+      <section class="panel" id="inverseDesignPanel">
         <div class="toolbar" style="justify-content: space-between; margin-bottom: 12px;">
           <h2 style="margin:0;">Inverse Design</h2>
           <button id="inverseDesign">Generate Proposals</button>
@@ -2098,6 +2123,7 @@ INDEX_HTML = r"""<!doctype html>
       anthropicKey: 'Stored only in the local .env file. Required only for Claude model names.',
       campaignName: 'Local campaign name. Save once, then future changes autosave into saved_experiments.',
       savedCampaign: 'Previously saved local campaigns that can be loaded without re-uploading the dataset.',
+      workflowMode: 'Choose automatic benchmark for fully labeled datasets; choose live campaign when labels arrive from experiments over time.',
       datasetFile: 'Accepted formats: CSV, TXT, XLS, XLSX, and NPY. The first column must be procedure text; later numeric columns are objectives.',
       optimizer: 'Choose GPR with embeddings for the GP baseline, or BO-ICL LLM for in-context LLM predictions over the uploaded pool.',
       objectiveName: 'The numeric label column to optimize. If multiple objective columns were uploaded, choose one here.',
@@ -2209,6 +2235,7 @@ INDEX_HTML = r"""<!doctype html>
 
     function payloadConfig() {
       return {
+        workflow_mode: $('workflowMode').value,
         optimizer: $('optimizer').value,
         objective_name: $('objectiveName').value,
         objective_direction: $('objectiveDirection').value,
@@ -2249,6 +2276,9 @@ INDEX_HTML = r"""<!doctype html>
       const campaign = state.campaign || {};
       $('campaignStatus').textContent = campaign.saved ? `Saved: ${campaign.name || campaign.id}` : 'Unsaved campaign';
       $('campaignStatus').className = `chip ${campaign.saved ? 'good' : 'warn'}`;
+      const workflow = state.config.workflow_mode === 'offline' ? 'Automatic benchmark' : 'Live campaign';
+      $('workflowStatus').textContent = workflow;
+      $('workflowStatus').className = `chip ${state.config.workflow_mode === 'offline' ? 'good' : 'warn'}`;
       $('datasetStatus').textContent = `${state.candidate_count} candidates, ${state.label_count || 0} labels`;
       $('datasetStatus').className = `chip ${state.candidate_count ? 'good' : 'warn'}`;
       $('observationStatus').textContent = `${state.observations.length} observations`;
@@ -2257,6 +2287,7 @@ INDEX_HTML = r"""<!doctype html>
 
       renderCampaigns();
       renderConfig();
+      renderWorkflowMode();
       renderCandidateSelect();
       renderPlot();
       renderBenchmarkRuns();
@@ -2282,6 +2313,7 @@ INDEX_HTML = r"""<!doctype html>
 
     function renderConfig() {
       const config = state.config;
+      $('workflowMode').value = config.workflow_mode;
       $('optimizer').value = config.optimizer;
       $('objectiveName').value = config.objective_name;
       $('objectiveOptions').innerHTML = (state.objective_names || [])
@@ -2324,6 +2356,20 @@ INDEX_HTML = r"""<!doctype html>
         .map((name) => `<option value="${name}">${name.replaceAll('_', ' ')}</option>`)
         .join('');
       $('acquisition').value = current;
+    }
+
+    function renderWorkflowMode() {
+      const isOffline = state.config.workflow_mode === 'offline';
+      $('offlineBenchmarkPanel').classList.toggle('hidden', !isOffline);
+      $('liveResultPanel').classList.toggle('hidden', isOffline);
+      $('suggestionsPanel').classList.toggle('hidden', isOffline);
+      $('inverseDesignPanel').classList.toggle('hidden', isOffline);
+      $('suggestTop').classList.toggle('hidden', isOffline);
+      if (isOffline) {
+        $('workflowBanner').textContent = 'Automatic benchmark mode: use Run & Append. Uploaded labels are hidden from the model until each simulated experiment is selected. Do not use Add Result or Generate Proposals for this workflow.';
+      } else {
+        $('workflowBanner').textContent = 'Live campaign mode: use Update Suggestions to choose the next procedure, run the experiment offline, then enter the result with Add Observation.';
+      }
     }
 
     function renderCandidateSelect() {
@@ -2644,6 +2690,11 @@ INDEX_HTML = r"""<!doctype html>
 
     $('suggest').addEventListener('click', updateSuggestions);
     $('suggestTop').addEventListener('click', updateSuggestions);
+    $('workflowMode').addEventListener('change', () => {
+      if (!state) return;
+      state.config.workflow_mode = $('workflowMode').value;
+      renderWorkflowMode();
+    });
     $('inverseDesign').addEventListener('click', async () => {
       await request('/api/config', {
         method: 'POST',
@@ -2779,6 +2830,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
       <p>Use this when you already have labels for the full pool and want to test BO performance without revealing labels to the model until each simulated experiment is selected.</p>
       <ol>
         <li>Import a labeled dataset.</li>
+        <li>Set <code>Workflow mode</code> to <code>Automatic benchmark: full labeled dataset</code>. The app switches to this automatically when imported labels are detected.</li>
         <li>Choose the active objective and whether to maximize or minimize it.</li>
         <li>Choose the suggestion engine, model, acquisition function, and target scaling.</li>
         <li>Set <code>Initial random</code>, <code>BO iterations</code>, <code>Workflow replicates</code>, and <code>Seed</code>.</li>
@@ -2793,6 +2845,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
       <p>Use this when you have a pool of procedures but labels are produced by experiments over time.</p>
       <ol>
         <li>Import a procedure pool. Labels can be blank or absent.</li>
+        <li>Set <code>Workflow mode</code> to <code>Live campaign: add results manually</code>. The app switches to this automatically when no labels are detected.</li>
         <li>Add one or two initial measured results with <code>Add Observation</code>.</li>
         <li>Click <code>Update Suggestions</code> to choose the next candidate from the uploaded pool.</li>
         <li>Run the physical experiment offline, then enter the measured value and optional uncertainty.</li>

@@ -20,6 +20,7 @@ def test_import_dataset_uses_first_column_and_optional_values(tmp_path):
     payload = state.import_dataset("dataset.csv", raw)
 
     assert payload["candidate_count"] == 3
+    assert payload["config"]["workflow_mode"] == "offline"
     assert [candidate["procedure"] for candidate in payload["candidates"]] == [
         "proc a",
         "proc b",
@@ -78,6 +79,14 @@ def test_replicates_keep_candidate_available_until_limit(tmp_path):
     assert state.to_json()["available_count"] == 1
     state.add_observation({"candidate_id": "cand-0", "value": 1.1})
     assert state.to_json()["available_count"] == 0
+
+
+def test_import_procedure_only_dataset_selects_live_mode(tmp_path):
+    state = LocalBOState(tmp_path)
+    payload = state.import_dataset("dataset.csv", b"procedure\nproc a\nproc b\n")
+
+    assert payload["label_count"] == 0
+    assert payload["config"]["workflow_mode"] == "live"
 
 
 def test_best_trace_respects_direction():

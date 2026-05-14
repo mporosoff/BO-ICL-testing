@@ -47,6 +47,18 @@ objective. Imported labels are stored as hidden candidate truth for offline
 benchmarks; live observations are only created when you click `Add Observation`
 or when an offline benchmark simulation selects a candidate.
 
+The `Workflow mode` selector separates the two main use cases:
+
+- `Automatic benchmark: full labeled dataset` is for fully labeled pools. Use
+  `Offline Benchmark > Run & Append`; do not use `Add Result`, `Update
+  Suggestions`, or `Generate Proposals` for this mode.
+- `Live campaign: add results manually` is for real experiments where labels
+  arrive over time. Use `Update Suggestions`, run the experiment, then enter the
+  measured result with `Add Observation`.
+
+The app switches to automatic benchmark mode when imported labels are detected,
+and live campaign mode when no labels are detected.
+
 For `.npy` files, use a 1D array for procedure-only pools, a 2D array where the
 first column is procedure text and later columns are labels, or a structured
 array with named fields.
