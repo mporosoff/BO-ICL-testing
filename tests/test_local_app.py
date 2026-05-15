@@ -588,6 +588,55 @@ def test_cancelled_benchmark_saves_partial_run_for_export_and_resume(tmp_path):
     assert resumed["progress"]["status"] == "complete"
 
 
+def test_run_and_append_auto_resumes_matching_partial_benchmark(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset(
+        "dataset.csv",
+        b"procedure,value\nproc a,1\nproc b,2\nproc c,3\nproc d,4\n",
+    )
+    state.update_config(
+        {
+            "acquisition": "random",
+            "optimizer": "gpr",
+            "benchmark_iterations": 2,
+            "benchmark_replicates": 1,
+            "benchmark_initial_points": 1,
+        }
+    )
+    original_next_candidate = state._benchmark_next_candidate
+
+    def fail_once(available, observations, rng, acquisition=None):
+        raise RuntimeError("connection lost")
+
+    state._benchmark_next_candidate = fail_once
+    payload = state.run_benchmark({"name": "connection smoke"})
+    partial = payload["benchmark_runs"][0]
+
+    assert partial["partial"] is True
+    assert partial["status"] == "error"
+    assert len(partial["replicate_observations"][0]) == 1
+
+    state._benchmark_next_candidate = original_next_candidate
+    state.update_config({"api_pause_seconds": 2.0})
+    resumed = state.run_benchmark({"name": "connection smoke"})
+    run = resumed["benchmark_runs"][0]
+
+    assert len(resumed["benchmark_runs"]) == 1
+    assert run["id"] == partial["id"]
+    assert run["partial"] is False
+    assert run["status"] == "complete"
+    assert run["config"]["api_pause_seconds"] == 2.0
+    assert any(
+        event["message"] == "Resuming partial benchmark 'connection smoke'."
+        for event in state.events
+    )
+
+
+def test_run_display_dedupes_live_resume_copy():
+    assert "function benchmarkRunsForDisplay()" in INDEX_HTML
+    assert "runs[index] = liveRun;" in INDEX_HTML
+
+
 def test_benchmark_can_use_greedy_final_iteration(tmp_path):
     state = LocalBOState(tmp_path)
     state.import_dataset(

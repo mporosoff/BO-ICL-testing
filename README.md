@@ -101,6 +101,11 @@ Click **Run & Append** to add the current configuration to the plot. Change a
 model or acquisition function and click **Run & Append** again to compare
 configurations.
 
+If a run stops after a connection, rate-limit, or model error, the partial
+trajectory is saved. Running the same label/settings again resumes the partial
+trajectory instead of creating a duplicate curve. Use **Clear Benchmarks** when
+you intentionally want to discard partial runs and start fresh.
+
 ### Live Campaign
 
 Use **Live campaign: add results manually** when you have an unlabeled pool and

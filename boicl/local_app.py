@@ -154,6 +154,34 @@ BENCHMARK_COLORS = [
 
 SCALING_MODES = ["off", "auto", "minmax", "zscore"]
 PLOT_STAT_GUIDES = ["off", "max", "paper"]
+
+BENCHMARK_RESUME_MATCH_KEYS = [
+    "optimizer",
+    "objective_name",
+    "objective_direction",
+    "objective_scaling",
+    "acquisition",
+    "embedding_model",
+    "prediction_model",
+    "inverse_model",
+    "llm_samples",
+    "selector_k",
+    "inverse_filter",
+    "inverse_random_candidates",
+    "inverse_target_multiplier",
+    "inverse_target_jitter",
+    "inverse_target_floor_value",
+    "ucb_lambda",
+    "score_limit",
+    "n_neighbors",
+    "n_components",
+    "benchmark_iterations",
+    "benchmark_replicates",
+    "benchmark_initial_points",
+    "benchmark_seed",
+    "benchmark_starting_baseline",
+    "greedy_final_iteration",
+]
 BENCHMARK_STARTING_BASELINES = ["none", "mean"]
 
 
@@ -2198,6 +2226,31 @@ class LocalBOState:
                 return
         self.benchmark_runs.append(run)
 
+    def _benchmark_run_matches_current_config(self, run: Dict[str, Any]) -> bool:
+        saved_config = run.get("config") or {}
+        return all(
+            saved_config.get(key) == self.config.get(key)
+            for key in BENCHMARK_RESUME_MATCH_KEYS
+        )
+
+    def _latest_resumable_benchmark_locked(
+        self, name: str
+    ) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
+        for index in range(len(self.benchmark_runs) - 1, -1, -1):
+            run = self.benchmark_runs[index]
+            if not run.get("partial"):
+                continue
+            if run.get("status") not in {"stopped", "error", "interrupted", "running"}:
+                continue
+            if run.get("name") != name:
+                continue
+            if not run.get("replicate_observations"):
+                continue
+            if not self._benchmark_run_matches_current_config(run):
+                continue
+            return index, run
+        return None, None
+
     def run_benchmark(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         with self.lock:
             self.cancel_event.clear()
@@ -2205,6 +2258,7 @@ class LocalBOState:
             resume_id = str(payload.get("resume_id") or "").strip()
             resume_index = None
             resume_run = None
+            requested_name = (payload.get("name") or "").strip()
             if resume_id:
                 for index, run in enumerate(self.benchmark_runs):
                     if run.get("id") == resume_id:
@@ -2229,6 +2283,36 @@ class LocalBOState:
                     self.config["api_pause_seconds"] = float(payload["api_pause_seconds"])
                 if "api_retry_attempts" in payload:
                     self.config["api_retry_attempts"] = int(payload["api_retry_attempts"])
+                if "api_rate_limit_cooldown_seconds" in payload:
+                    self.config["api_rate_limit_cooldown_seconds"] = float(
+                        payload["api_rate_limit_cooldown_seconds"]
+                    )
+            else:
+                candidate_name = requested_name or self._benchmark_name()
+                resume_index, resume_run = self._latest_resumable_benchmark_locked(
+                    candidate_name
+                )
+                if resume_run is not None:
+                    current_api_settings = {
+                        key: self.config.get(key)
+                        for key in [
+                            "api_pause_seconds",
+                            "api_retry_attempts",
+                            "api_rate_limit_cooldown_seconds",
+                        ]
+                    }
+                    saved_config = {
+                        key: value
+                        for key, value in (resume_run.get("config") or {}).items()
+                        if key in self.config
+                    }
+                    self.config.update(saved_config)
+                    self.config.update(current_api_settings)
+                    self.last_model_status = (
+                        "Resuming matching partial benchmark instead of creating "
+                        "a duplicate trajectory."
+                    )
+                    self.log(f"Resuming partial benchmark '{candidate_name}'.")
 
             labelled = self.labelled_candidates()
             if not labelled:
@@ -2247,7 +2331,7 @@ class LocalBOState:
                 raise ValueError(f"{missing_key} is required for this benchmark config.")
 
             name = (
-                (payload.get("name") or "").strip()
+                requested_name
                 or (resume_run or {}).get("name")
                 or self._benchmark_name()
             )
@@ -3502,8 +3586,8 @@ INDEX_HTML = r"""<!doctype html>
         regeneratePrompts: 'Replace both system messages with prompts generated from the uploaded dataset structure and procedure examples.',
         saveConfig: 'Apply the current settings without running a suggestion.',
         resetRun: 'Clear live observations and suggestions while keeping the uploaded dataset.',
-        runBenchmark: 'Run the current configuration against hidden labels and append it to the plot.',
-        resumeBenchmark: 'Continue the most recent stopped or interrupted offline benchmark from its saved procedure sequence.',
+        runBenchmark: 'Run the current configuration against hidden labels and append it to the plot. If a stopped/error run with the same label and settings exists, it resumes that run instead of creating a duplicate trajectory.',
+        resumeBenchmark: 'Continue the most recent stopped, errored, or interrupted offline benchmark from its saved procedure sequence.',
         clearBenchmarks: 'Remove appended offline benchmark curves from the plot.',
         stopRun: 'Ask the current long-running task to stop after the current API call returns.',
         addObservation: 'Record a live measurement for the selected or typed procedure.',
@@ -3629,11 +3713,29 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function latestPartialBenchmarkRun() {
-      const runs = state ? (state.benchmark_runs || []) : [];
+      const runs = state ? benchmarkRunsForDisplay() : [];
       for (let idx = runs.length - 1; idx >= 0; idx -= 1) {
         if (runs[idx].partial) return runs[idx];
       }
       return null;
+    }
+
+    function benchmarkRunsForDisplay() {
+      if (!state) return [];
+      const runs = (state.benchmark_runs || []).slice();
+      const liveRun = state.live_benchmark_run || null;
+      if (liveRun) {
+        const liveId = liveRun.id || '';
+        const index = liveId
+          ? runs.findIndex((run) => run.id === liveId)
+          : -1;
+        if (index >= 0) {
+          runs[index] = liveRun;
+        } else {
+          runs.push(liveRun);
+        }
+      }
+      return runs;
     }
 
     function render() {
@@ -3730,6 +3832,9 @@ INDEX_HTML = r"""<!doctype html>
       $('autoSuggest').checked = Boolean(config.auto_suggest);
       const partialRun = latestPartialBenchmarkRun();
       $('resumeBenchmark').disabled = busy || !partialRun;
+      $('resumeBenchmark').textContent = partialRun
+        ? `Resume ${partialRun.status || 'Partial'}`
+        : 'Resume Last';
 
       const current = $('acquisition').value || config.acquisition;
       setSelectOptions(
@@ -3828,9 +3933,7 @@ INDEX_HTML = r"""<!doctype html>
       const host = $('plot');
       const trace = state.best_trace || [];
       const randomTrace = state.random_walk_trace || [];
-      const benchmarkRuns = (state.benchmark_runs || []).concat(
-        state.live_benchmark_run ? [state.live_benchmark_run] : []
-      );
+      const benchmarkRuns = benchmarkRunsForDisplay();
       const statMode = (state.config || {}).plot_stat_guides || 'max';
       const rawDatasetStats = state.dataset_stats || [];
       const datasetStats = statMode === 'paper'
@@ -3979,9 +4082,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function renderBenchmarkRuns() {
-      const runs = (state.benchmark_runs || []).concat(
-        state.live_benchmark_run ? [state.live_benchmark_run] : []
-      );
+      const runs = benchmarkRunsForDisplay();
       if (!runs.length) {
         $('benchmarkRuns').innerHTML = '<div class="muted">No offline benchmark runs appended.</div>';
         return;
@@ -4898,7 +4999,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
         <li>Choose the active objective and whether to maximize or minimize it.</li>
         <li>Choose the suggestion engine, model, acquisition function, and target scaling.</li>
         <li>Set <code>Initial random</code>, <code>BO iterations</code>, <code>Workflow replicates</code>, and <code>Seed</code>. <code>Seed</code> is the reproducible random-number seed, not an objective-value starting point. Use <code>Starting baseline</code> when you want the first plotted marker at x=1 to be the dataset-mean incumbent; BO-selected pool experiments begin at x=2 after their hidden label is evaluated. Optionally enable <code>Greedy for final iteration</code> so only the last BO choice in each replicate switches to greedy exploitation.</li>
-        <li>Click <code>Run & Append</code>. Change settings and click it again to compare another configuration.</li>
+        <li>Click <code>Run & Append</code>. Change settings and click it again to compare another configuration. If a run stopped after a connection, rate-limit, or model error, clicking <code>Run & Append</code> again with the same label/settings resumes the partial trajectory instead of creating a duplicate curve.</li>
       </ol>
       <div class="callout">Paper-style numerical defaults are <code>Initial random = 1</code>, <code>Batch size = 1</code>, <code>BO iterations = 30</code>, <code>Workflow replicates = 5</code>, and <code>UCB lambda = 0.1</code>. Current model defaults use supported modern model IDs rather than retired paper-era model names.</div>
       <p>For BO-ICL LLM runs on large pools, <code>Broad pool</code> is the wider random pool considered first, and <code>LLM shortlist</code> retrieves the smaller inverse-design/embedding shortlist that is actually scored by the LLM. The inverse-design target is based on the current replicate's labeled history: by default it uses current best x <code>Normal(1.2, 0.05)</code>, matching the paper-style stochastic target. If sparse observations are often zero, set <code>Auto target floor</code> to a meaningful minimum aspirational value so the inverse query does not stay anchored at zero. The shortlist uses cached embeddings with MMR/cosine similarity, then optional random add-ons. The default <code>Broad pool = 250</code>, <code>LLM shortlist = 16</code>, <code>Random add-ons = 0</code>, and <code>LLM samples = 3</code> scores at most 16 candidates per BO step.</p>

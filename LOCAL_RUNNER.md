@@ -230,3 +230,10 @@ best-so-far trajectory with a +/- 1 standard deviation band. The dashed random
 baseline is the paper-style quantile expectation for random sampling, not a
 Monte Carlo replicate. When full labels are available, dashed guide lines mark
 the dataset mean, 75th, 95th, 99th percentile, and maximum.
+
+If a benchmark stops because of a connection, rate-limit, or model error, the
+partial run is saved. Clicking `Run & Append` again with the same run label and
+settings resumes that saved trajectory instead of creating a duplicate curve.
+Use `Resume Last` to continue the latest stopped/error run explicitly, or
+`Clear Benchmarks` if you intentionally want to discard partial trajectories and
+start fresh.
