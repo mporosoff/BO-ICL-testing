@@ -8,6 +8,7 @@ stays inside the existing BO-ICL package.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import random
@@ -520,6 +521,12 @@ def _safe_cache_fragment(value: str) -> str:
     return "".join(ch if ch.isalnum() else "_" for ch in value).strip("_") or "default"
 
 
+def _dataset_identifier(filename: str, raw: bytes) -> str:
+    stem = _safe_cache_fragment(Path(filename).stem.lower())
+    digest = hashlib.sha256(raw).hexdigest()[:12]
+    return f"{stem}_{digest}"
+
+
 def _is_uncertainty_column(column: Any) -> bool:
     name = str(column).lower()
     return any(token in name for token in ["uncert", "std", "stdev", "sigma", "error"])
@@ -648,6 +655,9 @@ class LocalBOState:
     last_model_status: str = "No dataset loaded."
     campaign_id: Optional[str] = None
     campaign_name: str = ""
+    dataset_id: str = ""
+    dataset_filename: str = ""
+    dataset_imported_at: str = ""
     progress: Dict[str, Any] = field(
         default_factory=lambda: {
             "status": "idle",
@@ -816,8 +826,11 @@ class LocalBOState:
                     "id": meta.get("id") or path.parent.name,
                     "name": meta.get("name") or path.parent.name,
                     "updated": meta.get("updated") or "",
+                    "dataset_id": meta.get("dataset_id") or "",
+                    "dataset_filename": meta.get("dataset_filename") or "",
                     "candidate_count": len(payload.get("candidates", [])),
                     "observation_count": len(payload.get("observations", [])),
+                    "benchmark_count": len(payload.get("benchmark_runs", [])),
                 }
             )
         campaigns.sort(key=lambda item: item.get("updated", ""), reverse=True)
@@ -842,6 +855,9 @@ class LocalBOState:
                 "name": self.campaign_name,
                 "saved": now,
                 "updated": now,
+                "dataset_id": self.dataset_id,
+                "dataset_filename": self.dataset_filename,
+                "dataset_imported_at": self.dataset_imported_at,
             },
             "config": self.config,
             "objective_names": self.objective_names,
@@ -875,6 +891,37 @@ class LocalBOState:
     def _autosave_locked(self) -> None:
         if self.campaign_id:
             self._write_campaign_locked()
+
+    def _has_project_state_locked(self) -> bool:
+        return bool(
+            self.campaign_id
+            or self.candidates
+            or self.observations
+            or self.suggestions
+            or self.inverse_designs
+            or self.benchmark_runs
+        )
+
+    def _default_import_campaign_name(self, filename: str) -> str:
+        stem = Path(filename).stem.replace("_", " ").strip() or "Imported dataset"
+        return f"{stem} import {time.strftime('%Y%m%d %H%M%S')}"
+
+    def _save_current_and_branch_for_import_locked(
+        self, filename: str
+    ) -> Optional[Dict[str, str]]:
+        if not self._has_project_state_locked():
+            return None
+        if not self.campaign_id:
+            self.campaign_name = (
+                f"Autosaved before importing {Path(filename).name}"
+            )
+            self.campaign_id = self._unique_campaign_id(self.campaign_name)
+        self._write_campaign_locked()
+        previous = {"id": self.campaign_id, "name": self.campaign_name}
+        self.campaign_name = self._default_import_campaign_name(filename)
+        self.campaign_id = self._unique_campaign_id(self.campaign_name)
+        self.events = []
+        return previous
 
     def embedding_cache_path(self) -> Path:
         fragment = _safe_cache_fragment(self.config["embedding_model"])
@@ -916,6 +963,7 @@ class LocalBOState:
     def public_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "id": candidate["id"],
+            "dataset_id": candidate.get("dataset_id") or self.dataset_id,
             "row": candidate["row"],
             "procedure": candidate["procedure"],
         }
@@ -939,6 +987,11 @@ class LocalBOState:
                     "id": self.campaign_id,
                     "name": self.campaign_name,
                     "saved": bool(self.campaign_id),
+                },
+                "dataset": {
+                    "id": self.dataset_id,
+                    "filename": self.dataset_filename,
+                    "imported_at": self.dataset_imported_at,
                 },
                 "campaigns": self.list_campaigns(),
                 "objective_names": self.objective_names,
@@ -1200,6 +1253,9 @@ class LocalBOState:
         with self.lock:
             self.campaign_id = meta.get("id") or campaign_id
             self.campaign_name = meta.get("name") or campaign_id
+            self.dataset_id = meta.get("dataset_id") or ""
+            self.dataset_filename = meta.get("dataset_filename") or ""
+            self.dataset_imported_at = meta.get("dataset_imported_at") or ""
             self.config = dict(DEFAULT_CONFIG)
             self.config.update(data.get("config", {}))
             self.objective_names = list(data.get("objective_names") or ["objective"])
@@ -1224,6 +1280,119 @@ class LocalBOState:
             )
             self.refresh_active_objective()
             self.log(f"Loaded campaign '{self.campaign_name}'.")
+            return self.to_json()
+
+    def export_campaign_archive_json(self) -> str:
+        with self.lock:
+            payload = self._campaign_payload_locked()
+            payload["meta"]["archive_exported_at"] = _now()
+            return json.dumps(payload, indent=2)
+
+    def export_campaign_archive_filename(self) -> str:
+        with self.lock:
+            parts = ["boicl"]
+            if self.campaign_name:
+                parts.append(_safe_cache_fragment(self.campaign_name.lower()))
+            elif self.dataset_filename:
+                parts.append(_safe_cache_fragment(Path(self.dataset_filename).stem.lower()))
+            else:
+                parts.append("campaign")
+            parts.append(time.strftime("%Y%m%d_%H%M%S"))
+            parts.append("archive")
+            return "_".join(parts) + ".json"
+
+    def import_campaign_archive(self, filename: str, raw: bytes) -> Dict[str, Any]:
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Campaign archive must be a valid JSON file.") from exc
+        if not isinstance(data, dict) or "candidates" not in data:
+            raise ValueError("Campaign archive is missing BO-ICL campaign data.")
+        meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+        with self.lock:
+            previous_project = self._save_current_and_branch_for_import_locked(filename)
+            base_name = str(meta.get("name") or Path(filename).stem or "Imported campaign")
+            archive_id = _safe_cache_fragment(str(meta.get("id") or "").lower())
+            if archive_id and not self.campaign_file(archive_id).exists():
+                campaign_id = archive_id
+            else:
+                campaign_id = self._unique_campaign_id(base_name)
+            self.campaign_id = campaign_id
+            self.campaign_name = base_name
+            self.dataset_id = meta.get("dataset_id") or ""
+            self.dataset_filename = meta.get("dataset_filename") or ""
+            self.dataset_imported_at = meta.get("dataset_imported_at") or ""
+            self.config = dict(DEFAULT_CONFIG)
+            self.config.update(data.get("config", {}))
+            self.objective_names = list(data.get("objective_names") or ["objective"])
+            self.candidates = list(data.get("candidates") or [])
+            self.observations = list(data.get("observations") or [])
+            self.suggestions = list(data.get("suggestions") or [])
+            self.inverse_designs = list(data.get("inverse_designs") or [])
+            self.benchmark_runs = list(data.get("benchmark_runs") or [])
+            self.progress = data.get("progress") or {
+                "status": "idle",
+                "label": "",
+                "detail": "",
+                "current": 0,
+                "total": 0,
+                "percent": 0,
+                "updated": "",
+            }
+            if self.progress.get("status") == "running":
+                partial = self.progress.get("partial_run")
+                if partial and partial.get("replicate_observations"):
+                    partial["partial"] = True
+                    partial["status"] = "interrupted"
+                    self._upsert_benchmark_run_locked(partial)
+                self.finish_progress(
+                    "Imported campaign archive",
+                    "Previous archived run was interrupted.",
+                )
+            self.events = list(data.get("events") or [])[:20]
+            self.last_error = None
+            self.last_model_status = (
+                data.get("last_model_status")
+                or f"Imported campaign archive: {self.campaign_name}."
+            )
+            self.refresh_active_objective()
+            self.log(f"Imported campaign archive '{Path(filename).name}'.")
+            if previous_project:
+                self.log(
+                    "Saved previous project "
+                    f"'{previous_project['name']}' before importing archive."
+                )
+            self._write_campaign_locked()
+            return self.to_json()
+
+    def start_fresh(self) -> Dict[str, Any]:
+        with self.lock:
+            self.config = dict(DEFAULT_CONFIG)
+            self.objective_names = ["objective"]
+            self.candidates = []
+            self.observations = []
+            self.suggestions = []
+            self.inverse_designs = []
+            self.benchmark_runs = []
+            self.campaign_id = None
+            self.campaign_name = ""
+            self.dataset_id = ""
+            self.dataset_filename = ""
+            self.dataset_imported_at = ""
+            self.progress = {
+                "status": "idle",
+                "label": "",
+                "detail": "",
+                "current": 0,
+                "total": 0,
+                "percent": 0,
+                "updated": "",
+            }
+            self.last_error = None
+            self.last_model_status = "Started fresh. Import a dataset or build a pool."
+            self.events = []
+            self.cancel_event.clear()
+            self.log("Started a fresh unsaved workspace.")
             return self.to_json()
 
     def delete_campaign(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1315,11 +1484,28 @@ class LocalBOState:
                 uncertainty_by_objective[str(value_columns[0])] = uncertainty_column
 
         with self.lock:
+            previous_project = self._save_current_and_branch_for_import_locked(filename)
+            if previous_project:
+                self.config = dict(DEFAULT_CONFIG)
+                self.objective_names = ["objective"]
+            self.dataset_filename = Path(filename).name
+            self.dataset_id = _dataset_identifier(filename, raw)
+            self.dataset_imported_at = _now()
             self.candidates = []
             self.observations = []
             self.suggestions = []
             self.inverse_designs = []
             self.benchmark_runs = []
+            self.progress = {
+                "status": "idle",
+                "label": "",
+                "detail": "",
+                "current": 0,
+                "total": 0,
+                "percent": 0,
+                "updated": "",
+            }
+            self.cancel_event.clear()
             self.last_error = None
             self.last_model_status = (
                 "Dataset loaded. Add live observations or run an offline benchmark."
@@ -1352,6 +1538,7 @@ class LocalBOState:
                 }
                 candidate = {
                     "id": f"cand-{len(self.candidates)}",
+                    "dataset_id": self.dataset_id,
                     "row": int(row_index) + 1,
                     "procedure": procedure,
                     "objectives": {
@@ -1367,6 +1554,11 @@ class LocalBOState:
             self.log(
                 f"Imported {len(self.candidates)} candidates from {Path(filename).name}."
             )
+            if previous_project:
+                self.log(
+                    "Saved previous project "
+                    f"'{previous_project['name']}' before starting this import."
+                )
             labelled = len(self.labelled_candidates())
             if labelled:
                 self.config["workflow_mode"] = "offline"
@@ -2636,15 +2828,30 @@ class LocalBOState:
             objective_fields = []
             for name in self.objective_names:
                 objective_fields.extend([name, f"{name}_uncertainty"])
+            exported_at = _now()
+            active_config_json = json.dumps(self.config, sort_keys=True)
+            candidate_lookup = {
+                candidate["id"]: candidate for candidate in self.candidates
+            }
             writer = csv.DictWriter(
                 out,
                 fieldnames=[
+                    "exported_at",
+                    "campaign_id",
+                    "campaign_name",
+                    "dataset_id",
+                    "dataset_filename",
+                    "dataset_imported_at",
                     "source",
                     "run_id",
                     "run_name",
                     "run_status",
+                    "settings_json",
+                    "run_settings_json",
                     "replicate",
                     "experiment_count",
+                    "candidate_id",
+                    "candidate_row",
                     "procedure",
                     *objective_fields,
                     "time",
@@ -2653,13 +2860,24 @@ class LocalBOState:
             )
             writer.writeheader()
             for index, obs in enumerate(self.observations, start=1):
+                candidate = candidate_lookup.get(obs.get("candidate_id") or "")
                 row = {
+                    "exported_at": exported_at,
+                    "campaign_id": self.campaign_id or "",
+                    "campaign_name": self.campaign_name,
+                    "dataset_id": self.dataset_id,
+                    "dataset_filename": self.dataset_filename,
+                    "dataset_imported_at": self.dataset_imported_at,
                     "source": "live",
                     "run_id": "",
                     "run_name": "",
                     "run_status": "",
+                    "settings_json": active_config_json,
+                    "run_settings_json": "",
                     "replicate": "",
                     "experiment_count": index,
+                    "candidate_id": obs.get("candidate_id", ""),
+                    "candidate_row": candidate.get("row", "") if candidate else "",
                     "procedure": obs["procedure"],
                     "time": obs["time"],
                 }
@@ -2673,14 +2891,28 @@ class LocalBOState:
                 for replicate_index, observations in enumerate(
                     run.get("replicate_observations") or [], start=1
                 ):
+                    run_config_json = json.dumps(
+                        run.get("config") or {}, sort_keys=True
+                    )
                     for obs_index, obs in enumerate(observations, start=1):
+                        candidate = candidate_lookup.get(obs.get("candidate_id") or "")
                         row = {
+                            "exported_at": exported_at,
+                            "campaign_id": self.campaign_id or "",
+                            "campaign_name": self.campaign_name,
+                            "dataset_id": self.dataset_id,
+                            "dataset_filename": self.dataset_filename,
+                            "dataset_imported_at": self.dataset_imported_at,
                             "source": "offline_benchmark",
                             "run_id": run.get("id", ""),
                             "run_name": run.get("name", ""),
                             "run_status": run.get("status", ""),
+                            "settings_json": active_config_json,
+                            "run_settings_json": run_config_json,
                             "replicate": replicate_index,
                             "experiment_count": obs_index,
+                            "candidate_id": obs.get("candidate_id", ""),
+                            "candidate_row": candidate.get("row", "") if candidate else "",
                             "procedure": obs["procedure"],
                             "time": obs.get("time", ""),
                         }
@@ -2691,6 +2923,17 @@ class LocalBOState:
                             ).get(name, "")
                         writer.writerow(row)
             return out.getvalue()
+
+    def export_observations_filename(self) -> str:
+        with self.lock:
+            parts = ["boicl"]
+            if self.campaign_name:
+                parts.append(_safe_cache_fragment(self.campaign_name.lower()))
+            if self.dataset_filename:
+                parts.append(_safe_cache_fragment(Path(self.dataset_filename).stem.lower()))
+            parts.append(time.strftime("%Y%m%d_%H%M%S"))
+            parts.append("observations")
+            return "_".join(parts) + ".csv"
 
 
 class LocalAppHandler(BaseHTTPRequestHandler):
@@ -2749,11 +2992,24 @@ class LocalAppHandler(BaseHTTPRequestHandler):
             self._send_json({"campaigns": self.state.list_campaigns()})
         elif parsed.path == "/api/export-observations.csv":
             payload = self.state.export_observations_csv()
+            filename = self.state.export_observations_filename()
             raw = payload.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/csv; charset=utf-8")
             self.send_header(
-                "Content-Disposition", "attachment; filename=boicl_observations.csv"
+                "Content-Disposition", f"attachment; filename={filename}"
+            )
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+        elif parsed.path == "/api/export-campaign-archive.json":
+            payload = self.state.export_campaign_archive_json()
+            filename = self.state.export_campaign_archive_filename()
+            raw = payload.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header(
+                "Content-Disposition", f"attachment; filename={filename}"
             )
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
@@ -2802,8 +3058,16 @@ class LocalAppHandler(BaseHTTPRequestHandler):
                 self._send_json(self.state.save_campaign(self._read_json()))
             elif parsed.path == "/api/load-campaign":
                 self._send_json(self.state.load_campaign(self._read_json()))
+            elif parsed.path == "/api/import-campaign-archive":
+                query = parse_qs(parsed.query)
+                filename = query.get("filename", ["campaign_archive.json"])[0]
+                self._send_json(
+                    self.state.import_campaign_archive(filename, self._read_raw())
+                )
             elif parsed.path == "/api/delete-campaign":
                 self._send_json(self.state.delete_campaign(self._read_json()))
+            elif parsed.path == "/api/start-fresh":
+                self._send_json(self.state.start_fresh())
             elif parsed.path == "/api/config":
                 self._send_json(self.state.update_config(self._read_json()))
             elif parsed.path == "/api/regenerate-prompts":
@@ -3158,7 +3422,13 @@ INDEX_HTML = r"""<!doctype html>
           <button class="primary" id="saveCampaign">Save</button>
           <button id="saveAsCampaign">Save As New</button>
           <button id="loadCampaign">Load</button>
+          <button id="startFresh">Start Fresh</button>
           <button id="deleteCampaign">Delete</button>
+        </div>
+        <div class="toolbar">
+          <button id="exportArchive">Export Archive</button>
+          <button id="importArchive">Import Archive</button>
+          <input id="archiveFile" type="file" accept=".json" style="display:none">
         </div>
       </section>
 
@@ -3397,6 +3667,7 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="toolbar">
           <button class="primary" id="runBenchmark">Run & Append</button>
+          <button id="clearAndRunBenchmark">Clear & Re-run</button>
           <button id="resumeBenchmark">Resume Last</button>
           <button id="clearBenchmarks">Clear Runs</button>
         </div>
@@ -3578,7 +3849,10 @@ INDEX_HTML = r"""<!doctype html>
         saveCampaign: 'Save or overwrite the current local campaign.',
         saveAsCampaign: 'Create a separate saved campaign copy with the current state.',
         loadCampaign: 'Reload the selected saved campaign and continue where it left off.',
+        startFresh: 'Clear the loaded dataset, observations, suggestions, and benchmark runs from this browser state without deleting saved campaigns.',
         deleteCampaign: 'Delete the selected local campaign save folder.',
+        exportArchive: 'Download the current campaign state as a portable JSON archive without API keys.',
+        importArchive: 'Load a portable BO-ICL campaign archive and save it as a local campaign.',
         openPoolBuilderTop: 'Open or focus one reusable Pool Builder window.',
         openPoolBuilderDataset: 'Open or focus one reusable Pool Builder window.',
         importDataset: 'Load candidates and hidden labels from the selected file.',
@@ -3587,6 +3861,7 @@ INDEX_HTML = r"""<!doctype html>
         saveConfig: 'Apply the current settings without running a suggestion.',
         resetRun: 'Clear live observations and suggestions while keeping the uploaded dataset.',
         runBenchmark: 'Run the current configuration against hidden labels and append it to the plot. If a stopped/error run with the same label and settings exists, it resumes that run instead of creating a duplicate trajectory.',
+        clearAndRunBenchmark: 'Clear all existing offline benchmark curves, then run the current settings again from scratch.',
         resumeBenchmark: 'Continue the most recent stopped, errored, or interrupted offline benchmark from its saved procedure sequence.',
         clearBenchmarks: 'Remove appended offline benchmark curves from the plot.',
         stopRun: 'Ask the current long-running task to stop after the current API call returns.',
@@ -3750,7 +4025,10 @@ INDEX_HTML = r"""<!doctype html>
       const workflow = state.config.workflow_mode === 'offline' ? 'Automatic benchmark' : 'Live campaign';
       $('workflowStatus').textContent = workflow;
       $('workflowStatus').className = `chip ${state.config.workflow_mode === 'offline' ? 'good' : 'warn'}`;
-      $('datasetStatus').textContent = `${state.candidate_count} candidates, ${state.label_count || 0} labels`;
+      const dataset = state.dataset || {};
+      const datasetSuffix = dataset.filename ? ` (${dataset.filename})` : '';
+      $('datasetStatus').textContent = `${state.candidate_count} candidates, ${state.label_count || 0} labels${datasetSuffix}`;
+      $('datasetStatus').title = dataset.id ? `Dataset ID: ${dataset.id}` : '';
       $('datasetStatus').className = `chip ${state.candidate_count ? 'good' : 'warn'}`;
       const cache = state.embedding_cache || {};
       $('embeddingStatus').textContent = `${cache.cached_count || 0}/${cache.total_count || 0} embedded`;
@@ -3781,7 +4059,8 @@ INDEX_HTML = r"""<!doctype html>
       const campaigns = state.campaigns || [];
       const options = ['<option value="">Choose saved campaign</option>'].concat(
         campaigns.map((item) => {
-          const label = `${item.name} (${item.observation_count || 0} obs, ${item.candidate_count || 0} candidates)`;
+          const dataset = item.dataset_filename ? `, ${item.dataset_filename}` : '';
+          const label = `${item.name} (${item.observation_count || 0} obs, ${item.candidate_count || 0} candidates, ${item.benchmark_count || 0} runs${dataset})`;
           return `<option value="${escapeHtml(item.id)}">${escapeHtml(label)}</option>`;
         })
       );
@@ -4203,20 +4482,29 @@ INDEX_HTML = r"""<!doctype html>
       await refresh();
       const count = data.candidate_count || (state ? state.candidate_count : 0);
       const objective = data.objective_name ? ` Objective: ${data.objective_name}.` : '';
+      const dataset = data.dataset_filename ? ` Dataset: ${data.dataset_filename}.` : '';
       const saved = data.saved ? ' It was autosaved into the current campaign.' : ' Save the campaign to keep it for later.';
-      renderNotice(`Pool Builder imported ${count} candidate(s) into this runner.${objective}${saved}`);
+      renderNotice(`Pool Builder imported ${count} candidate(s) into this runner.${objective}${dataset}${saved}`);
       window.focus();
     }
 
     window.addEventListener('message', (event) => {
       if (event.origin !== window.location.origin) return;
-      if (!event.data || event.data.type !== 'boicl-pool-imported') return;
-      handlePoolImported(event.data);
+      if (!event.data) return;
+      if (event.data.type === 'boicl-pool-imported') {
+        handlePoolImported(event.data);
+      } else if (event.data.type === 'boicl-focus-runner') {
+        window.focus();
+      }
     });
     if (poolChannel) {
       poolChannel.addEventListener('message', (event) => {
-        if (!event.data || event.data.type !== 'boicl-pool-imported') return;
-        handlePoolImported(event.data);
+        if (!event.data) return;
+        if (event.data.type === 'boicl-pool-imported') {
+          handlePoolImported(event.data);
+        } else if (event.data.type === 'boicl-focus-runner') {
+          window.focus();
+        }
       });
     }
 
@@ -4278,6 +4566,29 @@ INDEX_HTML = r"""<!doctype html>
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: $('savedCampaign').value })
       });
+    });
+
+    $('startFresh').addEventListener('click', async () => {
+      if (!window.confirm('Clear the current loaded dataset, observations, suggestions, and benchmark runs from this browser state? Saved campaigns on disk will not be deleted.')) return;
+      await request('/api/start-fresh', { method: 'POST' });
+    });
+
+    $('exportArchive').addEventListener('click', () => {
+      window.location.href = '/api/export-campaign-archive.json';
+    });
+
+    $('importArchive').addEventListener('click', () => {
+      $('archiveFile').click();
+    });
+
+    $('archiveFile').addEventListener('change', async () => {
+      const file = $('archiveFile').files[0];
+      if (!file) return;
+      await request(`/api/import-campaign-archive?filename=${encodeURIComponent(file.name)}`, {
+        method: 'POST',
+        body: await file.arrayBuffer()
+      });
+      $('archiveFile').value = '';
     });
 
     $('deleteCampaign').addEventListener('click', async () => {
@@ -4376,6 +4687,20 @@ INDEX_HTML = r"""<!doctype html>
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payloadConfig())
       });
+      await request('/api/run-benchmark', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: $('benchmarkName').value })
+      });
+    });
+    $('clearAndRunBenchmark').addEventListener('click', async () => {
+      if (!window.confirm('Clear all existing offline benchmark curves, then run the current settings from scratch?')) return;
+      await request('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payloadConfig())
+      });
+      await request('/api/clear-benchmarks', { method: 'POST' });
       await request('/api/run-benchmark', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -4677,6 +5002,7 @@ POOL_BUILDER_HTML = r"""<!doctype html>
         <button class="secondary" id="previewPool">Preview</button>
         <button class="primary" id="importPool">Import to Runner</button>
         <button id="downloadPool">Download CSV</button>
+        <button id="resetBuilder">Reset Builder</button>
       </div>
       <div class="status" id="statusBox">Ready.</div>
     </section>
@@ -4705,6 +5031,26 @@ POOL_BUILDER_HTML = r"""<!doctype html>
     const poolChannel = 'BroadcastChannel' in window ? new BroadcastChannel('boicl-local-runner') : null;
     const $ = (id) => document.getElementById(id);
     let currentRows = [];
+    let runnerWindow = null;
+    const DEFAULT_BUILDER_VALUES = {
+      systemName: 'WO3/SiO2',
+      gasName: 'pure H2',
+      flowRate: '40',
+      stabilizeTime: '30',
+      sampleTube: 'quartz sample tube',
+      coolingText: 'passively cool to ambient temperature',
+      phaseObjective: 'alpha phase (%)',
+      rampMin: '2',
+      rampMax: '20',
+      rampStep: '2',
+      tempMin: '350',
+      tempMax: '700',
+      tempStep: '50',
+      dwellMin: '1',
+      dwellMax: '8',
+      dwellStep: '1',
+      previewCount: '20',
+    };
 
     function escapeHtml(value) {
       return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
@@ -4775,13 +5121,36 @@ POOL_BUILDER_HTML = r"""<!doctype html>
       $('statusBox').classList.toggle('error', isError);
     }
 
-    function focusRunner() {
+    function openRunnerWindow() {
       if (window.opener && !window.opener.closed) {
-        window.opener.focus();
+        runnerWindow = window.opener;
+      } else if (!runnerWindow || runnerWindow.closed) {
+        runnerWindow = window.open('/', 'boicl_runner');
+      }
+      return runnerWindow;
+    }
+
+    function focusRunner() {
+      const runner = openRunnerWindow();
+      if (runner) {
+        try {
+          runner.focus();
+          setStatus('Runner opened/focused. If the browser blocked focus, switch to the BO-ICL Runner tab/window.');
+        } catch (_) {
+          setStatus('Runner is open. If focus was blocked, switch to the BO-ICL Runner tab/window.');
+        }
+        if (poolChannel) poolChannel.postMessage({ type: 'boicl-focus-runner' });
         return;
       }
-      const runner = window.open('/', 'boicl_runner');
-      if (runner) runner.focus();
+      setStatus('Could not open the runner window. Open the main BO-ICL Runner URL in a browser tab.', true);
+    }
+
+    function resetBuilder() {
+      Object.entries(DEFAULT_BUILDER_VALUES).forEach(([id, value]) => {
+        $(id).value = value;
+      });
+      renderPreview();
+      setStatus('Builder reset to the default WO3/SiO2 reduction template.');
     }
 
     function renderPreview() {
@@ -4813,6 +5182,7 @@ POOL_BUILDER_HTML = r"""<!doctype html>
       renderPreview();
       if (!currentRows.length) return;
       try {
+        const runner = openRunnerWindow();
         const csv = toCsv(currentRows);
         const objective = encodeURIComponent($('phaseObjective').value);
         const response = await fetch(`/api/import-dataset?filename=wo3_sio2_reduction_pool.csv&objective_name=${objective}`, {
@@ -4826,12 +5196,17 @@ POOL_BUILDER_HTML = r"""<!doctype html>
           type: 'boicl-pool-imported',
           candidate_count: payload.candidate_count,
           objective_name: (payload.config || {}).objective_name,
+          dataset_id: (payload.dataset || {}).id || '',
+          dataset_filename: (payload.dataset || {}).filename || 'wo3_sio2_reduction_pool.csv',
           saved: Boolean((payload.campaign || {}).saved),
         };
         if (poolChannel) {
           poolChannel.postMessage(message);
         } else if (window.opener) {
           window.opener.postMessage(message, window.location.origin);
+        }
+        if (runner) {
+          try { runner.focus(); } catch (_) {}
         }
         setStatus(
           `Imported ${payload.candidate_count} candidate(s) into the runner. `
@@ -4869,6 +5244,7 @@ POOL_BUILDER_HTML = r"""<!doctype html>
     $('previewPool').addEventListener('click', renderPreview);
     $('importPool').addEventListener('click', importPool);
     $('downloadPool').addEventListener('click', downloadPool);
+    $('resetBuilder').addEventListener('click', resetBuilder);
     $('focusRunner').addEventListener('click', focusRunner);
     renderPreview();
   </script>
@@ -4948,7 +5324,8 @@ USER_GUIDE_HTML = r"""<!doctype html>
         <li>Close the browser whenever needed. The saved campaign contains the uploaded pool, labels if present, observations, suggestions, settings, inverse designs, and benchmark runs.</li>
         <li>Later, start the local runner, choose the campaign in <code>Saved campaigns</code>, and click <code>Load</code>.</li>
       </ol>
-      <p>Use <code>Save As New</code> to branch a campaign into a separate local copy before trying a different strategy.</p>
+      <p>Use <code>Save As New</code> to branch a campaign into a separate local copy before trying a different strategy. If you import a new dataset or Pool Builder pool while a project is loaded, the app saves the current project first, then starts a separate clean campaign for the new import.</p>
+      <p><code>Export Archive</code> downloads a portable JSON snapshot of the current campaign without API keys. <code>Import Archive</code> restores that snapshot as a local saved campaign, including the pool, settings, observations, suggestions, inverse designs, benchmark runs, and plot history.</p>
     </section>
 
     <section>

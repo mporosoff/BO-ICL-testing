@@ -1,4 +1,5 @@
 import csv
+import json
 import random
 from io import BytesIO, StringIO
 
@@ -86,6 +87,8 @@ def test_pool_builder_page_contains_import_controls():
     assert "boicl_pool_builder" in POOL_BUILDER_HTML
     assert "boicl_runner" in POOL_BUILDER_HTML
     assert "Open/Focus Runner" in POOL_BUILDER_HTML
+    assert "Reset Builder" in POOL_BUILDER_HTML
+    assert "boicl-focus-runner" in POOL_BUILDER_HTML
     assert "Save the campaign in the runner to keep it for later" in POOL_BUILDER_HTML
     assert "BroadcastChannel" in POOL_BUILDER_HTML
 
@@ -97,7 +100,13 @@ def test_main_app_candidate_labels_surface_variable_values():
     assert "enter 73.5 for 73.5%, not 0.735" in INDEX_HTML
     assert "openPoolBuilder" in INDEX_HTML
     assert "boicl_pool_builder" in INDEX_HTML
+    assert "boicl_runner" in INDEX_HTML
+    assert "Start Fresh" in INDEX_HTML
+    assert "Clear & Re-run" in INDEX_HTML
+    assert "Export Archive" in INDEX_HTML
+    assert "Import Archive" in INDEX_HTML
     assert "Pool Builder imported" in INDEX_HTML
+    assert "boicl-focus-runner" in INDEX_HTML
     assert "BroadcastChannel" in INDEX_HTML
 
 
@@ -113,6 +122,19 @@ def test_import_dataset_can_select_between_multiple_objectives(tmp_path):
     assert payload["label_count"] == 2
     assert state.candidates[0]["objectives"]["yield"] == 1.2
     assert payload["dataset_stats"][0]["label"] == "mean"
+
+
+def test_import_dataset_tracks_dataset_metadata(tmp_path):
+    state = LocalBOState(tmp_path)
+    payload = state.import_dataset(
+        "Mo-Carburization_Dataset_v1.csv",
+        b"procedure,value\nproc a,1\n",
+    )
+
+    assert payload["dataset"]["filename"] == "Mo-Carburization_Dataset_v1.csv"
+    assert payload["dataset"]["id"].startswith("mo_carburization_dataset_v1_")
+    assert state.candidates[0]["dataset_id"] == payload["dataset"]["id"]
+    assert payload["candidates"][0]["dataset_id"] == payload["dataset"]["id"]
 
 
 def test_import_dataset_accepts_npy_table(tmp_path):
@@ -475,8 +497,110 @@ def test_campaign_save_load_and_autosave_roundtrip(tmp_path):
 
     assert payload["campaign"]["name"] == "Week one campaign"
     assert payload["candidate_count"] == 2
+    assert payload["dataset"]["filename"] == "dataset.csv"
+    assert payload["dataset"]["id"].startswith("dataset_")
     assert len(payload["observations"]) == 2
     assert payload["observations"][-1]["value"] == 2.0
+
+
+def test_import_dataset_saves_active_project_and_starts_new_campaign(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset("old_dataset.csv", b"procedure,value\nold a,1\nold b,2\n")
+    saved = state.save_campaign({"name": "Active campaign"})
+    old_id = saved["campaign"]["id"]
+    state.update_config({"optimizer": "llm", "benchmark_iterations": 9})
+    state.add_observation({"candidate_id": "cand-0", "value": 1.0})
+
+    payload = state.import_dataset("new_pool.csv", b"procedure,value\nnew a,5\n")
+
+    assert payload["campaign"]["saved"] is True
+    assert payload["campaign"]["id"] != old_id
+    assert payload["dataset"]["filename"] == "new_pool.csv"
+    assert payload["config"]["optimizer"] == DEFAULT_CONFIG["optimizer"]
+    assert payload["config"]["benchmark_iterations"] == DEFAULT_CONFIG["benchmark_iterations"]
+    assert payload["candidate_count"] == 1
+    assert payload["observations"] == []
+    old_payload = json.loads(
+        (tmp_path / "saved_experiments" / old_id / "campaign.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert old_payload["meta"]["name"] == "Active campaign"
+    assert len(old_payload["observations"]) == 1
+    new_id = payload["campaign"]["id"]
+    assert (tmp_path / "saved_experiments" / new_id / "campaign.json").exists()
+
+
+def test_import_campaign_archive_restores_and_saves_copy(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset("archive_dataset.csv", b"procedure,value\nproc a,1\nproc b,2\n")
+    state.save_campaign({"name": "Archive campaign"})
+    state.add_observation({"candidate_id": "cand-0", "value": 1.0})
+    state.update_config({"acquisition": "random", "benchmark_iterations": 1})
+    state.run_benchmark({"name": "archive benchmark"})
+    archive = state.export_campaign_archive_json().encode("utf-8")
+
+    restored = LocalBOState(tmp_path)
+    payload = restored.import_campaign_archive("archive_backup.json", archive)
+
+    assert payload["campaign"]["saved"] is True
+    assert payload["campaign"]["name"] == "Archive campaign"
+    assert payload["dataset"]["filename"] == "archive_dataset.csv"
+    assert len(payload["observations"]) == 1
+    assert len(payload["benchmark_runs"]) == 1
+    assert payload["benchmark_runs"][0]["status"] == "complete"
+    assert restored.export_campaign_archive_filename().startswith(
+        "boicl_archive_campaign_"
+    )
+    assert (
+        tmp_path
+        / "saved_experiments"
+        / payload["campaign"]["id"]
+        / "campaign.json"
+    ).exists()
+
+
+def test_start_fresh_clears_loaded_state_without_deleting_saves(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset("dataset.csv", b"procedure,value\nproc a,1\n")
+    saved = state.save_campaign({"name": "Keep me"})
+
+    payload = state.start_fresh()
+
+    assert payload["candidate_count"] == 0
+    assert payload["observations"] == []
+    assert payload["benchmark_runs"] == []
+    assert payload["campaign"]["saved"] is False
+    assert payload["dataset"]["id"] == ""
+    assert (tmp_path / "saved_experiments" / saved["campaign"]["id"] / "campaign.json").exists()
+
+
+def test_export_observations_csv_includes_dataset_and_settings_metadata(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset(
+        "alpha_pool.csv",
+        b"procedure,alpha phase (%)\nproc a,1\nproc b,2\nproc c,3\n",
+    )
+    state.save_campaign({"name": "Alpha campaign"})
+    state.add_observation({"candidate_id": "cand-0", "value": 1.0})
+    state.update_config({"acquisition": "random", "benchmark_iterations": 1})
+    state.run_benchmark({"name": "random metadata"})
+
+    rows = list(csv.DictReader(StringIO(state.export_observations_csv())))
+
+    assert rows
+    first = rows[0]
+    assert first["campaign_name"] == "Alpha campaign"
+    assert first["dataset_filename"] == "alpha_pool.csv"
+    assert first["dataset_id"].startswith("alpha_pool_")
+    assert first["candidate_id"] == "cand-0"
+    assert first["candidate_row"] == "1"
+    assert "benchmark_iterations" in first["settings_json"]
+    offline = next(row for row in rows if row["source"] == "offline_benchmark")
+    assert "benchmark_iterations" in offline["run_settings_json"]
+    assert state.export_observations_filename().startswith(
+        "boicl_alpha_campaign_alpha_pool_"
+    )
 
 
 def test_embedding_cache_status_counts_current_dataset_and_model(tmp_path):

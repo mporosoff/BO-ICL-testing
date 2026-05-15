@@ -97,14 +97,33 @@ Typical settings:
   context.
 - **Greedy for final iteration**: optional final exploitation step.
 
-Click **Run & Append** to add the current configuration to the plot. Change a
-model or acquisition function and click **Run & Append** again to compare
-configurations.
+Click **Run & Append** to add the current configuration to the plot. Completed
+runs stay in the saved campaign and are not overwritten by later runs.
 
-If a run stops after a connection, rate-limit, or model error, the partial
-trajectory is saved. Running the same label/settings again resumes the partial
-trajectory instead of creating a duplicate curve. Use **Clear Benchmarks** when
-you intentionally want to discard partial runs and start fresh.
+To compare controlled configurations on the same dataset, keep the campaign
+loaded, change the settings, and click **Run & Append** again. For example, run
+BO-ICL LLM first, switch the optimizer to **GPR with embeddings**, and click
+**Run & Append** to add the GPR baseline to the same plot. The same append
+workflow applies when testing different acquisition functions, prediction LLMs,
+inverse-design LLMs, embedding models, shortlist sizes, or replicate counts.
+
+Use clear run names such as `LLM gpt-4o UCB`, `GPR UCB`, or `LLM greedy final`
+so the plot legend and exported CSV are easy to interpret. The CSV export
+includes every appended run with its run id/name/status and saved settings.
+
+If a run completes, it is stored with `status: complete` and remains available
+for plotting, campaign reloads, archive export/import, and CSV export. The
+automatic resume behavior only applies to stopped, errored, or interrupted
+partial runs. If a run stops after a connection, rate-limit, or model error,
+running the same label/settings again resumes that partial trajectory instead of
+creating a duplicate curve.
+
+Only these actions intentionally clear or restart offline benchmark history:
+**Clear & Re-run** removes existing offline curves and immediately reruns the
+current settings; **Clear Benchmarks** removes offline benchmark curves without
+starting a new run; **Start Fresh** clears the whole active browser state; and
+importing a new dataset/pool saves the current project first, then starts a
+separate clean campaign for the new dataset.
 
 ### Live Campaign
 
@@ -120,6 +139,26 @@ will run physical experiments over time.
 
 Use **Save** in the campaign panel so the pool, settings, observations,
 suggestions, inverse designs, and benchmark runs can be loaded later.
+Use **Start Fresh** when you want a clean browser state for a new dataset or
+campaign without deleting saved campaigns on disk.
+
+If you import a new dataset or a Pool Builder pool while another project is
+loaded, the app saves the current project first and then creates a separate
+clean campaign for the new import. This prevents a multi-day campaign from
+being overwritten by a new pool.
+
+## Outputs
+
+**Export Observations CSV** writes live observations and offline benchmark rows
+with campaign name/id, dataset filename/id, candidate id/row, active settings,
+per-run settings, timestamps, procedures, objectives, and uncertainties. Export
+filenames include the campaign name, dataset stem, and export timestamp so they
+can be matched back to a saved experiment.
+
+**Export Archive** writes a portable JSON snapshot of the current campaign state
+without API keys. **Import Archive** reloads that snapshot and saves it as a
+local campaign, including the pool, labels, settings, observations, suggestions,
+inverse designs, benchmark runs, and plot history.
 
 ## LLM BO-ICL Settings
 

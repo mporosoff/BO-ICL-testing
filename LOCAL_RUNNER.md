@@ -114,11 +114,14 @@ unlabeled live experiment pool from the WO3/SiO2 reduction template. The first
 version varies ramp rate, maximum temperature, and dwell time, displays the
 calculated pool size, and imports a procedure-only CSV so the runner stays in
 live-campaign mode instead of treating those numeric variables as objective
-labels. After import, the builder confirms the transfer and the runner refreshes
-with a matching notice. Choose the live objective as `alpha phase (%)` for Im-3m
-or `beta phase (%)` for Pm-3n, then enter the XRD-calculated phase percentage
-from 0 to 100 in `Add Result`. Use whole percent units: enter `73.5` for 73.5%,
-not `0.735`.
+labels. `Open/Focus Runner` reuses one runner window instead of opening a new
+tab each time, and `Reset Builder` restores the default template values. After
+import, the builder confirms the transfer, the runner refreshes with a matching
+dataset notice, and the runner dataset chip shows the loaded filename with a
+dataset id in its hover text. Choose the live objective as `alpha phase (%)` for
+Im-3m or `beta phase (%)` for Pm-3n, then enter the XRD-calculated phase
+percentage from 0 to 100 in `Add Result`. Use whole percent units: enter `73.5`
+for 73.5%, not `0.735`.
 
 Long-running actions show live progress in the browser and print progress lines
 to the terminal window that launched the app. This includes embedding
@@ -181,7 +184,16 @@ Saved campaigns include the uploaded candidate pool, hidden labels if present,
 settings, observations, current suggestions, inverse-design proposals, benchmark
 runs, and recent event context. Restart the app later, choose the saved campaign,
 and click `Load` to continue without re-uploading the dataset. Use `Save As New`
-to branch a campaign before trying a different strategy.
+to branch a campaign before trying a different strategy. Use `Start Fresh` to
+clear the current loaded dataset, observations, suggestions, and benchmark runs
+from the browser state without deleting saved campaigns on disk.
+
+If you import a new dataset or import from Pool Builder while another project is
+loaded, the runner first saves the current project. It then creates a separate
+clean campaign for the newly imported pool, clears previous observations and
+benchmark runs from the browser state, and makes the new dataset the active
+project. This keeps accidental imports from overwriting an active multi-day
+campaign.
 
 Use `Offline Benchmark` when the uploaded dataset already contains labels and
 you want paper-style controlled experiments. Set the current suggestion engine,
@@ -235,5 +247,21 @@ If a benchmark stops because of a connection, rate-limit, or model error, the
 partial run is saved. Clicking `Run & Append` again with the same run label and
 settings resumes that saved trajectory instead of creating a duplicate curve.
 Use `Resume Last` to continue the latest stopped/error run explicitly, or
-`Clear Benchmarks` if you intentionally want to discard partial trajectories and
-start fresh.
+`Clear Benchmarks` if you intentionally want to discard partial trajectories.
+Use `Clear & Re-run` when you want to remove all existing offline benchmark
+curves and immediately rerun the current configuration from scratch.
+
+## Exports
+
+`Export Observations CSV` includes both live observations and offline benchmark
+rows. Each row carries campaign id/name, dataset id/filename/import time,
+candidate id/row, source, run id/name/status, active settings JSON, per-run
+settings JSON, objective values, uncertainty values, and timestamps. Downloaded
+filenames include the campaign name, dataset stem, export timestamp, and
+`observations` suffix so exports are easy to match back to a saved experiment.
+
+`Export Archive` downloads a portable JSON campaign snapshot. It does not include
+API keys. `Import Archive` loads that JSON into the runner and saves it as a
+local campaign, restoring the candidate pool, hidden labels, selected settings,
+live observations, suggestions, inverse-design proposals, offline benchmark
+runs, and the plot history derived from those rows.
