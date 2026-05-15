@@ -196,7 +196,7 @@ acquisition function, model settings, objective, and scaling, then choose:
 - `Starting baseline`: optional plot-only incumbent for the best-so-far
   calculation. `Dataset mean incumbent` draws the full-dataset mean as the first
   marker at x=1 without adding a fake labeled procedure to the LLM context;
-  scored experiments advance from the next x position.
+  BO-selected pool experiments begin at x=2 after their label is available.
 - `Greedy for final iteration`: use the selected acquisition function for the
   run, but switch only the final BO choice in each replicate to greedy
   exploitation.

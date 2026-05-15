@@ -146,6 +146,29 @@ def test_defaults_match_paper_style_numeric_settings():
     assert DEFAULT_CONFIG["prediction_system_message"]
 
 
+def test_model_fields_are_real_selectors():
+    assert '<select id="embeddingModel"></select>' in INDEX_HTML
+    assert '<select id="predictionModel"></select>' in INDEX_HTML
+    assert '<select id="inverseModel"></select>' in INDEX_HTML
+    assert 'id="modelOptions"' not in INDEX_HTML
+    assert 'id="embeddingModelOptions"' not in INDEX_HTML
+
+
+def test_non_benchmark_progress_clears_stale_partial_run(tmp_path):
+    state = LocalBOState(tmp_path)
+    partial_run = {"id": "benchmark-1", "summary": [{"index": 1, "mean": 2.0}]}
+
+    state.set_progress(
+        "Running benchmark: smoke",
+        1,
+        10,
+        extra={"partial_run": partial_run},
+    )
+    state.set_progress("Updating suggestions", 0, 1)
+
+    assert "partial_run" not in state.progress_snapshot()
+
+
 def test_replicates_keep_candidate_available_until_limit(tmp_path):
     state = LocalBOState(tmp_path)
     state.import_dataset("dataset.csv", b"procedure\nproc a\n")
@@ -198,6 +221,21 @@ def test_best_trace_mean_baseline_can_hide_initial_context_rows():
     assert trace == [
         {"index": 1, "value": 3.0, "best": 3.0, "baseline": True},
         {"index": 2, "value": 5.0, "best": 5.0},
+    ]
+
+
+def test_best_trace_mean_baseline_waits_for_first_scored_pool_result():
+    observations = [{"value": 1.0}]
+
+    trace = _best_trace(
+        observations,
+        "maximize",
+        baseline_value=3.0,
+        skip_observations=1,
+    )
+
+    assert trace == [
+        {"index": 1, "value": 3.0, "best": 3.0, "baseline": True},
     ]
 
 
@@ -276,6 +314,149 @@ def test_offline_benchmark_can_start_plot_from_dataset_mean(tmp_path):
     assert len(run["summary"]) == 2
     assert all(point["index"] >= 1 for point in run["replicate_traces"][0])
     assert len(run["replicate_observations"][0]) == 2
+
+
+def test_mean_baseline_progress_stays_on_seed_before_first_bo_result(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset(
+        "dataset.csv",
+        b"procedure,value\nproc a,1\nproc b,2\nproc c,3\nproc d,4\n",
+    )
+    state.update_config(
+        {
+            "acquisition": "random",
+            "optimizer": "gpr",
+            "benchmark_iterations": 2,
+            "benchmark_replicates": 1,
+            "benchmark_initial_points": 1,
+            "benchmark_starting_baseline": "mean",
+        }
+    )
+    captured = {}
+
+    def stop_before_first_bo_result(available, observations, rng, acquisition=None):
+        progress = state.progress_snapshot()
+        partial = progress["partial_run"]
+        captured["current"] = progress["current"]
+        captured["total"] = progress["total"]
+        captured["detail"] = progress["detail"]
+        captured["summary"] = list(partial["summary"])
+        raise RunCancelled("stop before first BO result")
+
+    state._benchmark_next_candidate = stop_before_first_bo_result
+    payload = state.run_benchmark({"name": "mean progress"})
+    partial = payload["benchmark_runs"][0]
+
+    assert captured["current"] == 1
+    assert captured["total"] == 3
+    assert "experiment 1/3" in captured["detail"]
+    assert [point["index"] for point in captured["summary"]] == [1]
+    assert captured["summary"][0]["mean"] == 2.5
+    assert partial["status"] == "stopped"
+    assert [point["index"] for point in partial["summary"]] == [1]
+
+
+def test_mean_baseline_plot_horizon_ignores_hidden_initial_context(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset(
+        "dataset.csv",
+        b"procedure,value\nproc a,1\nproc b,2\nproc c,3\nproc d,4\n",
+    )
+    state.update_config(
+        {
+            "acquisition": "random",
+            "optimizer": "gpr",
+            "benchmark_iterations": 2,
+            "benchmark_replicates": 1,
+            "benchmark_initial_points": 2,
+            "benchmark_starting_baseline": "mean",
+        }
+    )
+
+    payload = state.run_benchmark({"name": "mean horizon"})
+    run = payload["benchmark_runs"][0]
+
+    assert state.plot_horizon() == 3
+    assert [point["index"] for point in run["summary"]] == [1, 2, 3]
+    assert [point["index"] for point in payload["random_walk_trace"]] == [1, 2, 3]
+
+
+def test_llm_benchmark_scores_after_one_initial_point(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    state = LocalBOState(tmp_path)
+    state.import_dataset(
+        "dataset.csv",
+        b"procedure,value\nproc a,1\nproc b,2\nproc c,3\nproc d,4\n",
+    )
+    state.update_config(
+        {
+            "acquisition": "upper_confidence_bound",
+            "optimizer": "llm",
+            "benchmark_iterations": 1,
+            "benchmark_replicates": 1,
+            "benchmark_initial_points": 1,
+        }
+    )
+    calls = []
+
+    def fake_llm_suggestions(available, observations=None, rng=None, k=None, acquisition=None):
+        calls.append(
+            {
+                "available": len(available),
+                "observations": len(observations or []),
+                "acquisition": acquisition,
+            }
+        )
+        candidate = available[0]
+        return [
+            {
+                "candidate_id": candidate["id"],
+                "procedure": candidate["procedure"],
+                "acquisition": 1.0,
+                "mean": 1.0,
+                "source": "llm",
+            }
+        ]
+
+    state._llm_suggestions = fake_llm_suggestions
+    payload = state.run_benchmark({"name": "llm one seed"})
+
+    assert calls == [
+        {
+            "available": 3,
+            "observations": 1,
+            "acquisition": "upper_confidence_bound",
+        }
+    ]
+    assert payload["benchmark_runs"][0]["status"] == "complete"
+
+
+def test_live_llm_suggests_after_one_observation(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    state = LocalBOState(tmp_path)
+    state.import_dataset("dataset.csv", b"procedure\nproc a\nproc b\nproc c\n")
+    state.update_config({"acquisition": "upper_confidence_bound", "optimizer": "llm"})
+    state.add_observation({"candidate_id": "cand-0", "value": 1.0})
+    calls = []
+
+    def fake_llm_suggestions(available, observations=None, rng=None, k=None, acquisition=None):
+        calls.append(len(observations or []))
+        candidate = available[0]
+        return [
+            {
+                "candidate_id": candidate["id"],
+                "procedure": candidate["procedure"],
+                "acquisition": 1.0,
+                "mean": 1.0,
+                "source": "llm",
+            }
+        ]
+
+    state._llm_suggestions = fake_llm_suggestions
+    payload = state.suggest()
+
+    assert calls == [1]
+    assert payload["suggestions"][0]["source"] == "llm"
 
 
 def test_campaign_save_load_and_autosave_roundtrip(tmp_path):

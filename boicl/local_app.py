@@ -673,7 +673,11 @@ class LocalBOState:
         }
         if extra:
             self.progress.update(extra)
-        elif status in {"running", "cancelling", "error", "cancelled"} and previous_partial:
+        elif (
+            str(label).startswith("Running benchmark:")
+            and status in {"running", "cancelling", "error", "cancelled"}
+            and previous_partial
+        ):
             self.progress["partial_run"] = previous_partial
         message = f"{label}: {current}/{total}"
         if detail:
@@ -950,10 +954,14 @@ class LocalBOState:
             }
 
     def plot_horizon(self, live_count: int = 0) -> int:
+        configured_horizon = int(self.config["benchmark_iterations"])
+        if self.config.get("benchmark_starting_baseline") == "mean":
+            configured_horizon += 1
+        else:
+            configured_horizon += int(self.config["benchmark_initial_points"])
         horizon = max(
             live_count,
-            int(self.config["benchmark_initial_points"])
-            + int(self.config["benchmark_iterations"]),
+            configured_horizon,
         )
         for run in self.benchmark_runs:
             for point in run.get("summary", []):
@@ -1546,19 +1554,30 @@ class LocalBOState:
                 self.finish_progress("Updating suggestions", f"{missing_key} missing.")
                 self._autosave_locked()
                 return self.to_json()
-            if len(active_observations) < 2:
+            min_observations = 1 if self.config["optimizer"] == "llm" else 2
+            if len(active_observations) < min_observations:
                 self.suggestions = self._random_suggestions(available)
-                self.last_model_status = "Add at least 2 observations before model suggestions."
+                self.last_model_status = (
+                    f"Add at least {min_observations} observation"
+                    f"{'s' if min_observations != 1 else ''} before model suggestions."
+                )
                 self.finish_progress(
-                    "Updating suggestions", "Showing random candidates until 2 observations."
+                    "Updating suggestions",
+                    f"Showing random candidates until {min_observations} observation"
+                    f"{'s' if min_observations != 1 else ''}.",
                 )
                 self._autosave_locked()
                 return self.to_json()
-            if len(self._training_observations()) < 2:
+            if len(self._training_observations()) < min_observations:
                 self.suggestions = self._random_suggestions(available)
-                self.last_model_status = "Add at least 2 unique procedures before model suggestions."
+                self.last_model_status = (
+                    f"Add at least {min_observations} unique procedure"
+                    f"{'s' if min_observations != 1 else ''} before model suggestions."
+                )
                 self.finish_progress(
-                    "Updating suggestions", "Showing random candidates until 2 unique procedures."
+                    "Updating suggestions",
+                    f"Showing random candidates until {min_observations} unique procedure"
+                    f"{'s' if min_observations != 1 else ''}.",
                 )
                 self._autosave_locked()
                 return self.to_json()
@@ -1582,9 +1601,13 @@ class LocalBOState:
                     ),
                 )
                 if self.config["optimizer"] == "llm":
-                    self.suggestions = self._llm_suggestions(available)
+                    self.suggestions = self._llm_suggestions(
+                        available, active_observations
+                    )
                 else:
-                    self.suggestions = self._gpr_suggestions(available)
+                    self.suggestions = self._gpr_suggestions(
+                        available, active_observations
+                    )
                 self.check_cancelled()
                 self.last_model_status = (
                     f"Updated {self.config['optimizer'].upper()} on {len(active_observations)} observations."
@@ -2091,14 +2114,18 @@ class LocalBOState:
         acquisition: Optional[str] = None,
     ) -> Dict[str, Any]:
         acquisition = acquisition or self.config["acquisition"]
-        training_rows, _ = self._training_rows_and_scaler(observations)
-        if acquisition == "random" or len(training_rows) < 2:
+        if acquisition == "random":
             return rng.choice(available)
+        training_rows, _ = self._training_rows_and_scaler(observations)
         if self.config["optimizer"] == "llm":
+            if len(training_rows) < 1:
+                return rng.choice(available)
             suggestions = self._llm_suggestions(
                 available, observations, rng=rng, k=1, acquisition=acquisition
             )
         else:
+            if len(training_rows) < 2:
+                return rng.choice(available)
             suggestions = self._gpr_suggestions(
                 available, observations, rng=rng, k=1, acquisition=acquisition
             )
@@ -2227,6 +2254,8 @@ class LocalBOState:
             seed = int(self.config["benchmark_seed"])
             baseline_value = self._benchmark_baseline_value(labelled)
             trace_skip_count = initial_points if baseline_value is not None else 0
+            baseline_step_count = 1 if baseline_value is not None else 0
+            progress_steps_per_replicate = iterations + baseline_step_count
             replicate_observations: List[List[Dict[str, Any]]] = [
                 [dict(obs) for obs in obs_list]
                 for obs_list in ((resume_run or {}).get("replicate_observations") or [])
@@ -2241,11 +2270,21 @@ class LocalBOState:
                 for obs_list in replicate_observations
                 if obs_list
             ]
-            total_steps = max(1, replicates * iterations)
-            completed_steps = sum(
-                max(0, min(iterations, len(obs_list) - initial_points))
-                for obs_list in replicate_observations[:replicates]
-            )
+
+            def completed_display_steps(obs_list: List[Dict[str, Any]]) -> int:
+                completed_bo_steps = max(0, min(iterations, len(obs_list) - initial_points))
+                if baseline_step_count and len(obs_list) >= initial_points:
+                    return 1 + completed_bo_steps
+                return completed_bo_steps
+
+            def completed_display_total() -> int:
+                return sum(
+                    completed_display_steps(obs_list)
+                    for obs_list in replicate_observations[:replicates]
+                )
+
+            total_steps = max(1, replicates * progress_steps_per_replicate)
+            completed_steps = completed_display_total()
             color = (resume_run or {}).get("color") or BENCHMARK_COLORS[
                 len(self.benchmark_runs) % len(BENCHMARK_COLORS)
             ]
@@ -2302,6 +2341,11 @@ class LocalBOState:
                         else ""
                     )
                     + (
+                        "; mean incumbent is experiment 1"
+                        if baseline_step_count
+                        else ""
+                    )
+                    + (
                         f"; scoring up to {self._llm_scored_candidate_count(len(labelled))} "
                         f"candidate(s) x "
                         f"{self.config['llm_samples']} samples per BO step"
@@ -2335,6 +2379,19 @@ class LocalBOState:
                         observations.append(self._observation_from_candidate(candidate))
                         selected_ids.add(candidate["id"])
                     update_partial_run(replicate, observations)
+                    if baseline_step_count and len(observations) >= initial_points:
+                        completed_steps = completed_display_total()
+                        self.set_progress(
+                            f"Running benchmark: {name}",
+                            completed_steps,
+                            total_steps,
+                            detail=(
+                                f"Replicate {replicate + 1}/{replicates}, "
+                                f"experiment {completed_display_steps(observations)}/"
+                                f"{progress_steps_per_replicate}, mean incumbent initialized"
+                            ),
+                            extra={"partial_run": partial_run},
+                        )
                     start_iteration = max(0, len(observations) - initial_points)
                     for iteration in range(start_iteration, iterations):
                         self.check_cancelled()
@@ -2357,17 +2414,28 @@ class LocalBOState:
                         self.check_cancelled()
                         observations.append(self._observation_from_candidate(candidate))
                         selected_ids.add(candidate["id"])
-                        completed_steps += 1
                         update_partial_run(replicate, observations)
+                        completed_steps = completed_display_total()
+                        progress_detail = (
+                            (
+                                f"Replicate {replicate + 1}/{replicates}, "
+                                f"experiment {completed_display_steps(observations)}/"
+                                f"{progress_steps_per_replicate} complete "
+                                f"(BO choice {iteration + 1}/{iterations}, "
+                                f"{(acquisition_override or self.config['acquisition']).replace('_', ' ')})"
+                            )
+                            if baseline_step_count
+                            else (
+                                f"Replicate {replicate + 1}/{replicates}, "
+                                f"iteration {iteration + 1}/{iterations}, "
+                                f"{(acquisition_override or self.config['acquisition']).replace('_', ' ')}"
+                            )
+                        )
                         self.set_progress(
                             f"Running benchmark: {name}",
                             completed_steps,
                             total_steps,
-                            detail=(
-                                f"Replicate {replicate + 1}/{replicates}, "
-                                f"iteration {iteration + 1}/{iterations}, "
-                                f"{(acquisition_override or self.config['acquisition']).replace('_', ' ')}"
-                            ),
+                            detail=progress_detail,
                             extra={"partial_run": partial_run},
                         )
                     while len(replicate_observations) <= replicate:
@@ -3044,8 +3112,6 @@ INDEX_HTML = r"""<!doctype html>
           <label for="objectiveName">Objective name</label>
           <input id="objectiveName" value="objective" list="objectiveOptions">
           <datalist id="objectiveOptions"></datalist>
-          <datalist id="modelOptions"></datalist>
-          <datalist id="embeddingModelOptions"></datalist>
         </div>
         <div class="row">
           <div class="field">
@@ -3083,16 +3149,16 @@ INDEX_HTML = r"""<!doctype html>
         <div class="row">
           <div class="field">
             <label for="embeddingModel">Embedding model</label>
-            <input id="embeddingModel" value="text-embedding-ada-002" list="embeddingModelOptions">
+            <select id="embeddingModel"></select>
           </div>
           <div class="field">
             <label for="predictionModel">Prediction LLM</label>
-            <input id="predictionModel" value="gpt-4o" list="modelOptions">
+            <select id="predictionModel"></select>
           </div>
         </div>
         <div class="field">
           <label for="inverseModel">Inverse design LLM</label>
-          <input id="inverseModel" value="gpt-4o" list="modelOptions">
+          <select id="inverseModel"></select>
         </div>
         <div class="field">
           <label for="predictionSystemMessage">Prediction system message</label>
@@ -3378,7 +3444,7 @@ INDEX_HTML = r"""<!doctype html>
       benchmarkIterations: 'Number of BO choices after initialization. The paper notebook default was 30.',
       benchmarkReplicates: 'Number of repeated runs for the same workflow. The paper notebook default was 5.',
       benchmarkSeed: 'Starting random seed for reproducible benchmark replicates.',
-      benchmarkStartingBaseline: 'Plot-only incumbent value at experiment count 0. Dataset mean starts each benchmark curve from the mean label without adding a fake labeled procedure to the LLM context.',
+      benchmarkStartingBaseline: 'Plot-only incumbent value at experiment count 1. Dataset mean starts each benchmark curve from the mean label without adding a fake labeled procedure to the LLM context; BO-selected pool experiments begin at count 2.',
       greedyFinalIteration: 'When checked, only the final BO choice in each replicate switches to greedy acquisition. Earlier choices use the selected acquisition function.',
       candidateSelect: 'Choose a suggested or uploaded pool candidate for live result entry.',
       manualProcedure: 'Procedure text for a live observation. This fills automatically when you select a candidate.',
@@ -3395,6 +3461,19 @@ INDEX_HTML = r"""<!doctype html>
     function fmt(value, digits = 4) {
       if (value === null || value === undefined || Number.isNaN(Number(value))) return '';
       return Number(value).toLocaleString(undefined, { maximumSignificantDigits: digits });
+    }
+
+    function setSelectOptions(id, values, current, labeler = (value) => value) {
+      const select = $(id);
+      const unique = [];
+      (values || []).forEach((value) => {
+        if (value && !unique.includes(value)) unique.push(value);
+      });
+      if (current && !unique.includes(current)) unique.unshift(current);
+      select.innerHTML = unique
+        .map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(labeler(value))}</option>`)
+        .join('');
+      select.value = current || unique[0] || '';
     }
 
     function applyHelpText() {
@@ -3616,18 +3695,12 @@ INDEX_HTML = r"""<!doctype html>
       $('objectiveOptions').innerHTML = (state.objective_names || [])
         .map((name) => `<option value="${escapeHtml(name)}"></option>`)
         .join('');
-      $('modelOptions').innerHTML = (state.model_presets || [])
-        .map((name) => `<option value="${escapeHtml(name)}"></option>`)
-        .join('');
-      $('embeddingModelOptions').innerHTML = (state.embedding_model_presets || [])
-        .map((name) => `<option value="${escapeHtml(name)}"></option>`)
-        .join('');
+      setSelectOptions('embeddingModel', state.embedding_model_presets || [], config.embedding_model);
+      setSelectOptions('predictionModel', state.model_presets || [], config.prediction_model);
+      setSelectOptions('inverseModel', state.model_presets || [], config.inverse_model);
       $('objectiveDirection').value = config.objective_direction;
       $('objectiveScaling').value = config.objective_scaling;
       $('plotStatGuides').value = config.plot_stat_guides || 'max';
-      $('embeddingModel').value = config.embedding_model;
-      $('predictionModel').value = config.prediction_model;
-      $('inverseModel').value = config.inverse_model;
       $('predictionSystemMessage').value = config.prediction_system_message;
       $('inverseSystemMessage').value = config.inverse_system_message;
       $('llmSamples').value = config.llm_samples;
@@ -3659,10 +3732,12 @@ INDEX_HTML = r"""<!doctype html>
       $('resumeBenchmark').disabled = busy || !partialRun;
 
       const current = $('acquisition').value || config.acquisition;
-      $('acquisition').innerHTML = state.acquisition_functions
-        .map((name) => `<option value="${name}">${name.replaceAll('_', ' ')}</option>`)
-        .join('');
-      $('acquisition').value = current;
+      setSelectOptions(
+        'acquisition',
+        state.acquisition_functions || [],
+        current,
+        (name) => name.replaceAll('_', ' ')
+      );
     }
 
     function renderWorkflowMode() {
@@ -4822,7 +4897,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
         <li>Set <code>Workflow mode</code> to <code>Automatic benchmark: full labeled dataset</code>. The app switches to this automatically when imported labels are detected.</li>
         <li>Choose the active objective and whether to maximize or minimize it.</li>
         <li>Choose the suggestion engine, model, acquisition function, and target scaling.</li>
-        <li>Set <code>Initial random</code>, <code>BO iterations</code>, <code>Workflow replicates</code>, and <code>Seed</code>. <code>Seed</code> is the reproducible random-number seed, not an objective-value starting point. Use <code>Starting baseline</code> when you want the first plotted marker at x=1 to be the dataset-mean incumbent; scored experiments then advance from the next x position. Optionally enable <code>Greedy for final iteration</code> so only the last BO choice in each replicate switches to greedy exploitation.</li>
+        <li>Set <code>Initial random</code>, <code>BO iterations</code>, <code>Workflow replicates</code>, and <code>Seed</code>. <code>Seed</code> is the reproducible random-number seed, not an objective-value starting point. Use <code>Starting baseline</code> when you want the first plotted marker at x=1 to be the dataset-mean incumbent; BO-selected pool experiments begin at x=2 after their hidden label is evaluated. Optionally enable <code>Greedy for final iteration</code> so only the last BO choice in each replicate switches to greedy exploitation.</li>
         <li>Click <code>Run & Append</code>. Change settings and click it again to compare another configuration.</li>
       </ol>
       <div class="callout">Paper-style numerical defaults are <code>Initial random = 1</code>, <code>Batch size = 1</code>, <code>BO iterations = 30</code>, <code>Workflow replicates = 5</code>, and <code>UCB lambda = 0.1</code>. Current model defaults use supported modern model IDs rather than retired paper-era model names.</div>
@@ -4861,7 +4936,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
           <tr><td>API pause / 429 cooldown / 429 retries</td><td><code>API pause</code> spaces out successful calls. <code>429 cooldown</code> waits after a rate-limit error before retrying. Retries controls how many recovery attempts are allowed before the partial run is saved for resume.</td></tr>
           <tr><td>Replicates</td><td>Live-mode repeated measurements allowed for the same candidate before it is removed from the available pool.</td></tr>
           <tr><td>Workflow replicates</td><td>Offline benchmark repeated runs of the whole BO workflow for averaging and spread bands.</td></tr>
-          <tr><td>Starting baseline</td><td>Offline benchmark plot option. <code>Dataset mean incumbent</code> draws the mean incumbent as the first marker at x=1 and initializes best-so-far from that value, without adding a fake labeled procedure to the model context.</td></tr>
+          <tr><td>Starting baseline</td><td>Offline benchmark plot option. <code>Dataset mean incumbent</code> draws the mean incumbent as the first marker at x=1 and initializes best-so-far from that value, without adding a fake labeled procedure to the model context. The first BO-selected pool experiment is plotted at x=2 only after its label is available.</td></tr>
           <tr><td>API keys</td><td>Keys are written only to the local ignored <code>.env</code> file. OpenAI keys are required for embeddings and OpenAI LLMs; OpenRouter and Anthropic keys are only needed for those model families.</td></tr>
           <tr><td>System messages</td><td>Generated from the uploaded dataset by default. They constrain the LLM to numeric predictions or procedure-style inverse designs without exposing hidden labels.</td></tr>
         </tbody>

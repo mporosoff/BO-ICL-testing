@@ -1,178 +1,203 @@
-# 🤖 BO-ICL: Bayesian Optimization using in-context learning
+# BO-ICL Local Active-Learning Toolkit
 
-![version](https://img.shields.io/badge/version-0.0.1-brightgreen)
-[![paper](https://img.shields.io/badge/paper-arXiv-red)](https://arxiv.org/abs/2304.05341)
-[![MIT license](https://img.shields.io/badge/License-MIT-blue.svg)](https://lbesson.mit-license.org/)
+This repository contains a local browser app for running Bayesian optimization
+with in-context learning (BO-ICL) over a finite pool of experimental
+procedures. The current working focus is the active-learning BO workflow from
+the BO-ICL paper, with a practical interface for offline benchmark studies and
+multi-day live experimental campaigns.
 
-BO-ICL does regression with uncertainties using frozen Large Language Models by using token probabilities.
-It uses LangChain to select examples to create in-context learning prompts from training data.
-By selecting examples, it can consider more training data than it fits in the model's context window.
-Being able to predict uncertainty, allow the employment of interesting techniques such as Bayesian Optimization.
+Paper: [Bayesian Optimization of Catalysts With In-context Learning](https://arxiv.org/abs/2304.05341)
 
-## Table of content
+## What This App Does
 
-- [BO-ICL](#-bo-icl-bayesian-optimization-using-in-context-learning)
-  - [Install](#install-)
-  - [Usage](#usage-)
-    - [Quickstart](#quickstart-)
-    - [Customising the model](#customising-the-model)
-    - [Inverse design](#inverse-design)
-  - [Citation](#citation)
+- Runs locally in your browser from a Windows `.bat` launcher.
+- Imports experiment pools from CSV, TXT, XLS, XLSX, or NPY files.
+- Supports fully labeled offline benchmark runs and live campaigns where labels
+  are added as experiments finish.
+- Uses either BO-ICL LLM scoring or GPR over cached embeddings.
+- Lets you choose embedding, prediction LLM, inverse-design LLM, acquisition
+  function, replicate count, BO iteration count, and rate-limit controls.
+- Saves API keys only to a local ignored `.env` file.
+- Saves campaigns under `saved_experiments/` so multi-day campaigns can be
+  resumed without re-uploading data.
+- Caches embeddings under `.cache/` so repeated runs on the same pool do not
+  re-embed everything.
 
-## Install 📦
+## Quick Start
 
-boicl can simply be installed using pip:
+From this folder, double-click:
 
-```bash
-pip install boicl
+```text
+run_boicl_local.bat
 ```
 
-Some additional requirements are needed to use the Gaussian Process Regressor (GPR) module.
-They can also be installed using pip:
+The launcher creates the virtual environment if needed, installs local
+dependencies, starts the app, and opens the browser.
 
-```bash
-pip install boicl[gpr]
+Manual launch:
+
+```powershell
+.\.venv\Scripts\python.exe -m boicl.local_app
 ```
 
-## Usage 💻
+Open the browser app, paste API keys in the **API Keys** panel, and click
+**Save Locally**. Do not paste real API keys into tracked files.
 
-You need to set up your OpenAI API key in order to use BO-ICL.
-You can do that using the `os` Python library:
+## API Keys
 
-```py
-import os
-os.environ["OPENAI_API_KEY"] = "<your-key-here>"
+Keys are stored in `.env`, which is ignored by Git.
+
+Supported key names:
+
+- `OPENAI_API_KEY`: OpenAI LLMs and OpenAI embedding models.
+- `OPENROUTER_API_KEY`: models whose names start with `openrouter/`.
+- `ANTHROPIC_API_KEY`: Claude models.
+
+The app reloads `.env` on startup. If a key looks invalid after restarting,
+re-enter it in the browser and save again.
+
+## Dataset Format
+
+The first column must contain procedure text. Later numeric columns are treated
+as objective labels unless their names look like uncertainty, standard
+deviation, sigma, or error columns.
+
+Example:
+
+```csv
+procedure,alpha phase (%),alpha phase uncertainty
+"Reduction experiment A",0,
+"Reduction experiment B",17.5,1.2
+"Reduction experiment C",83.0,2.5
 ```
 
-### Local browser runner
+For tungsten phase campaigns, enter phase percentages as whole percent values
+from `0` to `100`, such as `73.5` for 73.5%, not `0.735`.
 
-On Windows, double-click `run_boicl_local.bat` to create the local environment,
-save API keys to an ignored `.env`, and launch a browser app for GPR-guided
-experiments. See `LOCAL_RUNNER.md` for dataset format and workflow notes.
+The app optimizes one active objective at a time. If a dataset has multiple
+objective columns, choose the active objective in the settings panel.
 
-### Quickstart 🔥
+## Workflow Modes
 
-`boicl` provides a simple interface to use the model.
+### Offline Benchmark
 
-```py
-# Create the model object
-asktell = boicl.AskTellFewShotTopk()
+Use **Automatic benchmark: full labeled dataset** when the uploaded dataset
+already has labels. The app hides labels from the model until each simulated
+experiment is selected.
 
-# Tell some points to the model
-asktell.tell("1-bromopropane", -1.730)
-asktell.tell("1-bromopentane", -3.080)
-asktell.tell("1-bromooctane", -5.060)
-asktell.tell("1-bromonaphthalene", -4.35)
+Typical settings:
 
-# Make a prediction
-yhat = asktell.predict("1-bromobutane")
-print(yhat.mean(), yhat.std())
+- **Objective direction**: usually `Maximize` for phase percentage or yield.
+- **Target scaling**: start with `Off` for LLM BO-ICL on bounded percentages.
+- **Initial random**: usually `1` or `2`.
+- **BO iterations**: number of sequential model-selected experiments.
+- **Workflow replicates**: repeated runs for mean and spread bands.
+- **Starting baseline**: `Dataset mean incumbent` can start the plot at the
+  full-dataset mean without adding a fake labeled procedure to the model
+  context.
+- **Greedy for final iteration**: optional final exploitation step.
+
+Click **Run & Append** to add the current configuration to the plot. Change a
+model or acquisition function and click **Run & Append** again to compare
+configurations.
+
+### Live Campaign
+
+Use **Live campaign: add results manually** when you have an unlabeled pool and
+will run physical experiments over time.
+
+1. Import a procedure-only pool, or create one with **Pool Builder**.
+2. Click **Prepare Embeddings** once for the selected embedding model.
+3. Click **Update Suggestions**.
+4. Run the selected experiment offline.
+5. Enter the measured objective and optional uncertainty.
+6. Click **Add Observation** and repeat.
+
+Use **Save** in the campaign panel so the pool, settings, observations,
+suggestions, inverse designs, and benchmark runs can be loaded later.
+
+## LLM BO-ICL Settings
+
+- **Prediction LLM**: model used to predict candidate objective values.
+- **Inverse design LLM**: model used to generate a procedure-like retrieval
+  query for shortlist construction.
+- **Embedding model**: model used for GPR features and inverse-filter nearest
+  neighbor retrieval.
+- **Broad pool**: wider candidate subset considered first.
+- **LLM shortlist**: number of candidates retrieved from the broad pool using
+  inverse design plus cached embeddings.
+- **Random add-ons**: extra random candidates added to the shortlist for
+  diversity.
+- **LLM samples**: repeated LLM prediction samples per shortlisted candidate.
+  Runtime scales with `shortlist x samples x BO iterations x replicates`.
+- **Auto target multiplier/jitter/floor**: controls the automatic inverse-design
+  target used for shortlist retrieval.
+
+For sparse phase data with many zeros, set an **Auto target floor** such as
+`5` or `10` so the inverse-design query does not stay pinned at zero.
+
+## GPR Notes
+
+GPR mode uses embeddings plus a Gaussian process model. It is useful for
+comparison experiments, but sparse all-zero labels can be hard for GPR early in
+a campaign. BoTorch may warn that outcomes are not standardized or that inputs
+are not unit-cube scaled. These warnings are not OpenAI API errors; they mean
+the GP has little variation to learn from.
+
+LLM BO-ICL can score after one labeled seed example. GPR still needs at least
+two unique labeled procedures before it can fit a meaningful model.
+
+## Files And Local State
+
+Tracked project files:
+
+- `boicl/local_app.py`: local browser app and backend.
+- `run_boicl_local.bat`: Windows launcher.
+- `LOCAL_RUNNER.md`: detailed user guide and setting explanations.
+- `tests/`: local tests.
+
+Ignored local state:
+
+- `.env`: local API keys.
+- `.venv/`: virtual environment.
+- `.cache/`: embedding cache.
+- `saved_experiments/`: saved local campaigns.
+
+## Testing
+
+Run:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest
 ```
 
-This prediction returns $-2.92 \pm 1.27$.
+The current local suite includes tests for dataset import, campaign save/load,
+offline benchmark progress/resume behavior, model selectors, LLM one-seed
+scoring, and plot numbering.
 
-Further improvements can be done by using Bayesian Optimization.
+## Paper Package API
 
-```py
-# Create a list of examples
-pool_list = [
-  "1-bromoheptane",
-  "1-bromohexane",
-  "1-bromo-2-methylpropane",
-  "butan-1-ol"
-]
+The original BO-ICL package API is still available for Python use, for example:
 
-# Create the pool object
-pool=boicl.Pool(pool_list)
-
-# Ask the next point
-asktell.ask(pool)
-
-# Output:
-(['1-bromo-2-methylpropane'], [-1.284916344093158], [-1.92])
-
-```
-
-Where the first value is the selected point, the second value is the value of the acquisition function, and the third value is the predicted mean.
-
-Let's tell this point to the model with its correct label and make a prediction:
-
-```py
-asktell.tell("1-bromo-2-methylpropane", -2.430)
-
-yhat = asktell.predict("1-bromobutane")
-print(yhat.mean(), yhat.std())
-```
-
-This prediction returns $-1.866 \pm 0.012$.
-Which is closer to the label of -2.370 for the 1-bromobutane and the uncertainty also decreased.
-
-### Customising the model
-
-`boicl` provides different models depending on the prompt you want to use.
-One example of usage can be seen in the following:
-
-```py
+```python
 import boicl
-asktell = boicl.AskTellFewShotTopk(
-  x_formatter=lambda x: f"iupac name {x}",
-  y_name="measured log solubility in mols per litre",
-  y_formatter=lambda y: f"{y:.2f}",
-  model="gpt-4",
-  selector_k=5,
-  temperature=0.7,
-)
+
+asktell = boicl.AskTellFewShotTopk()
+asktell.tell("procedure A", 1.2)
+asktell.tell("procedure B", 3.4)
+
+prediction = asktell.predict("procedure C")
+print(prediction.mean(), prediction.std())
 ```
 
-Other arguments can be used to customize the prompt (`prefix`, `prompt_template`, `suffix`) and the in-context learning procedure (`use_quantiles`, `n_quantiles`).
-Additionally, we implemented other models. A brief list can be seen below:
+For the current local workflow, prefer the browser app unless you are
+developing package internals.
 
-- AskTellFewShotTopk;
-- AskTellFinetuning;
-- AskTellRidgeKernelRegression;
-- AskTellGPR;
-- AskTellNearestNeighbor.
+## Citation
 
-Refer to the [notebooks](https://github.com/ur-whitelab/BO-ICL/tree/main/paper) available in the paper directory to see examples of how to use boicl and the [paper](https://arxiv.org/abs/2304.05341) for a detailed description of the classes.
+Please cite Ramos et al.:
 
-### Inverse design
-
-Aiming to propose new data, `boicl` implements another approach to generate data.
-After following a similar procedure to `tell` datapoints to the model, the `inv_predict` can be used to do an inverse prediction.
-For carrying an inverse design out, we query the label we want and the model should generate a data that corresponds to that label:
-
-```py
-data_x = [
-"A 15 wt% tungsten carbide catalyst was prepared with Fe dopant metal at 0.5 wt% and carburized at 835 °C. The reaction was run at 280 °C, resulting in a CO yield of",
-"A 15 wt% tungsten carbide catalyst was prepared with Fe dopant metal at 0.5 wt% and carburized at 835 °C. The reaction was run at 350 °C, resulting in a CO yield of",
-...
-]
-
-data_y = [
-1.66,
-3.03,
-...
-]
-
-
-for i in range(n):
-  asktell.tell(data_x[i], data_y[i]
-
-asktell.inv_predict(20.0)
-```
-
-The data for that is available in the paper directory.
-This generated the following procedure:
-
-```
-the synthesis procedure:"A 30 wt% tungsten carbide catalyst was prepared with Cu dopant metal at 5 wt% and carburized at 835 C. The reaction was run at 350 ºC"
-```
-
-### Citation
-
-Please, cite [Ramos et al.](https://arxiv.org/abs/2304.05341):
-
-```
+```bibtex
 @misc{ramos2023bayesian,
       title={Bayesian Optimization of Catalysts With In-context Learning},
       author={Mayk Caldas Ramos and Shane S. Michtavy and Marc D. Porosoff and Andrew D. White},
