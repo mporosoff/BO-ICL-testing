@@ -58,9 +58,9 @@ def test_import_dataset_uses_first_column_and_optional_values(tmp_path):
 def test_pool_builder_import_shape_is_unlabelled_live_pool(tmp_path):
     state = LocalBOState(tmp_path)
     raw = (
-        "procedure\n"
+        "procedure,alpha phase (%)\n"
         "\"Reduction experiment of WO3/SiO2: ramp to 400 C at 10 C/min, "
-        "soak for 4 h.\"\n"
+        "soak for 4 h.\",\n"
     ).encode("utf-8")
 
     payload = state.import_dataset(
@@ -86,9 +86,13 @@ def test_pool_builder_page_contains_import_controls():
     assert "Step" in POOL_BUILDER_HTML
     assert "boicl_pool_builder" in POOL_BUILDER_HTML
     assert "boicl_runner" in POOL_BUILDER_HTML
-    assert "Open/Focus Runner" in POOL_BUILDER_HTML
+    assert "Open Runner Tab" in POOL_BUILDER_HTML
     assert "Reset Builder" in POOL_BUILDER_HTML
+    assert "objectivePreviewHeader" in POOL_BUILDER_HTML
+    assert "blank until measured" in POOL_BUILDER_HTML
+    assert "The objective column is blank until measured." in POOL_BUILDER_HTML
     assert "boicl-focus-runner" in POOL_BUILDER_HTML
+    assert "target=\"boicl_runner\"" in POOL_BUILDER_HTML
     assert "Save the campaign in the runner to keep it for later" in POOL_BUILDER_HTML
     assert "BroadcastChannel" in POOL_BUILDER_HTML
 
@@ -105,6 +109,8 @@ def test_main_app_candidate_labels_surface_variable_values():
     assert "Clear & Re-run" in INDEX_HTML
     assert "Export Archive" in INDEX_HTML
     assert "Import Archive" in INDEX_HTML
+    assert "candidateSearch" in INDEX_HTML
+    assert "/api/candidate-search" in INDEX_HTML
     assert "Pool Builder imported" in INDEX_HTML
     assert "boicl-focus-runner" in INDEX_HTML
     assert "BroadcastChannel" in INDEX_HTML
@@ -135,6 +141,18 @@ def test_import_dataset_tracks_dataset_metadata(tmp_path):
     assert payload["dataset"]["id"].startswith("mo_carburization_dataset_v1_")
     assert state.candidates[0]["dataset_id"] == payload["dataset"]["id"]
     assert payload["candidates"][0]["dataset_id"] == payload["dataset"]["id"]
+
+
+def test_candidate_search_finds_rows_beyond_public_preview_limit(tmp_path):
+    state = LocalBOState(tmp_path)
+    rows = ["procedure"] + [f"procedure row {idx}" for idx in range(1, 1001)]
+    state.import_dataset("large_pool.csv", "\n".join(rows).encode("utf-8"))
+
+    payload = state.search_candidates("row 900", limit=10)
+
+    assert payload["available_count"] == 1000
+    assert payload["candidates"]
+    assert payload["candidates"][0]["row"] == 900
 
 
 def test_import_dataset_accepts_npy_table(tmp_path):

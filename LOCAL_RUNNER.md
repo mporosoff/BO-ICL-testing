@@ -109,19 +109,31 @@ candidate pool with the selected embedding model. The embeddings are saved under
 repeated benchmark configurations, and app restarts. If you change the embedding
 model, prepare embeddings once for the new model too.
 
-Use `Pool Builder` to open or focus one reusable side window for generating an
+Use `Pool Builder` to open or focus one reusable browser tab for generating an
 unlabeled live experiment pool from the WO3/SiO2 reduction template. The first
 version varies ramp rate, maximum temperature, and dwell time, displays the
-calculated pool size, and imports a procedure-only CSV so the runner stays in
-live-campaign mode instead of treating those numeric variables as objective
-labels. `Open/Focus Runner` reuses one runner window instead of opening a new
-tab each time, and `Reset Builder` restores the default template values. After
+calculated pool size, and imports a live-pool CSV with blank objective cells so
+the runner stays in live-campaign mode instead of treating those numeric
+variables as objective labels. `Open Runner Tab` uses the reusable runner tab,
+and `Reset Builder` restores the default template values. After
 import, the builder confirms the transfer, the runner refreshes with a matching
 dataset notice, and the runner dataset chip shows the loaded filename with a
 dataset id in its hover text. Choose the live objective as `alpha phase (%)` for
 Im-3m or `beta phase (%)` for Pm-3n, then enter the XRD-calculated phase
 percentage from 0 to 100 in `Add Result`. Use whole percent units: enter `73.5`
 for 73.5%, not `0.735`.
+
+Downloaded Pool Builder CSV files include `procedure` plus the selected live
+objective column. That objective column is intentionally blank for live pools.
+Blank objective cells keep the runner in live-campaign mode; if you later fill
+the column with measured values, the same file can be re-imported as a labeled
+offline benchmark dataset.
+
+For live result entry, the runner searches the full available candidate pool by
+row number or procedure text instead of rendering a giant dropdown. This is
+intended for large pools where listing 10,000 procedures at once would be
+awkward. Suggested candidates are included in the search choices, and the manual
+procedure field remains available for off-pool results.
 
 Long-running actions show live progress in the browser and print progress lines
 to the terminal window that launched the app. This includes embedding

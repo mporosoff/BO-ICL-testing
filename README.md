@@ -137,6 +137,17 @@ will run physical experiments over time.
 5. Enter the measured objective and optional uncertainty.
 6. Click **Add Observation** and repeat.
 
+The **Add Result** panel searches the full available candidate pool by row
+number or procedure text, so large pools do not need a huge dropdown. Suggested
+candidates still appear first, and you can also type a manual procedure when a
+result does not correspond to an uploaded pool row.
+
+Pool Builder exports live pools with a `procedure` column plus the selected
+objective column, such as `alpha phase (%)`. The objective cells are blank until
+measurements are available, so the runner treats the pool as unlabeled live
+data. You can also fill that column later and re-import the file as a labeled
+offline benchmark dataset.
+
 Use **Save** in the campaign panel so the pool, settings, observations,
 suggestions, inverse designs, and benchmark runs can be loaded later.
 Use **Start Fresh** when you want a clean browser state for a new dataset or

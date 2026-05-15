@@ -968,6 +968,57 @@ class LocalBOState:
             "procedure": candidate["procedure"],
         }
 
+    def search_candidates(self, query: str = "", limit: int = 80) -> Dict[str, Any]:
+        with self.lock:
+            available = self.available_candidates()
+            query = (query or "").strip().lower()
+            limit = max(1, min(int(limit or 80), 200))
+            if query:
+                tokens = [
+                    token.strip("#")
+                    for token in query.replace(",", " ").split()
+                    if token.strip("#")
+                ]
+
+                def score(candidate: Dict[str, Any]) -> int:
+                    row = str(candidate.get("row", ""))
+                    procedure = str(candidate.get("procedure", "")).lower()
+                    haystack = f"{row} {procedure}"
+                    if not all(token in haystack for token in tokens):
+                        return -1
+                    value = 0
+                    for token in tokens:
+                        if token == row:
+                            value += 100
+                        elif row.startswith(token):
+                            value += 50
+                        elif procedure.startswith(token):
+                            value += 25
+                        else:
+                            value += 5
+                    return value
+
+                scored = [
+                    (score(candidate), candidate)
+                    for candidate in available
+                ]
+                matches = [
+                    candidate
+                    for _, candidate in sorted(
+                        (item for item in scored if item[0] >= 0),
+                        key=lambda item: (-item[0], item[1].get("row", 0)),
+                    )
+                ]
+            else:
+                matches = available
+            return {
+                "candidates": [
+                    self.public_candidate(candidate) for candidate in matches[:limit]
+                ],
+                "matched_count": len(matches),
+                "available_count": len(available),
+            }
+
     def to_json(self) -> Dict[str, Any]:
         with self.lock:
             active_observations = self.active_observations()
@@ -2990,6 +3041,14 @@ class LocalAppHandler(BaseHTTPRequestHandler):
             self._send_json({"progress": self.state.progress_snapshot()})
         elif parsed.path == "/api/campaigns":
             self._send_json({"campaigns": self.state.list_campaigns()})
+        elif parsed.path == "/api/candidate-search":
+            query = parse_qs(parsed.query)
+            self._send_json(
+                self.state.search_candidates(
+                    query.get("q", [""])[0],
+                    int(query.get("limit", ["80"])[0] or 80),
+                )
+            )
         elif parsed.path == "/api/export-observations.csv":
             payload = self.state.export_observations_csv()
             filename = self.state.export_observations_filename()
@@ -3383,7 +3442,7 @@ INDEX_HTML = r"""<!doctype html>
       <span class="chip" id="datasetStatus">No dataset</span>
       <span class="chip" id="embeddingStatus">Embeddings</span>
       <span class="chip" id="observationStatus">0 observations</span>
-      <button id="openPoolBuilderTop" title="Open or focus the reusable local procedure-pool builder window.">Pool Builder</button>
+      <button id="openPoolBuilderTop" title="Open or focus the reusable local procedure-pool builder tab.">Pool Builder</button>
       <a class="button-link" href="/guide" target="_blank" rel="noopener" title="Open the local user guide in a new browser tab.">User Guide</a>
       <button class="secondary" id="suggestTop">Update Suggestions</button>
     </div>
@@ -3699,9 +3758,12 @@ INDEX_HTML = r"""<!doctype html>
       <section class="panel" id="liveResultPanel">
         <h2>Add Result</h2>
         <div class="field">
-          <label for="candidateSelect">Candidate</label>
-          <select id="candidateSelect"></select>
+          <label for="candidateSearch">Candidate search</label>
+          <input id="candidateSearch" list="candidateOptions" autocomplete="off" placeholder="Search row #, ramp, temperature, dwell, or procedure text">
+          <datalist id="candidateOptions"></datalist>
+          <input id="candidateSelect" type="hidden">
         </div>
+        <button id="clearCandidate" type="button" style="margin: -4px 0 10px;">Clear Candidate</button>
         <div class="muted" id="candidatePreview" style="margin: -6px 0 12px;"></div>
         <div class="field">
           <label for="manualProcedure">Procedure</label>
@@ -3752,6 +3814,8 @@ INDEX_HTML = r"""<!doctype html>
     let busy = false;
     let progressTimer = null;
     let transientNotice = '';
+    let candidateSearchResults = [];
+    let candidateSearchTimer = null;
     const poolChannel = 'BroadcastChannel' in window ? new BroadcastChannel('boicl-local-runner') : null;
 
     const $ = (id) => document.getElementById(id);
@@ -3801,7 +3865,8 @@ INDEX_HTML = r"""<!doctype html>
       benchmarkSeed: 'Starting random seed for reproducible benchmark replicates.',
       benchmarkStartingBaseline: 'Plot-only incumbent value at experiment count 1. Dataset mean starts each benchmark curve from the mean label without adding a fake labeled procedure to the LLM context; BO-selected pool experiments begin at count 2.',
       greedyFinalIteration: 'When checked, only the final BO choice in each replicate switches to greedy acquisition. Earlier choices use the selected acquisition function.',
-      candidateSelect: 'Choose a suggested or uploaded pool candidate for live result entry.',
+      candidateSearch: 'Search the full available pool by row number or procedure text, then choose a candidate for live result entry.',
+      clearCandidate: 'Clear the selected pool candidate and use the manual procedure field instead.',
       manualProcedure: 'Procedure text for a live observation. This fills automatically when you select a candidate.',
       objectiveValue: 'Measured objective value in original units. For tungsten phase optimization, enter whole percent units from 0 to 100, for example 73.5 for 73.5%, not 0.735.',
       objectiveUncertainty: 'Optional measurement uncertainty or standard deviation in original units.'
@@ -3906,7 +3971,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function openPoolBuilder() {
-      const popup = window.open('/pool-builder', 'boicl_pool_builder', 'width=1180,height=820');
+      const popup = window.open('/pool-builder', 'boicl_pool_builder');
       if (popup) popup.focus();
     }
 
@@ -4177,35 +4242,124 @@ INDEX_HTML = r"""<!doctype html>
       return lead ? `${lead} - ${tail}` : tail;
     }
 
+    function findCandidateById(id) {
+      if (!id) return null;
+      return (candidateSearchResults || []).find((item) => item.id === id || item.candidate_id === id)
+        || (state.candidates || []).find((item) => item.id === id)
+        || (state.available_candidates || []).find((item) => item.id === id)
+        || (state.suggestions || []).find((item) => item.candidate_id === id)
+        || null;
+    }
+
+    function decorateCandidate(item, prefix = '') {
+      const id = item.id || item.candidate_id || '';
+      return {
+        ...item,
+        id,
+        candidate_id: item.candidate_id || id,
+        _candidateLabel: candidateOptionLabel(item, prefix)
+      };
+    }
+
+    function setCandidateSelection(item, prefix = '') {
+      if (!item) return;
+      const decorated = item._candidateLabel ? item : decorateCandidate(item, prefix);
+      $('candidateSelect').value = decorated.id || decorated.candidate_id || '';
+      $('candidateSearch').value = decorated._candidateLabel;
+      $('manualProcedure').value = decorated.procedure || '';
+      updateCandidatePreview();
+      $('objectiveValue').focus();
+    }
+
+    function clearCandidateSelection(clearProcedure = false) {
+      $('candidateSelect').value = '';
+      $('candidateSearch').value = '';
+      if (clearProcedure) $('manualProcedure').value = '';
+      updateCandidatePreview();
+    }
+
+    function populateCandidateOptions(items) {
+      const seen = new Set();
+      candidateSearchResults = [];
+      items.forEach((item) => {
+        const decorated = item._candidateLabel ? item : decorateCandidate(item);
+        const id = decorated.id || decorated.candidate_id || '';
+        if (!id || seen.has(id)) return;
+        seen.add(id);
+        candidateSearchResults.push(decorated);
+      });
+      $('candidateOptions').innerHTML = candidateSearchResults.map((item) => (
+        `<option value="${escapeHtml(item._candidateLabel)}"></option>`
+      )).join('');
+    }
+
+    function exactCandidateSearchMatch() {
+      const value = $('candidateSearch').value.trim();
+      return candidateSearchResults.find((item) => item._candidateLabel === value) || null;
+    }
+
     function updateCandidatePreview() {
       const id = $('candidateSelect').value;
-      const cand = (state.candidates || []).find((item) => item.id === id);
-      const sug = (state.suggestions || []).find((item) => item.candidate_id === id);
-      const item = cand || sug;
+      const item = findCandidateById(id);
       if (!item) {
-        $('candidatePreview').textContent = '';
+        const available = Number(state.available_count || 0);
+        $('candidatePreview').textContent = available
+          ? `Search ${available.toLocaleString()} available candidate(s), or type a manual procedure below.`
+          : 'No available pool candidates. Type a manual procedure below if needed.';
         return;
       }
       const summary = candidateProcedureSummary(item.procedure);
       $('candidatePreview').textContent = summary
-        ? `${summary}. Full procedure is shown below.`
-        : 'Full selected procedure is shown below.';
+        ? `${summary}. Selected candidate row ${item.row || ''}; full procedure is shown below.`
+        : `Selected candidate row ${item.row || ''}; full procedure is shown below.`;
     }
 
     function renderCandidateSelect() {
       const suggestions = state.suggestions || [];
-      const candidates = (state.available_candidates || []).slice(0, 500);
-      const options = ['<option value="">Manual procedure</option>'];
-      suggestions.forEach((sug) => {
-        options.push(`<option value="${escapeHtml(sug.candidate_id)}">${escapeHtml(candidateOptionLabel(sug, 'Suggested'))}</option>`);
-      });
-      candidates.forEach((cand) => {
-        if (!suggestions.some((sug) => sug.candidate_id === cand.id)) {
-          options.push(`<option value="${escapeHtml(cand.id)}">${escapeHtml(candidateOptionLabel(cand))}</option>`);
-        }
-      });
-      $('candidateSelect').innerHTML = options.join('');
+      const candidates = (state.available_candidates || []).slice(0, 50);
+      populateCandidateOptions([
+        ...suggestions.map((sug) => decorateCandidate(sug, 'Suggested')),
+        ...candidates.map((cand) => decorateCandidate(cand))
+      ]);
       updateCandidatePreview();
+    }
+
+    async function searchCandidates() {
+      const query = $('candidateSearch').value.trim();
+      const exact = exactCandidateSearchMatch();
+      if (exact) {
+        setCandidateSelection(exact);
+        return;
+      }
+      if ($('candidateSelect').value) {
+        $('manualProcedure').value = '';
+      }
+      $('candidateSelect').value = '';
+      const suggestions = (state.suggestions || [])
+        .filter((sug) => {
+          const text = `${sug.row || ''} ${sug.procedure || ''}`.toLowerCase();
+          return !query || query.toLowerCase().split(/\s+/).every((token) => text.includes(token));
+        })
+        .map((sug) => decorateCandidate(sug, 'Suggested'));
+      try {
+        const response = await fetch(`/api/candidate-search?q=${encodeURIComponent(query)}&limit=80`, { cache: 'no-store' });
+        const payload = await response.json();
+        const rows = (payload.candidates || []).map((cand) => decorateCandidate(cand));
+        populateCandidateOptions([...suggestions, ...rows]);
+        updateCandidatePreview();
+      } catch (error) {
+        renderError(error.message);
+      }
+    }
+
+    function queueCandidateSearch() {
+      const exact = exactCandidateSearchMatch();
+      if (exact) {
+        setCandidateSelection(exact);
+        return;
+      }
+      if (candidateSearchTimer) window.clearTimeout(candidateSearchTimer);
+      candidateSearchTimer = window.setTimeout(searchCandidates, 180);
     }
 
     function renderPlot() {
@@ -4402,11 +4556,8 @@ INDEX_HTML = r"""<!doctype html>
       </table></div>`;
       document.querySelectorAll('[data-use]').forEach((button) => {
         button.addEventListener('click', () => {
-          $('candidateSelect').value = button.dataset.use;
           const sug = suggestions.find((item) => item.candidate_id === button.dataset.use);
-          $('manualProcedure').value = sug ? sug.procedure : '';
-          updateCandidatePreview();
-          $('objectiveValue').focus();
+          if (sug) setCandidateSelection(sug, 'Suggested');
         });
       });
     }
@@ -4644,16 +4795,16 @@ INDEX_HTML = r"""<!doctype html>
       });
       $('objectiveValue').value = '';
       $('objectiveUncertainty').value = '';
+      clearCandidateSelection(true);
       if (state && state.config.auto_suggest) await updateSuggestions();
     });
 
-    $('candidateSelect').addEventListener('change', () => {
-      const id = $('candidateSelect').value;
-      const cand = (state.candidates || []).find((item) => item.id === id);
-      const sug = (state.suggestions || []).find((item) => item.candidate_id === id);
-      $('manualProcedure').value = cand ? cand.procedure : (sug ? sug.procedure : '');
-      updateCandidatePreview();
+    $('candidateSearch').addEventListener('input', queueCandidateSearch);
+    $('candidateSearch').addEventListener('change', () => {
+      const exact = exactCandidateSearchMatch();
+      if (exact) setCandidateSelection(exact);
     });
+    $('clearCandidate').addEventListener('click', () => clearCandidateSelection(true));
 
     $('suggest').addEventListener('click', updateSuggestions);
     $('suggestTop').addEventListener('click', updateSuggestions);
@@ -4922,7 +5073,7 @@ POOL_BUILDER_HTML = r"""<!doctype html>
     </div>
     <div class="toolbar">
       <span class="pill" id="countPill">0 procedures</span>
-      <button id="focusRunner">Open/Focus Runner</button>
+      <a class="button-link" id="focusRunner" href="/" target="boicl_runner">Open Runner Tab</a>
     </div>
   </header>
 
@@ -5018,6 +5169,7 @@ POOL_BUILDER_HTML = r"""<!doctype html>
             <tr>
               <th>#</th>
               <th>Procedure</th>
+              <th id="objectivePreviewHeader">Objective</th>
             </tr>
           </thead>
           <tbody id="previewRows"></tbody>
@@ -5113,7 +5265,9 @@ POOL_BUILDER_HTML = r"""<!doctype html>
 
     function toCsv(rows) {
       const escape = (value) => `"${String(value).replaceAll('"', '""')}"`;
-      return ['procedure'].concat(rows.map((row) => escape(row.procedure))).join('\n') + '\n';
+      const objective = $('phaseObjective').value || 'objective';
+      const header = ['procedure', escape(objective)].join(',');
+      return [header].concat(rows.map((row) => `${escape(row.procedure)},`)).join('\n') + '\n';
     }
 
     function setStatus(message, isError = false) {
@@ -5161,13 +5315,15 @@ POOL_BUILDER_HTML = r"""<!doctype html>
         $('countPill').textContent = `${currentRows.length} procedures`;
         $('poolSize').value = currentRows.length.toLocaleString();
         $('combinationNote').textContent = `${result.total} total combinations`;
+        $('objectivePreviewHeader').textContent = `${$('phaseObjective').value} (blank until measured)`;
         $('previewRows').innerHTML = currentRows.slice(0, previewCount).map((row, index) => `
           <tr>
             <td>${index + 1}</td>
             <td class="procedure">${escapeHtml(row.procedure)}</td>
+            <td class="muted">(blank)</td>
           </tr>
         `).join('');
-        setStatus(`Generated ${currentRows.length} procedure-only row(s). Numeric variables are embedded in the procedure text.`);
+        setStatus(`Generated ${currentRows.length} live procedure row(s). The objective column is blank until measured.`);
       } catch (error) {
         currentRows = [];
         $('countPill').textContent = '0 procedures';
@@ -5211,7 +5367,7 @@ POOL_BUILDER_HTML = r"""<!doctype html>
         setStatus(
           `Imported ${payload.candidate_count} candidate(s) into the runner. `
           + `${message.saved ? 'The current campaign was autosaved.' : 'Save the campaign in the runner to keep it for later.'} `
-          + `Use Open/Focus Runner to continue.`
+          + `Use Open Runner Tab to continue.`
         );
       } catch (error) {
         setStatus(error.message, true);
@@ -5245,7 +5401,10 @@ POOL_BUILDER_HTML = r"""<!doctype html>
     $('importPool').addEventListener('click', importPool);
     $('downloadPool').addEventListener('click', downloadPool);
     $('resetBuilder').addEventListener('click', resetBuilder);
-    $('focusRunner').addEventListener('click', focusRunner);
+    $('focusRunner').addEventListener('click', () => {
+      if (poolChannel) poolChannel.postMessage({ type: 'boicl-focus-runner' });
+      setStatus('Runner tab opened/focused. If the browser kept it in the background, switch to the BO-ICL Runner tab.');
+    });
     renderPreview();
   </script>
 </body>
@@ -5355,8 +5514,8 @@ USER_GUIDE_HTML = r"""<!doctype html>
 
     <section>
       <h2>Procedure Pool Builder</h2>
-      <p>Open <code>Pool Builder</code> to generate an unlabeled live-experiment pool for the WO3/SiO2 reduction template. The app reuses one Pool Builder window instead of opening a fresh tab every time. The first version varies ramp rate, maximum temperature, and dwell time while keeping gas, flow rate, stabilization time, holder, and cooling text fixed.</p>
-      <p>The builder imports a procedure-only CSV so the generated numeric variables are not mistaken for objective labels. They are embedded directly inside each procedure string, which keeps the main runner in live-campaign mode.</p>
+      <p>Open <code>Pool Builder</code> to generate an unlabeled live-experiment pool for the WO3/SiO2 reduction template. The app reuses one Pool Builder tab instead of opening a fresh tab every time. The first version varies ramp rate, maximum temperature, and dwell time while keeping gas, flow rate, stabilization time, holder, and cooling text fixed.</p>
+      <p>The builder imports a live-pool CSV with <code>procedure</code> plus a blank selected-objective column. Blank objective cells keep the main runner in live-campaign mode; if those cells are later filled with measured labels, the same CSV can be re-imported as a labeled offline benchmark dataset.</p>
       <p>After import, the builder shows an import confirmation and the runner refreshes with a matching notice. If the campaign is not saved yet, click <code>Save</code> in the runner to keep the generated pool for later.</p>
       <p><code>Pool size</code> is calculated from the minimum, maximum, and step settings for the three variables. The live objective selector sets the main runner to maximize either <code>alpha phase (%)</code> for Im-3m or <code>beta phase (%)</code> for Pm-3n; enter the XRD-calculated percentage from 0 to 100 with <code>Add Result</code>. Use whole percent units: <code>73.5</code> means 73.5%, not 0.735.</p>
     </section>
@@ -5395,7 +5554,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
         <li>Run the physical experiment offline, then enter the measured value and optional uncertainty.</li>
         <li>Repeat until the iteration cap is reached or you decide to stop.</li>
       </ol>
-      <p>Objective values should be entered in original units. Scaling is only used internally for fitting if enabled, and the plot remains in original units.</p>
+      <p>The <code>Add Result</code> candidate field searches the full available pool by row number or procedure text, so large pools do not need a giant dropdown. Objective values should be entered in original units. Scaling is only used internally for fitting if enabled, and the plot remains in original units.</p>
     </section>
 
     <section>
