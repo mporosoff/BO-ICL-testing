@@ -182,6 +182,8 @@ def test_defaults_match_paper_style_numeric_settings():
     assert DEFAULT_CONFIG["benchmark_iterations"] == 30
     assert DEFAULT_CONFIG["benchmark_replicates"] == 5
     assert DEFAULT_CONFIG["benchmark_starting_baseline"] == "none"
+    assert DEFAULT_CONFIG["objective_lower_bound"] == ""
+    assert DEFAULT_CONFIG["objective_upper_bound"] == ""
     assert DEFAULT_CONFIG["ucb_lambda"] == 0.1
     assert DEFAULT_CONFIG["llm_samples"] == 3
     assert DEFAULT_CONFIG["llm_pool_scope"] == "full"
@@ -199,6 +201,8 @@ def test_model_fields_are_real_selectors():
     assert '<select id="embeddingModel"></select>' in INDEX_HTML
     assert '<select id="predictionModel"></select>' in INDEX_HTML
     assert '<select id="inverseModel"></select>' in INDEX_HTML
+    assert 'id="objectiveLowerBound"' in INDEX_HTML
+    assert 'id="objectiveUpperBound"' in INDEX_HTML
     assert 'id="modelOptions"' not in INDEX_HTML
     assert 'id="embeddingModelOptions"' not in INDEX_HTML
 
@@ -1207,15 +1211,22 @@ def test_auto_prompts_refresh_when_live_objective_name_changes(tmp_path):
     state = LocalBOState(tmp_path)
     state.import_dataset("pool.csv", b"procedure,objective\nproc a,\nproc b,\n")
 
-    payload = state.update_config({"objective_name": "alpha Mo2C"})
+    payload = state.update_config(
+        {
+            "objective_name": "alpha Mo2C",
+            "objective_lower_bound": "0",
+            "objective_upper_bound": "100",
+        }
+    )
 
     assert "Active objective selected in the tool: alpha Mo2C" in payload["config"][
         "prediction_system_message"
     ]
+    assert "bounded from 0 to 100" in payload["config"]["prediction_system_message"]
     assert "alpha Mo2C" in payload["config"]["inverse_system_message"]
 
 
-def test_custom_prompts_are_not_replaced_when_objective_name_changes(tmp_path):
+def test_custom_prompts_are_not_replaced_but_runtime_bounds_are_appended(tmp_path):
     state = LocalBOState(tmp_path)
     state.import_dataset("pool.csv", b"procedure,objective\nproc a,\nproc b,\n")
     state.update_config(
@@ -1225,10 +1236,18 @@ def test_custom_prompts_are_not_replaced_when_objective_name_changes(tmp_path):
         }
     )
 
-    payload = state.update_config({"objective_name": "alpha Mo2C"})
+    payload = state.update_config(
+        {
+            "objective_name": "alpha Mo2C",
+            "objective_lower_bound": "0",
+            "objective_upper_bound": "100",
+        }
+    )
 
     assert payload["config"]["prediction_system_message"] == "custom prediction"
     assert payload["config"]["inverse_system_message"] == "custom inverse"
+    assert state.prediction_system_message().startswith("custom prediction")
+    assert "bounded from 0 to 100" in state.prediction_system_message()
 
 
 def test_browser_config_tracks_llm_and_inverse_models(tmp_path):

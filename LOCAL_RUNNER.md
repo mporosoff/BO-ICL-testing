@@ -85,6 +85,11 @@ training. `Target scaling` is off by default. `Auto range`, `Min-max`, and
 `Z-score` scale the model target while plots and exports stay in the original
 objective units. Entered uncertainty is stored, exported, and plotted as an
 error bar.
+`Objective lower bound` and `Objective upper bound` are optional physical or
+measurement bounds in original units. For phase percentages, use `0` and `100`.
+These bounds are included in the LLM system-message context and used to clip the
+displayed prediction/error bars on the plot. They do not clamp stored raw
+predictions, measured values, exports, or acquisition ranking.
 For model-selected points, the runner also stores the model prediction that was
 used for ranking. Those prediction means and uncertainties are plotted as
 separate prediction markers with error bars and are included in saved campaigns,

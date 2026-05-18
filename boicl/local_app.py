@@ -97,6 +97,7 @@ GENERATED_PREDICTION_PROMPT_PREFIX = (
 GENERATED_INVERSE_PROMPT_PREFIX = (
     "You are a careful inverse-design assistant for Bayesian optimization."
 )
+OBJECTIVE_BOUNDS_PROMPT_MARKER = "Known objective bounds supplied by the user:"
 
 
 DEFAULT_CONFIG = {
@@ -105,6 +106,8 @@ DEFAULT_CONFIG = {
     "objective_name": "objective",
     "objective_direction": "maximize",
     "objective_scaling": "off",
+    "objective_lower_bound": "",
+    "objective_upper_bound": "",
     "acquisition": "upper_confidence_bound",
     "embedding_model": "text-embedding-ada-002",
     "prediction_model": "gpt-4o",
@@ -163,6 +166,8 @@ BENCHMARK_RESUME_MATCH_KEYS = [
     "objective_name",
     "objective_direction",
     "objective_scaling",
+    "objective_lower_bound",
+    "objective_upper_bound",
     "acquisition",
     "embedding_model",
     "prediction_model",
@@ -232,10 +237,36 @@ def _is_auto_inverse_prompt(value: Optional[str]) -> bool:
     )
 
 
+def _bounds_instruction(
+    lower: Optional[float], upper: Optional[float]
+) -> str:
+    if lower is None and upper is None:
+        return ""
+    if lower is not None and upper is not None:
+        return (
+            f"{OBJECTIVE_BOUNDS_PROMPT_MARKER} the active objective is physically "
+            f"bounded from {lower:g} to {upper:g} in original objective units. "
+            "Use these bounds as measurement context; values outside this range "
+            "are physically invalid."
+        )
+    if lower is not None:
+        return (
+            f"{OBJECTIVE_BOUNDS_PROMPT_MARKER} the active objective has a lower "
+            f"bound of {lower:g} in original objective units. Use this as "
+            "measurement context; values below this bound are physically invalid."
+        )
+    return (
+        f"{OBJECTIVE_BOUNDS_PROMPT_MARKER} the active objective has an upper "
+        f"bound of {upper:g} in original objective units. Use this as measurement "
+        "context; values above this bound are physically invalid."
+    )
+
+
 def _dataset_prompt_summary(
     candidates: List[Dict[str, Any]],
     objective_names: List[str],
     active_objective: Optional[str] = None,
+    objective_bounds: Optional[Tuple[Optional[float], Optional[float]]] = None,
 ) -> str:
     objectives = ", ".join(objective_names) if objective_names else "objective"
     lines = [
@@ -244,6 +275,10 @@ def _dataset_prompt_summary(
     ]
     if active_objective:
         lines.append(f"Active objective selected in the tool: {active_objective}.")
+    if objective_bounds:
+        instruction = _bounds_instruction(*objective_bounds)
+        if instruction:
+            lines.append(instruction)
     lines.append(
         "The first uploaded column is the procedure text. Numeric labels, if present, "
         "are used by the tool only when an experiment is observed or simulated."
@@ -259,6 +294,7 @@ def _dataset_prediction_prompt(
     candidates: List[Dict[str, Any]],
     objective_names: List[str],
     active_objective: Optional[str] = None,
+    objective_bounds: Optional[Tuple[Optional[float], Optional[float]]] = None,
 ) -> str:
     return (
         f"{GENERATED_PREDICTION_PROMPT_PREFIX} You will receive relevant labeled "
@@ -270,7 +306,7 @@ def _dataset_prediction_prompt(
         "the prompt. Return exactly one numeric value in the original objective "
         "units. Do not include units, JSON, ranges, uncertainty, citations, "
         "explanations, or extra text.\n\n"
-        f"{_dataset_prompt_summary(candidates, objective_names, active_objective)}"
+        f"{_dataset_prompt_summary(candidates, objective_names, active_objective, objective_bounds)}"
     )
 
 
@@ -278,6 +314,7 @@ def _dataset_inverse_prompt(
     candidates: List[Dict[str, Any]],
     objective_names: List[str],
     active_objective: Optional[str] = None,
+    objective_bounds: Optional[Tuple[Optional[float], Optional[float]]] = None,
 ) -> str:
     return (
         f"{GENERATED_INVERSE_PROMPT_PREFIX} You will receive labeled examples and "
@@ -289,7 +326,7 @@ def _dataset_inverse_prompt(
         "reuse parameter names, units, syntax, reagents, ranges, and workflow steps "
         "seen in the examples unless the prompt explicitly allows otherwise. Return "
         "only the procedure text, with no explanation or formatting.\n\n"
-        f"{_dataset_prompt_summary(candidates, objective_names, active_objective)}"
+        f"{_dataset_prompt_summary(candidates, objective_names, active_objective, objective_bounds)}"
     )
 
 
@@ -1154,14 +1191,29 @@ class LocalBOState:
             for cand in self.labelled_candidates(objective)
         ]
 
+    def objective_bounds(self) -> Tuple[Optional[float], Optional[float]]:
+        lower = _coerce_float(self.config.get("objective_lower_bound"))
+        upper = _coerce_float(self.config.get("objective_upper_bound"))
+        if lower is not None and upper is not None and lower > upper:
+            lower, upper = upper, lower
+        return lower, upper
+
+    def _system_message_with_bounds(self, message: str) -> str:
+        instruction = _bounds_instruction(*self.objective_bounds())
+        if instruction and OBJECTIVE_BOUNDS_PROMPT_MARKER not in message:
+            return f"{message}\n\n{instruction}"
+        return message
+
     def prediction_system_message(self) -> str:
-        return (
+        message = (
             self.config.get("prediction_system_message")
             or DEFAULT_PREDICTION_SYSTEM_MESSAGE
         )
+        return self._system_message_with_bounds(message)
 
     def inverse_system_message(self) -> str:
-        return self.config.get("inverse_system_message") or DEFAULT_INVERSE_SYSTEM_MESSAGE
+        message = self.config.get("inverse_system_message") or DEFAULT_INVERSE_SYSTEM_MESSAGE
+        return self._system_message_with_bounds(message)
 
     def _refresh_dataset_prompts_locked(self, force: bool = False) -> bool:
         if not self.candidates:
@@ -1176,6 +1228,7 @@ class LocalBOState:
                 self.candidates,
                 self.objective_names,
                 self.config.get("objective_name"),
+                self.objective_bounds(),
             )
             changed = True
         if force or _is_auto_inverse_prompt(self.config.get("inverse_system_message")):
@@ -1183,6 +1236,7 @@ class LocalBOState:
                 self.candidates,
                 self.objective_names,
                 self.config.get("objective_name"),
+                self.objective_bounds(),
             )
             changed = True
         if changed:
@@ -1695,6 +1749,7 @@ class LocalBOState:
     def update_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         with self.lock:
             previous_objective_name = self.config.get("objective_name")
+            previous_objective_bounds = self.objective_bounds()
             for key in DEFAULT_CONFIG:
                 if key not in payload:
                     continue
@@ -1800,7 +1855,10 @@ class LocalBOState:
             if self.config["objective_name"] not in self.objective_names:
                 self.objective_names.append(self.config["objective_name"])
             self.refresh_active_objective()
-            if self.config.get("objective_name") != previous_objective_name:
+            if (
+                self.config.get("objective_name") != previous_objective_name
+                or self.objective_bounds() != previous_objective_bounds
+            ):
                 self._refresh_dataset_prompts_locked()
             self.log("Updated run settings.")
             self._autosave_locked()
@@ -2780,6 +2838,8 @@ class LocalBOState:
                 "objective_name",
                 "objective_direction",
                 "objective_scaling",
+                "objective_lower_bound",
+                "objective_upper_bound",
                 "acquisition",
                 "embedding_model",
                 "prediction_model",
@@ -4143,6 +4203,16 @@ INDEX_HTML = r"""<!doctype html>
         <div class="muted" style="margin-top: -4px; margin-bottom: 12px;">
           Tungsten phase campaigns: use an XRD phase percentage from 0-100 as the live objective, for example alpha phase (%) for Im-3m or beta phase (%) for Pm-3n.
         </div>
+        <div class="row">
+          <div class="field">
+            <label for="objectiveLowerBound">Objective lower bound</label>
+            <input id="objectiveLowerBound" type="number" step="any" placeholder="optional">
+          </div>
+          <div class="field">
+            <label for="objectiveUpperBound">Objective upper bound</label>
+            <input id="objectiveUpperBound" type="number" step="any" placeholder="optional">
+          </div>
+        </div>
         <div class="field">
           <label for="objectiveScaling">Target scaling</label>
           <select id="objectiveScaling">
@@ -4470,6 +4540,8 @@ INDEX_HTML = r"""<!doctype html>
       objectiveName: 'The numeric label column to optimize. If multiple objective columns were uploaded, choose one here.',
       objectiveDirection: 'Maximize for yields/selectivity/scores; minimize for losses, errors, or costs.',
       acquisition: 'Candidate ranking rule. The paper notebook default sweep included upper confidence bound, greedy, random, and random mean baseline.',
+      objectiveLowerBound: 'Optional physical or measurement lower bound in original units. Used only in LLM system messages and plot display, not acquisition math.',
+      objectiveUpperBound: 'Optional physical or measurement upper bound in original units. For phase percentages, use 100. Used only in LLM system messages and plot display.',
       objectiveScaling: 'Off keeps labels in their original units for model fitting. Auto/min-max/z-score scale only the model target; plots stay in original units.',
       plotStatGuides: 'Controls full-dataset dashed reference lines. Best only is cleaner; Paper stats adds mean and percentile guides.',
       embeddingModel: 'OpenAI embedding model used to featurize procedures for GPR and nearest-neighbor inverse filtering.',
@@ -4667,6 +4739,8 @@ INDEX_HTML = r"""<!doctype html>
         objective_name: $('objectiveName').value,
         objective_direction: $('objectiveDirection').value,
         objective_scaling: $('objectiveScaling').value,
+        objective_lower_bound: $('objectiveLowerBound').value,
+        objective_upper_bound: $('objectiveUpperBound').value,
         plot_stat_guides: $('plotStatGuides').value,
         acquisition: $('acquisition').value,
         embedding_model: $('embeddingModel').value,
@@ -4801,6 +4875,8 @@ INDEX_HTML = r"""<!doctype html>
       setSelectOptions('inverseModel', state.model_presets || [], config.inverse_model);
       $('objectiveDirection').value = config.objective_direction;
       $('objectiveScaling').value = config.objective_scaling;
+      $('objectiveLowerBound').value = config.objective_lower_bound || '';
+      $('objectiveUpperBound').value = config.objective_upper_bound || '';
       $('plotStatGuides').value = config.plot_stat_guides || 'max';
       $('predictionSystemMessage').value = config.prediction_system_message;
       $('inverseSystemMessage').value = config.inverse_system_message;
@@ -5065,6 +5141,30 @@ INDEX_HTML = r"""<!doctype html>
       const height = 330;
       const pad = { left: 56, right: 76, top: 26, bottom: 46 };
       const activeObs = obs.filter((item) => item.value !== null && item.value !== undefined);
+      const optionalNumber = (value) => {
+        if (value === null || value === undefined || value === '') return null;
+        const number = Number(value);
+        return Number.isFinite(number) ? number : null;
+      };
+      let objectiveLower = optionalNumber((state.config || {}).objective_lower_bound);
+      let objectiveUpper = optionalNumber((state.config || {}).objective_upper_bound);
+      if (objectiveLower !== null && objectiveUpper !== null && objectiveLower > objectiveUpper) {
+        const swapped = objectiveLower;
+        objectiveLower = objectiveUpper;
+        objectiveUpper = swapped;
+      }
+      const clipToObjectiveBounds = (value) => {
+        if (value === null || value === undefined || !Number.isFinite(Number(value))) return value;
+        let clipped = Number(value);
+        if (objectiveLower !== null) clipped = Math.max(objectiveLower, clipped);
+        if (objectiveUpper !== null) clipped = Math.min(objectiveUpper, clipped);
+        return clipped;
+      };
+      const boundedRangeValues = (center, spread = 0) => [
+        clipToObjectiveBounds(Number(center) - Number(spread || 0)),
+        clipToObjectiveBounds(Number(center) + Number(spread || 0)),
+        clipToObjectiveBounds(Number(center))
+      ];
       const xIndexes = [
         ...trace.map((item) => Number(item.index)),
         ...randomTrace.map((item) => Number(item.index)),
@@ -5076,24 +5176,29 @@ INDEX_HTML = r"""<!doctype html>
       const maxIndex = Math.max(1, ...xIndexes);
       const values = activeObs.flatMap((item) => {
         const unc = Number(item.uncertainty || 0);
-        return [item.value - unc, item.value + unc, item.value];
+        return [clipToObjectiveBounds(item.value - unc), clipToObjectiveBounds(item.value + unc), item.value];
       }).concat(
         activeObs.flatMap((item) => {
           const prediction = item.prediction || {};
           if (prediction.mean === null || prediction.mean === undefined) return [];
           const std = Number(prediction.std || 0);
-          return [prediction.mean - std, prediction.mean + std, prediction.mean];
+          return boundedRangeValues(prediction.mean, std);
         }),
         randomObs.flatMap((item) => {
           const unc = Number(item.uncertainty || 0);
-          return [item.value - unc, item.value + unc, item.value];
+          return [clipToObjectiveBounds(item.value - unc), clipToObjectiveBounds(item.value + unc), item.value];
         }),
         trace.map((item) => item.best),
         randomTrace.map((item) => item.best),
         liveRandomTrace.map((item) => item.best),
         benchmarkRuns.flatMap((run) => (run.summary || []).flatMap((item) => [item.lower, item.upper, item.mean])),
-        benchmarkRuns.flatMap((run) => (run.prediction_summary || []).flatMap((item) => [item.lower, item.upper, item.mean])),
-        datasetStats.map((item) => item.value)
+        benchmarkRuns.flatMap((run) => (run.prediction_summary || []).flatMap((item) => [
+          clipToObjectiveBounds(item.lower),
+          clipToObjectiveBounds(item.upper),
+          clipToObjectiveBounds(item.mean)
+        ])),
+        datasetStats.map((item) => item.value),
+        [objectiveLower, objectiveUpper]
       ).filter((value) => value !== null && value !== undefined && Number.isFinite(Number(value)));
       if (!values.length) {
         host.innerHTML = '<div class="empty" style="margin: 18px;">No plottable values yet</div>';
@@ -5140,6 +5245,14 @@ INDEX_HTML = r"""<!doctype html>
         return `<line x1="${pad.left}" x2="${width - pad.right}" y1="${yy}" y2="${yy}" stroke="#98a2b3" stroke-width="1" stroke-dasharray="4 5" opacity="${idx === 0 ? 0.7 : 0.55}" />
           <text x="${width - pad.right + 8}" y="${yy + 4}">${escapeHtml(item.label)}</text>`;
       }).join('');
+      const boundLines = [
+        objectiveLower !== null ? { value: objectiveLower, label: 'lower bound' } : null,
+        objectiveUpper !== null && objectiveUpper !== objectiveLower ? { value: objectiveUpper, label: 'upper bound' } : null
+      ].filter(Boolean).map((item) => {
+        const yy = y(item.value);
+        return `<line x1="${pad.left}" x2="${width - pad.right}" y1="${yy}" y2="${yy}" stroke="#475467" stroke-width="1" stroke-dasharray="2 4" opacity="0.5" />
+          <text x="${width - pad.right + 8}" y="${yy + 4}">${escapeHtml(item.label)}</text>`;
+      }).join('');
       const runLayers = benchmarkRuns.map((run) => {
         const points = run.summary || [];
         if (!points.length) return '';
@@ -5161,9 +5274,10 @@ INDEX_HTML = r"""<!doctype html>
         const color = run.color || '#7c3aed';
         return points.map((item) => {
           const cx = x(item.index);
-          const cy = y(item.mean);
+          const displayMean = clipToObjectiveBounds(item.mean);
+          const cy = y(displayMean);
           const std = Number(item.std || 0);
-          const err = std ? `<line x1="${cx}" x2="${cx}" y1="${y(item.mean - std)}" y2="${y(item.mean + std)}" stroke="${color}" stroke-width="1.4" opacity="0.75" />` : '';
+          const err = std ? `<line x1="${cx}" x2="${cx}" y1="${y(clipToObjectiveBounds(item.mean - std))}" y2="${y(clipToObjectiveBounds(item.mean + std))}" stroke="${color}" stroke-width="1.4" opacity="0.75" />` : '';
           return `${err}<path d="M ${cx.toFixed(1)} ${(cy - 5).toFixed(1)} L ${(cx + 5).toFixed(1)} ${cy.toFixed(1)} L ${cx.toFixed(1)} ${(cy + 5).toFixed(1)} L ${(cx - 5).toFixed(1)} ${cy.toFixed(1)} Z" fill="#fff" stroke="${color}" stroke-width="1.8" opacity="0.85"><title>${escapeHtml(run.name)} predicted: ${fmt(item.mean)} +/- ${fmt(item.std)}</title></path>`;
         }).join('');
       }).join('');
@@ -5171,16 +5285,17 @@ INDEX_HTML = r"""<!doctype html>
         const prediction = item.prediction || {};
         if (prediction.mean === null || prediction.mean === undefined) return '';
         const cx = x(idx + 1);
-        const cy = y(prediction.mean);
+        const displayMean = clipToObjectiveBounds(prediction.mean);
+        const cy = y(displayMean);
         const std = Number(prediction.std || 0);
-        const err = std ? `<line x1="${cx}" x2="${cx}" y1="${y(prediction.mean - std)}" y2="${y(prediction.mean + std)}" stroke="#2563eb" stroke-width="1.4" opacity="0.75" />` : '';
+        const err = std ? `<line x1="${cx}" x2="${cx}" y1="${y(clipToObjectiveBounds(prediction.mean - std))}" y2="${y(clipToObjectiveBounds(prediction.mean + std))}" stroke="#2563eb" stroke-width="1.4" opacity="0.75" />` : '';
         return `${err}<path d="M ${cx.toFixed(1)} ${(cy - 5).toFixed(1)} L ${(cx + 5).toFixed(1)} ${cy.toFixed(1)} L ${cx.toFixed(1)} ${(cy + 5).toFixed(1)} L ${(cx - 5).toFixed(1)} ${cy.toFixed(1)} Z" fill="#fff" stroke="#2563eb" stroke-width="1.8"><title>${escapeHtml(item.procedure)} predicted: ${fmt(prediction.mean)} +/- ${fmt(prediction.std)}</title></path>`;
       }).join('');
       const points = activeObs.map((item, idx) => {
         const cx = x(idx + 1);
         const cy = y(item.value);
         const unc = Number(item.uncertainty || 0);
-        const err = unc ? `<line x1="${cx}" x2="${cx}" y1="${y(item.value - unc)}" y2="${y(item.value + unc)}" stroke="#b45309" stroke-width="1.5" />` : '';
+        const err = unc ? `<line x1="${cx}" x2="${cx}" y1="${y(clipToObjectiveBounds(item.value - unc))}" y2="${y(clipToObjectiveBounds(item.value + unc))}" stroke="#b45309" stroke-width="1.5" />` : '';
         return `${err}<circle cx="${cx}" cy="${cy}" r="4" fill="#2563eb"><title>${escapeHtml(item.procedure)}: ${fmt(item.value)}</title></circle>`;
       }).join('');
       const ticks = [0, 0.25, 0.5, 0.75, 1].map((t) => {
@@ -5225,6 +5340,7 @@ INDEX_HTML = r"""<!doctype html>
         ${ticks}
         ${zeroLine}
         ${statLines}
+        ${boundLines}
         <line x1="${pad.left}" x2="${width - pad.right}" y1="${height - pad.bottom}" y2="${height - pad.bottom}" stroke="#cfd6e2" />
         <line x1="${pad.left}" x2="${pad.left}" y1="${pad.top}" y2="${height - pad.bottom}" stroke="#cfd6e2" />
         ${xTicks}
@@ -6342,6 +6458,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
           <tr><td>Suggestion engine</td><td><code>GPR with embeddings</code> uses OpenAI embeddings plus a Gaussian process. <code>BO-ICL LLM</code> uses the selected LLM for in-context predictions.</td></tr>
           <tr><td>Acquisition</td><td>Rule for ranking the next experiment. UCB balances mean and uncertainty; expected improvement favors likely gains; greedy uses predicted best; random is a control.</td></tr>
           <tr><td>Target scaling</td><td>Off by default. Auto/min-max/z-score can help GPR numerics when bounded labels are not already near unit scale.</td></tr>
+          <tr><td>Objective bounds</td><td>Optional lower/upper physical bounds in original units. They are added to LLM system-message context and used to clip plot display of prediction/error bars, but raw predictions, exports, and acquisition scores are not clamped.</td></tr>
           <tr><td>Broad pool</td><td>Caps candidates scored by GPR. In LLM mode, it is used only when <code>LLM shortlist = 0</code> or when <code>LLM pool scope = Broad random pool</code>.</td></tr>
           <tr><td>LLM shortlist</td><td>Number of candidates retrieved by inverse-design text plus cached embeddings before LLM scoring. In Full pool mode this matches the paper; in Broad random pool mode it is a faster approximation.</td></tr>
           <tr><td>LLM pool scope</td><td><code>Full pool (paper)</code> compares the inverse-design query against every available candidate. <code>Broad random pool (fast)</code> first samples the Broad pool and then applies MMR/cosine similarity inside that subset.</td></tr>

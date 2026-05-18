@@ -92,6 +92,9 @@ Typical settings:
 
 - **Objective direction**: usually `Maximize` for phase percentage or yield.
 - **Target scaling**: start with `Off` for LLM BO-ICL on bounded percentages.
+- **Objective bounds**: optional. For phase percentages, use lower `0` and
+  upper `100`; these bounds are given to the LLM and used to clip plotted
+  prediction/error bars, but raw predictions and acquisition scores are kept.
 - **Initial random**: usually `1` or `2`.
 - **BO iterations**: number of sequential model-selected experiments.
 - **Workflow replicates**: repeated runs for mean and spread bands.
@@ -222,6 +225,13 @@ In the suggestions table, **Mean** is the LLM-predicted objective value in the
 original objective units, while **Acq** is the acquisition score used to rank the
 candidate. The inverse-design target is only a retrieval query for building the
 shortlist; candidate means do not have to equal that target.
+
+**Objective lower/upper bound** fields are optional physical or measurement
+bounds. They are included in the LLM system-message context and used to keep the
+plot display within sensible limits, for example clipping a `95 +/- 30`
+prediction error bar to the valid `0-100` percentage range. They do not clamp
+stored prediction values, measured observations, CSV exports, or acquisition
+ranking.
 
 For sparse phase data with many zeros, set an **Auto target floor** such as
 `5` or `10` so the inverse-design query does not stay pinned at zero.
