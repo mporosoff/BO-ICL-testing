@@ -247,6 +247,10 @@ In the suggestions table, **Mean** is the LLM-predicted objective value in the
 original objective units, while **Acq** is the acquisition score used to rank the
 candidate. The inverse-design target is only a retrieval query for building the
 shortlist; candidate means do not have to equal that target.
+If every scored LLM prediction is flat, for example all candidates score
+`0 +/- 0`, the app treats the acquisition ranking as uninformative and falls
+back to random exploration from the available pool instead of selecting an
+arbitrary first shortlist item.
 The **Method** column shows the source, model, and acquisition used to generate
 the row. If you change model or acquisition settings and save them, old
 suggestions are cleared so they are not mistaken for suggestions from the new

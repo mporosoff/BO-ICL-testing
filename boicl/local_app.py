@@ -2305,6 +2305,8 @@ class LocalBOState:
             else self.config.get("score_limit"),
             "time": _now(),
         }
+        if suggestion.get("selection_note"):
+            prediction["selection_note"] = suggestion.get("selection_note")
         if suggestion.get("inverse_seed"):
             prediction["inverse_seed"] = suggestion.get("inverse_seed")
         return prediction
@@ -2482,10 +2484,20 @@ class LocalBOState:
                 return "OPENAI_API_KEY"
         return None
 
-    def _random_suggestions(self, available: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        batch_size = min(self.config["batch_size"], len(available))
-        sampled = random.sample(available, batch_size)
-        metadata = self._suggestion_context_metadata("random", "random")
+    def _random_suggestions(
+        self,
+        available: List[Dict[str, Any]],
+        rng: Optional[random.Random] = None,
+        k: Optional[int] = None,
+        source: str = "random",
+        acquisition_name: str = "random",
+        selection_note: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        batch_size = min(k or self.config["batch_size"], len(available))
+        sampled = (rng or random).sample(available, batch_size)
+        metadata = self._suggestion_context_metadata(source, acquisition_name)
+        if selection_note:
+            metadata["selection_note"] = selection_note
         return [
             {
                 "candidate_id": cand["id"],
@@ -2688,7 +2700,7 @@ class LocalBOState:
         best: float,
         aq_fxn,
         k: int,
-    ) -> Tuple[List[str], List[float], List[float], List[Optional[float]]]:
+    ) -> Tuple[List[str], List[float], List[float], List[Optional[float]], bool]:
         results = model.predict(
             procedures,
             system_message=self.prediction_system_message(),
@@ -2712,13 +2724,32 @@ class LocalBOState:
                 )
             except (TypeError, ValueError, AttributeError):
                 continue
-        scored.sort(key=lambda item: item["acquisition"], reverse=True)
+        degenerate = self._llm_scores_are_degenerate(scored)
+        scored.sort(
+            key=lambda item: (item["acquisition"], item["mean"]),
+            reverse=True,
+        )
         selected = scored[:k]
         return (
             [item["procedure"] for item in selected],
             [item["acquisition"] for item in selected],
             [item["mean"] for item in selected],
             [item["std"] for item in selected],
+            degenerate,
+        )
+
+    @staticmethod
+    def _llm_scores_are_degenerate(scored: List[Dict[str, Any]]) -> bool:
+        if len(scored) < 2:
+            return False
+        means = [float(item["mean"]) for item in scored]
+        stds = [float(item["std"] or 0.0) for item in scored]
+        acquisitions = [float(item["acquisition"]) for item in scored]
+        tolerance = 1e-9
+        return (
+            max(means) - min(means) <= tolerance
+            and max(stds) - min(stds) <= tolerance
+            and max(acquisitions) - min(acquisitions) <= tolerance
         )
 
     def _llm_suggestions(
@@ -2822,7 +2853,27 @@ class LocalBOState:
                     suggestion_count,
                 ),
             )
-            selected, acq_values, means, stds = raw
+            selected, acq_values, means, stds = raw[:4]
+            degenerate_scores = bool(raw[4]) if len(raw) > 4 else False
+            if degenerate_scores:
+                note = (
+                    "LLM predictions were flat across the scored shortlist; "
+                    "selected a random exploratory candidate instead of using "
+                    "an arbitrary tied acquisition ranking."
+                )
+                self.log(note)
+                fallback = self._random_suggestions(
+                    available,
+                    rng=rng,
+                    k=suggestion_count,
+                    source="llm",
+                    acquisition_name=acquisition_name,
+                    selection_note=note,
+                )
+                for suggestion in fallback:
+                    suggestion["inverse_seed"] = inverse_text
+                    suggestion["objective_scaling"] = scaler.get("mode", "off")
+                return fallback
         self.check_cancelled()
         if not selected:
             return self._random_suggestions(available)
@@ -3654,6 +3705,7 @@ class LocalBOState:
                     "prediction_llm_uncertainty_calibration",
                     "prediction_score_limit",
                     "prediction_inverse_seed",
+                    "prediction_selection_note",
                     "prediction_time",
                     *objective_fields,
                     "time",
@@ -3697,6 +3749,7 @@ class LocalBOState:
                 )
                 row["prediction_score_limit"] = prediction.get("score_limit", "")
                 row["prediction_inverse_seed"] = prediction.get("inverse_seed", "")
+                row["prediction_selection_note"] = prediction.get("selection_note", "")
                 row["prediction_time"] = prediction.get("time", "")
 
             for index, obs in enumerate(self.observations, start=1):
@@ -5642,7 +5695,8 @@ INDEX_HTML = r"""<!doctype html>
         prediction.llm_pool_scope ? `LLM pool: ${prediction.llm_pool_scope}` : '',
         prediction.inverse_filter !== undefined && prediction.inverse_filter !== null ? `shortlist: ${prediction.inverse_filter}` : '',
         prediction.llm_samples !== undefined && prediction.llm_samples !== null ? `LLM samples: ${prediction.llm_samples}` : '',
-        prediction.llm_uncertainty_calibration !== undefined && prediction.llm_uncertainty_calibration !== null ? `uncertainty scalar: ${prediction.llm_uncertainty_calibration}` : ''
+        prediction.llm_uncertainty_calibration !== undefined && prediction.llm_uncertainty_calibration !== null ? `uncertainty scalar: ${prediction.llm_uncertainty_calibration}` : '',
+        prediction.selection_note ? `selection note: ${prediction.selection_note}` : ''
       ].filter(Boolean);
       return fields.join('; ');
     }
@@ -6700,7 +6754,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
       </ol>
       <div class="callout">Paper-style numerical defaults are <code>Initial random = 1</code>, <code>Batch size = 1</code>, <code>BO iterations = 30</code>, <code>Workflow replicates = 5</code>, and <code>UCB lambda = 0.1</code>. Current model defaults use supported modern model IDs rather than retired paper-era model names.</div>
       <p>For BO-ICL LLM runs on large pools, <code>LLM shortlist</code> retrieves the smaller inverse-design/embedding shortlist that is actually scored by the LLM. The inverse-design target is based on the current replicate's labeled history: by default it uses current best x <code>Normal(1.2, 0.05)</code>, matching the paper-style stochastic target. If sparse observations are often zero, set <code>Auto target floor</code> to a meaningful minimum aspirational value so the inverse query does not stay anchored at zero. With <code>LLM pool scope = Full pool (paper)</code>, the shortlist searches the full available pool with cached embeddings and MMR/cosine similarity, then optional random add-ons. With <code>Broad random pool (fast)</code>, the app first samples <code>Broad pool</code> candidates and runs the same MMR/cosine step only inside that subset. The default <code>LLM shortlist = 16</code>, <code>Random add-ons = 0</code>, and <code>LLM samples = 3</code> scores at most 16 candidates per BO step.</p>
-      <p>LLM runtime scales with <code>(LLM shortlist + Random add-ons) x LLM samples x BO iterations x Workflow replicates</code> when the shortlist is enabled. If <code>LLM shortlist = 0</code>, runtime falls back to <code>Broad pool x LLM samples</code>. Rate-limit errors are retried automatically; increase <code>429 cooldown (s)</code>, increase <code>API pause (s)</code>, or lower the shortlist/samples if 429s keep appearing. Use the <code>Stop</code> button in the progress panel to cancel after the current API call returns.</p>
+      <p>LLM runtime scales with <code>(LLM shortlist + Random add-ons) x LLM samples x BO iterations x Workflow replicates</code> when the shortlist is enabled. If <code>LLM shortlist = 0</code>, runtime falls back to <code>Broad pool x LLM samples</code>. If every scored LLM prediction is flat, for example all candidates score <code>0 +/- 0</code>, the acquisition ranking is treated as uninformative and the app falls back to random exploration from the available pool instead of selecting an arbitrary first shortlist item. Rate-limit errors are retried automatically; increase <code>429 cooldown (s)</code>, increase <code>API pause (s)</code>, or lower the shortlist/samples if 429s keep appearing. Use the <code>Stop</code> button in the progress panel to cancel after the current API call returns.</p>
       <p>The plot shows the mean best-so-far trajectory and a +/- 1 sample-standard-deviation band across workflow replicates. Model prediction markers show the predicted objective mean and calibrated uncertainty for BO-selected points separately from the measured value. The dashed random baseline is the paper notebook's random-mean quantile expectation. <code>Plot guides</code> defaults to the best labelled value only; switch it to <code>Paper stats</code> to add the mean and percentile guide lines.</p>
     </section>
 

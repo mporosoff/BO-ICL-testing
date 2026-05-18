@@ -1290,6 +1290,48 @@ def test_live_llm_shortlist_can_prefilter_with_broad_pool(tmp_path, monkeypatch)
     assert payload["suggestions"][0]["std"] == 1.0
 
 
+def test_llm_flat_predictions_fall_back_to_random_exploration(tmp_path):
+    state = LocalBOState(tmp_path)
+    rows = ["procedure", *[f"proc {index}" for index in range(5)]]
+    state.import_dataset("pool.csv", "\n".join(rows).encode("utf-8"))
+    state.update_config(
+        {
+            "optimizer": "llm",
+            "batch_size": 1,
+            "inverse_filter": 2,
+            "inverse_random_candidates": 0,
+            "inverse_target_jitter": 0,
+        }
+    )
+    state.add_observation({"candidate_id": "cand-0", "value": 1})
+
+    class FakeModel:
+        def predict(self, possible_x, system_message=""):
+            return [GaussDist(0.0, 0.0) for _ in possible_x]
+
+    class LastSampler:
+        def sample(self, items, k):
+            return list(items)[-k:]
+
+    state._build_llm_model = lambda observations=None: (FakeModel(), {"mode": "off"})
+    state._inverse_target_display_value = lambda *args, **kwargs: 5.0
+    state._generate_inverse_text = lambda *args, **kwargs: "target-like query"
+    state._cached_approx_sample = lambda procedures, query, k, lambda_mult=0.5: procedures[:k]
+
+    suggestions = state._llm_suggestions(
+        state.available_candidates(),
+        state.active_observations(),
+        rng=LastSampler(),
+        k=1,
+    )
+
+    assert suggestions[0]["procedure"] == "proc 4"
+    assert suggestions[0]["source"] == "llm"
+    assert suggestions[0]["mean"] is None
+    assert "flat" in suggestions[0]["selection_note"].lower()
+    assert suggestions[0]["inverse_seed"] == "target-like query"
+
+
 def test_api_retry_recovers_from_rate_limit_message(tmp_path):
     state = LocalBOState(tmp_path)
     state.update_config(
