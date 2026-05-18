@@ -749,6 +749,46 @@ def test_config_change_clears_stale_model_suggestions(tmp_path):
     assert "Update suggestions" in payload["last_model_status"]
 
 
+def test_llm_model_keeps_original_units_when_target_scaling_is_enabled(
+    tmp_path, monkeypatch
+):
+    import boicl as boicl_pkg
+
+    told_values = []
+
+    class FakeAskTellFewShotTopk:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def tell(self, procedure, value):
+            told_values.append((procedure, value))
+
+    monkeypatch.setattr(boicl_pkg, "AskTellFewShotTopk", FakeAskTellFewShotTopk)
+    state = LocalBOState(tmp_path)
+    state.update_config(
+        {
+            "optimizer": "llm",
+            "objective_scaling": "minmax",
+            "inverse_target_floor_value": "5",
+            "inverse_target_multiplier": 1.0,
+            "inverse_target_jitter": 0.0,
+        }
+    )
+    observations = [
+        {"procedure": "zero procedure", "value": 0.0},
+        {"procedure": "best procedure", "value": 100.0},
+    ]
+
+    _, scaler = state._build_llm_model(observations)
+
+    assert scaler["mode"] == "off"
+    assert told_values == [
+        ("zero procedure", 0.0),
+        ("best procedure", 100.0),
+    ]
+    assert state._inverse_target_model_value(scaler, [observations[0]]) == 5.0
+
+
 def test_prediction_summary_combines_offline_replicate_predictions(tmp_path):
     state = LocalBOState(tmp_path)
     summary = state._summarize_prediction_points(

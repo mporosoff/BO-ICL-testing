@@ -92,6 +92,8 @@ Typical settings:
 
 - **Objective direction**: usually `Maximize` for phase percentage or yield.
 - **Target scaling**: start with `Off` for LLM BO-ICL on bounded percentages.
+  The LLM path keeps labels, inverse-design targets, floors, and predictions in
+  original objective units; auto/min-max/z-score scaling is used only for GPR.
 - **Objective bounds**: optional. For phase percentages, use lower `0` and
   upper `100`; these bounds are given to the LLM and used to clip plotted
   prediction/error bars, but raw predictions and acquisition scores are kept.

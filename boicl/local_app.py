@@ -2508,7 +2508,14 @@ class LocalBOState:
         from boicl import AskTellFewShotTopk
 
         selector_k = int(self.config["selector_k"]) or None
-        active_observations, scaler = self._training_rows_and_scaler(observations)
+        # LLM prompts describe the objective in original lab units. Keeping the
+        # few-shot labels and inverse-design target in those same units avoids
+        # scaled 0/1 answers being unscaled into artificial 0/100 predictions.
+        active_observations, scaler = _group_training_observations(
+            observations if observations is not None else self.active_observations(),
+            self.config["objective_direction"],
+            "off",
+        )
         model = AskTellFewShotTopk(
             model=self.config["prediction_model"],
             inverse_model=self.config["inverse_model"],
@@ -2690,6 +2697,7 @@ class LocalBOState:
         if not selected:
             return self._random_suggestions(available)
         metadata = self._suggestion_context_metadata("llm", acquisition_name)
+        metadata["objective_scaling"] = scaler.get("mode", "off")
         return [
             {
                 "candidate_id": by_proc[procedure]["id"],
@@ -4665,7 +4673,7 @@ INDEX_HTML = r"""<!doctype html>
       acquisition: 'Candidate ranking rule. The paper notebook default sweep included upper confidence bound, greedy, random, and random mean baseline.',
       objectiveLowerBound: 'Optional physical or measurement lower bound in original units. Used only in LLM system messages and plot display, not acquisition math.',
       objectiveUpperBound: 'Optional physical or measurement upper bound in original units. For phase percentages, use 100. Used only in LLM system messages and plot display.',
-      objectiveScaling: 'Off keeps labels in their original units for model fitting. Auto/min-max/z-score scale only the model target; plots stay in original units.',
+      objectiveScaling: 'Off keeps labels in original units. Auto/min-max/z-score are used for GPR fitting only; BO-ICL LLM always uses original units so prompts, floors, and predictions stay consistent.',
       plotStatGuides: 'Controls full-dataset dashed reference lines. Best only is cleaner; Paper stats adds mean and percentile guides.',
       embeddingModel: 'OpenAI embedding model used to featurize procedures for GPR and nearest-neighbor inverse filtering.',
       predictionModel: 'LLM used by BO-ICL to predict objective values and acquisition scores for candidate procedures.',
@@ -6616,7 +6624,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
         <tbody>
           <tr><td>Suggestion engine</td><td><code>GPR with embeddings</code> uses OpenAI embeddings plus a Gaussian process. <code>BO-ICL LLM</code> uses the selected LLM for in-context predictions.</td></tr>
           <tr><td>Acquisition</td><td>Rule for ranking the next experiment. UCB balances mean and uncertainty; expected improvement favors likely gains; greedy uses predicted best; random is a control.</td></tr>
-          <tr><td>Target scaling</td><td>Off by default. Auto/min-max/z-score can help GPR numerics when bounded labels are not already near unit scale.</td></tr>
+          <tr><td>Target scaling</td><td>Off by default. Auto/min-max/z-score can help GPR numerics when bounded labels are not already near unit scale. BO-ICL LLM keeps labels, inverse targets, floors, and predictions in original objective units.</td></tr>
           <tr><td>Objective bounds</td><td>Optional lower/upper physical bounds in original units. They are added to LLM system-message context and used to clip plot display of prediction/error bars, but raw predictions, exports, and acquisition scores are not clamped.</td></tr>
           <tr><td>Broad pool</td><td>Caps candidates scored by GPR. In LLM mode, it is used only when <code>LLM shortlist = 0</code> or when <code>LLM pool scope = Broad random pool</code>.</td></tr>
           <tr><td>LLM shortlist</td><td>Number of candidates retrieved by inverse-design text plus cached embeddings before LLM scoring. In Full pool mode this matches the paper; in Broad random pool mode it is a faster approximation.</td></tr>
