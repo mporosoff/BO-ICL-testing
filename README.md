@@ -108,6 +108,10 @@ runs stay in the saved campaign and are not overwritten by later runs.
 For LLM and GPR-selected BO points, the plot also shows the model's predicted
 objective and uncertainty as separate prediction markers with error bars; the
 measured values remain the best-so-far trajectory.
+The live observations table records the method used for each selected point,
+for example `LLM / gpt-4o / upper confidence bound` or
+`GPR / text-embedding-ada-002 / greedy`, so changing acquisition functions or
+models mid-campaign leaves an audit trail.
 
 To compare controlled configurations on the same dataset, keep the campaign
 loaded, change the settings, and click **Run & Append** again. For example, run
@@ -118,7 +122,9 @@ inverse-design LLMs, embedding models, shortlist sizes, or replicate counts.
 
 Use clear run names such as `LLM gpt-4o UCB`, `GPR UCB`, or `LLM greedy final`
 so the plot legend and exported CSV are easy to interpret. The CSV export
-includes every appended run with its run id/name/status and saved settings.
+includes every appended run with its run id/name/status, saved settings, model
+prediction metadata, optimizer, acquisition function, shortlist settings, and
+model IDs.
 
 If a run completes, it is stored with `status: complete` and remains available
 for plotting, campaign reloads, archive export/import, and CSV export. The
@@ -225,6 +231,10 @@ In the suggestions table, **Mean** is the LLM-predicted objective value in the
 original objective units, while **Acq** is the acquisition score used to rank the
 candidate. The inverse-design target is only a retrieval query for building the
 shortlist; candidate means do not have to equal that target.
+The **Method** column shows the source, model, and acquisition used to generate
+the row. If you change model or acquisition settings and save them, old
+suggestions are cleared so they are not mistaken for suggestions from the new
+configuration.
 
 **Objective lower/upper bound** fields are optional physical or measurement
 bounds. They are included in the LLM system-message context and used to keep the

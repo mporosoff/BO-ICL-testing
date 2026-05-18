@@ -688,8 +688,13 @@ def test_live_observation_keeps_model_prediction_for_plot_and_export(tmp_path):
             "mean": 42.0,
             "std": 3.5,
             "source": "llm",
+            "optimizer": "llm",
+            "acquisition_function": "upper_confidence_bound",
             "prediction_model": "gpt-4o",
             "inverse_model": "gpt-4o",
+            "embedding_model": "text-embedding-ada-002",
+            "llm_samples": 3,
+            "inverse_filter": 16,
         }
     ]
 
@@ -700,13 +705,48 @@ def test_live_observation_keeps_model_prediction_for_plot_and_export(tmp_path):
     observation = payload["observations"][0]
     assert observation["prediction"]["mean"] == 42.0
     assert observation["prediction"]["std"] == 3.5
+    assert observation["prediction"]["optimizer"] == "llm"
+    assert (
+        observation["prediction"]["acquisition_function"]
+        == "upper_confidence_bound"
+    )
 
     rows = list(csv.DictReader(StringIO(state.export_observations_csv())))
     assert rows[0]["prediction_mean"] == "42.0"
     assert rows[0]["prediction_uncertainty"] == "3.5"
     assert rows[0]["prediction_acquisition"] == "1.25"
+    assert rows[0]["prediction_optimizer"] == "llm"
+    assert rows[0]["prediction_acquisition_function"] == "upper_confidence_bound"
     assert rows[0]["prediction_model"] == "gpt-4o"
+    assert rows[0]["embedding_model"] == "text-embedding-ada-002"
+    assert rows[0]["prediction_llm_samples"] == "3"
+    assert rows[0]["prediction_inverse_filter"] == "16"
     assert rows[0]["alpha phase (%)_uncertainty"] == "0.6"
+    assert "<th>Model / Acq.</th>" in INDEX_HTML
+    assert "<th>Method</th>" in INDEX_HTML
+
+
+def test_config_change_clears_stale_model_suggestions(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset("alpha_pool.csv", b"procedure\nproc a\nproc b\n")
+    state.suggestions = [
+        {
+            "candidate_id": "cand-0",
+            "procedure": "proc a",
+            "acquisition": 1.25,
+            "mean": 42.0,
+            "std": 3.5,
+            "source": "llm",
+            "optimizer": "llm",
+            "acquisition_function": "upper_confidence_bound",
+            "prediction_model": "gpt-4o",
+        }
+    ]
+
+    payload = state.update_config({"acquisition": "greedy"})
+
+    assert payload["suggestions"] == []
+    assert "Update suggestions" in payload["last_model_status"]
 
 
 def test_prediction_summary_combines_offline_replicate_predictions(tmp_path):

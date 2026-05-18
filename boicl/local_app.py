@@ -1750,6 +1750,37 @@ class LocalBOState:
         with self.lock:
             previous_objective_name = self.config.get("objective_name")
             previous_objective_bounds = self.objective_bounds()
+            suggestion_config_keys = {
+                "optimizer",
+                "objective_name",
+                "objective_direction",
+                "objective_scaling",
+                "objective_lower_bound",
+                "objective_upper_bound",
+                "acquisition",
+                "embedding_model",
+                "prediction_model",
+                "inverse_model",
+                "prediction_system_message",
+                "inverse_system_message",
+                "llm_samples",
+                "selector_k",
+                "llm_pool_scope",
+                "inverse_filter",
+                "inverse_random_candidates",
+                "inverse_target_value",
+                "inverse_target_multiplier",
+                "inverse_target_jitter",
+                "inverse_target_floor_value",
+                "batch_size",
+                "score_limit",
+                "ucb_lambda",
+                "n_neighbors",
+                "n_components",
+            }
+            previous_suggestion_config = {
+                key: self.config.get(key) for key in suggestion_config_keys
+            }
             for key in DEFAULT_CONFIG:
                 if key not in payload:
                     continue
@@ -1860,6 +1891,18 @@ class LocalBOState:
                 or self.objective_bounds() != previous_objective_bounds
             ):
                 self._refresh_dataset_prompts_locked()
+            current_suggestion_config = {
+                key: self.config.get(key) for key in suggestion_config_keys
+            }
+            if (
+                self.suggestions
+                and current_suggestion_config != previous_suggestion_config
+            ):
+                self.suggestions = []
+                self.last_model_status = (
+                    "Run settings changed. Update suggestions before selecting "
+                    "the next point."
+                )
             self.log("Updated run settings.")
             self._autosave_locked()
             return self.to_json()
@@ -2110,16 +2153,60 @@ class LocalBOState:
             "std": std,
             "acquisition": acquisition,
             "source": suggestion.get("source") or self.config["optimizer"],
+            "optimizer": suggestion.get("optimizer") or self.config.get("optimizer"),
+            "acquisition_function": suggestion.get("acquisition_function")
+            or self.config.get("acquisition"),
+            "objective_name": suggestion.get("objective_name")
+            or self.config.get("objective_name"),
+            "objective_direction": suggestion.get("objective_direction")
+            or self.config.get("objective_direction"),
+            "objective_scaling": suggestion.get("objective_scaling")
+            or self.config.get("objective_scaling"),
             "prediction_model": suggestion.get("prediction_model")
             or self.config.get("prediction_model"),
             "inverse_model": suggestion.get("inverse_model")
             or self.config.get("inverse_model"),
-            "embedding_model": self.config.get("embedding_model"),
+            "embedding_model": suggestion.get("embedding_model")
+            or self.config.get("embedding_model"),
+            "llm_pool_scope": suggestion.get("llm_pool_scope")
+            or self.config.get("llm_pool_scope"),
+            "inverse_filter": suggestion.get("inverse_filter")
+            if suggestion.get("inverse_filter") is not None
+            else self.config.get("inverse_filter"),
+            "inverse_random_candidates": suggestion.get("inverse_random_candidates")
+            if suggestion.get("inverse_random_candidates") is not None
+            else self.config.get("inverse_random_candidates"),
+            "llm_samples": suggestion.get("llm_samples")
+            if suggestion.get("llm_samples") is not None
+            else self.config.get("llm_samples"),
+            "score_limit": suggestion.get("score_limit")
+            if suggestion.get("score_limit") is not None
+            else self.config.get("score_limit"),
             "time": _now(),
         }
         if suggestion.get("inverse_seed"):
             prediction["inverse_seed"] = suggestion.get("inverse_seed")
         return prediction
+
+    def _suggestion_context_metadata(
+        self, source: str, acquisition_name: Optional[str]
+    ) -> Dict[str, Any]:
+        return {
+            "source": source,
+            "optimizer": self.config.get("optimizer"),
+            "acquisition_function": acquisition_name or self.config.get("acquisition"),
+            "objective_name": self.config.get("objective_name"),
+            "objective_direction": self.config.get("objective_direction"),
+            "objective_scaling": self.config.get("objective_scaling"),
+            "prediction_model": self.config.get("prediction_model"),
+            "inverse_model": self.config.get("inverse_model"),
+            "embedding_model": self.config.get("embedding_model"),
+            "llm_pool_scope": self.config.get("llm_pool_scope"),
+            "inverse_filter": self.config.get("inverse_filter"),
+            "inverse_random_candidates": self.config.get("inverse_random_candidates"),
+            "llm_samples": self.config.get("llm_samples"),
+            "score_limit": self.config.get("score_limit"),
+        }
 
     def _matching_prediction_locked(
         self, candidate_id: Optional[str], procedure: str
@@ -2275,6 +2362,7 @@ class LocalBOState:
     def _random_suggestions(self, available: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         batch_size = min(self.config["batch_size"], len(available))
         sampled = random.sample(available, batch_size)
+        metadata = self._suggestion_context_metadata("random", "random")
         return [
             {
                 "candidate_id": cand["id"],
@@ -2282,7 +2370,7 @@ class LocalBOState:
                 "acquisition": 0.0,
                 "mean": None,
                 "std": None,
-                "source": "random",
+                **metadata,
             }
             for cand in sampled
         ]
@@ -2350,6 +2438,7 @@ class LocalBOState:
     ) -> List[Dict[str, Any]]:
         from boicl import AskTellGPR
 
+        acquisition_name = acquisition or self.config["acquisition"]
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         active_observations, scaler = self._training_rows_and_scaler(observations)
         n_obs = len(active_observations)
@@ -2382,7 +2471,7 @@ class LocalBOState:
 
         raw = model.ask(
             procedures,
-            aq_fxn=acquisition or self.config["acquisition"],
+            aq_fxn=acquisition_name,
             k=min(k or self.config["batch_size"], len(procedures)),
             aug_random_filter=len(procedures),
             _lambda=self.config["ucb_lambda"],
@@ -2394,6 +2483,7 @@ class LocalBOState:
         selected, acquisition, means = raw[:3]
         stds = raw[3] if len(raw) > 3 else [None] * len(selected)
         by_proc = {cand["procedure"]: cand for cand in subset}
+        metadata = self._suggestion_context_metadata("gpr", acquisition_name)
         return [
             {
                 "candidate_id": by_proc[procedure]["id"],
@@ -2407,7 +2497,7 @@ class LocalBOState:
                 "std": _unscale_uncertainty(float(std), scaler)
                 if std is not None
                 else None,
-                "source": "gpr",
+                **metadata,
             }
             for procedure, aq, mean, std in zip(selected, acquisition, means, stds)
         ]
@@ -2599,6 +2689,7 @@ class LocalBOState:
         self.check_cancelled()
         if not selected:
             return self._random_suggestions(available)
+        metadata = self._suggestion_context_metadata("llm", acquisition_name)
         return [
             {
                 "candidate_id": by_proc[procedure]["id"],
@@ -2610,9 +2701,7 @@ class LocalBOState:
                 if mean is not None
                 else None,
                 "std": _unscale_uncertainty(std, scaler),
-                "source": "llm",
-                "prediction_model": self.config["prediction_model"],
-                "inverse_model": self.config["inverse_model"],
+                **metadata,
                 "inverse_seed": inverse_text,
             }
             for procedure, aq, mean, std in zip(selected, acq_values, means, stds)
@@ -3455,8 +3544,19 @@ class LocalBOState:
                     "prediction_uncertainty",
                     "prediction_acquisition",
                     "prediction_source",
+                    "prediction_optimizer",
+                    "prediction_acquisition_function",
                     "prediction_model",
                     "inverse_model",
+                    "embedding_model",
+                    "prediction_objective_name",
+                    "prediction_objective_direction",
+                    "prediction_objective_scaling",
+                    "prediction_llm_pool_scope",
+                    "prediction_inverse_filter",
+                    "prediction_inverse_random_candidates",
+                    "prediction_llm_samples",
+                    "prediction_score_limit",
                     "prediction_time",
                     *objective_fields,
                     "time",
@@ -3471,8 +3571,31 @@ class LocalBOState:
                 row["prediction_uncertainty"] = prediction.get("std", "")
                 row["prediction_acquisition"] = prediction.get("acquisition", "")
                 row["prediction_source"] = prediction.get("source", "")
+                row["prediction_optimizer"] = prediction.get("optimizer", "")
+                row["prediction_acquisition_function"] = prediction.get(
+                    "acquisition_function", ""
+                )
                 row["prediction_model"] = prediction.get("prediction_model", "")
                 row["inverse_model"] = prediction.get("inverse_model", "")
+                row["embedding_model"] = prediction.get("embedding_model", "")
+                row["prediction_objective_name"] = prediction.get("objective_name", "")
+                row["prediction_objective_direction"] = prediction.get(
+                    "objective_direction", ""
+                )
+                row["prediction_objective_scaling"] = prediction.get(
+                    "objective_scaling", ""
+                )
+                row["prediction_llm_pool_scope"] = prediction.get(
+                    "llm_pool_scope", ""
+                )
+                row["prediction_inverse_filter"] = prediction.get(
+                    "inverse_filter", ""
+                )
+                row["prediction_inverse_random_candidates"] = prediction.get(
+                    "inverse_random_candidates", ""
+                )
+                row["prediction_llm_samples"] = prediction.get("llm_samples", "")
+                row["prediction_score_limit"] = prediction.get("score_limit", "")
                 row["prediction_time"] = prediction.get("time", "")
 
             for index, obs in enumerate(self.observations, start=1):
@@ -5381,6 +5504,38 @@ INDEX_HTML = r"""<!doctype html>
       </table></div>`;
     }
 
+    function humanizeSetting(value) {
+      return String(value || '').replaceAll('_', ' ');
+    }
+
+    function predictionMethodLabel(prediction = {}) {
+      if (!prediction || Object.keys(prediction).length === 0) return '';
+      const source = prediction.source || prediction.optimizer || '';
+      const model = prediction.source === 'gpr'
+        ? prediction.embedding_model
+        : (prediction.prediction_model || prediction.embedding_model);
+      const acquisition = prediction.acquisition_function || '';
+      return [source ? source.toUpperCase() : '', model, humanizeSetting(acquisition)]
+        .filter(Boolean)
+        .join(' / ');
+    }
+
+    function predictionMethodTitle(prediction = {}) {
+      if (!prediction || Object.keys(prediction).length === 0) return '';
+      const fields = [
+        prediction.source ? `source: ${prediction.source}` : '',
+        prediction.optimizer ? `optimizer: ${prediction.optimizer}` : '',
+        prediction.acquisition_function ? `acquisition: ${humanizeSetting(prediction.acquisition_function)}` : '',
+        prediction.prediction_model ? `prediction model: ${prediction.prediction_model}` : '',
+        prediction.inverse_model ? `inverse model: ${prediction.inverse_model}` : '',
+        prediction.embedding_model ? `embedding model: ${prediction.embedding_model}` : '',
+        prediction.llm_pool_scope ? `LLM pool: ${prediction.llm_pool_scope}` : '',
+        prediction.inverse_filter !== undefined && prediction.inverse_filter !== null ? `shortlist: ${prediction.inverse_filter}` : '',
+        prediction.llm_samples !== undefined && prediction.llm_samples !== null ? `LLM samples: ${prediction.llm_samples}` : ''
+      ].filter(Boolean);
+      return fields.join('; ');
+    }
+
     function renderSuggestions() {
       const suggestions = state.suggestions || [];
       if (!suggestions.length) {
@@ -5388,9 +5543,10 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       $('suggestions').innerHTML = `<div class="scroll"><table>
-        <thead><tr><th>Procedure</th><th>Acq</th><th>Mean</th><th>Std</th><th></th></tr></thead>
+        <thead><tr><th>Procedure</th><th>Method</th><th>Acq</th><th>Mean</th><th>Std</th><th></th></tr></thead>
         <tbody>${suggestions.map((sug) => `<tr>
           <td class="procedure">${escapeHtml(sug.procedure)}</td>
+          <td title="${escapeHtml(predictionMethodTitle(sug))}">${escapeHtml(predictionMethodLabel(sug))}</td>
           <td>${fmt(sug.acquisition)}</td>
           <td>${fmt(sug.mean)}</td>
           <td>${fmt(sug.std)}</td>
@@ -5438,17 +5594,19 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       $('observations').innerHTML = `<div class="scroll"><table>
-        <thead><tr><th>#</th><th>Procedure</th><th>Value</th><th>Unc.</th><th>Prediction</th><th>Time</th><th></th></tr></thead>
+        <thead><tr><th>#</th><th>Procedure</th><th>Value</th><th>Unc.</th><th>Model / Acq.</th><th>Prediction</th><th>Time</th><th></th></tr></thead>
         <tbody>${observations.map((obs, idx) => {
           const prediction = obs.prediction || {};
           const predText = prediction.mean === null || prediction.mean === undefined
             ? ''
             : `${fmt(prediction.mean)}${prediction.std !== null && prediction.std !== undefined ? ` +/- ${fmt(prediction.std)}` : ''}`;
+          const methodTitle = predictionMethodTitle(prediction);
           return `<tr>
           <td>${idx + 1}</td>
           <td class="procedure">${escapeHtml(obs.procedure)}</td>
           <td>${fmt(obs.value)}</td>
           <td>${fmt(obs.uncertainty)}</td>
+          <td title="${escapeHtml(methodTitle)}">${escapeHtml(predictionMethodLabel(prediction))}</td>
           <td>${escapeHtml(predText)}</td>
           <td>${escapeHtml(obs.time)}</td>
           <td><button class="danger" data-delete-observation="${escapeHtml(obs.id || '')}">Delete</button></td>
@@ -6448,6 +6606,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
       </ol>
       <p>The <code>Add Result</code> candidate field searches the full available pool by row number or procedure text, so large pools do not need a giant dropdown. If a test or incorrect result is added, use <code>Delete</code> in the <code>Observations</code> table and update suggestions again. Objective values should be entered in original units. Scaling is only used internally for fitting if enabled, and the plot remains in original units.</p>
       <p>Use <code>Live Random Walk</code> to collect a separate live random-control trace when full-dataset statistics are not known. Set the point count, click <code>Start / Next Random</code>, run that random candidate, enter its measured value and optional uncertainty, and click <code>Add Random Result</code>. These random-control rows do not train the BO model; they are saved, plotted, archived, and exported separately.</p>
+      <p>The <code>Observations</code> table keeps the method used for each selected point, including source, model, and acquisition function. Saving changed model or acquisition settings clears old suggestions so they are not accidentally used under the new controls.</p>
     </section>
 
     <section>
@@ -6462,7 +6621,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
           <tr><td>Broad pool</td><td>Caps candidates scored by GPR. In LLM mode, it is used only when <code>LLM shortlist = 0</code> or when <code>LLM pool scope = Broad random pool</code>.</td></tr>
           <tr><td>LLM shortlist</td><td>Number of candidates retrieved by inverse-design text plus cached embeddings before LLM scoring. In Full pool mode this matches the paper; in Broad random pool mode it is a faster approximation.</td></tr>
           <tr><td>LLM pool scope</td><td><code>Full pool (paper)</code> compares the inverse-design query against every available candidate. <code>Broad random pool (fast)</code> first samples the Broad pool and then applies MMR/cosine similarity inside that subset.</td></tr>
-          <tr><td>Suggestions Acq / Mean</td><td><code>Mean</code> is the predicted objective in original units. <code>Acq</code> is the acquisition score used for ranking. The inverse-design target creates the retrieval query; shortlisted candidates do not have to predict exactly at that target.</td></tr>
+          <tr><td>Suggestions Method / Acq / Mean</td><td><code>Method</code> records source, model, and acquisition function. <code>Mean</code> is the predicted objective in original units. <code>Acq</code> is the acquisition score used for ranking. The inverse-design target creates the retrieval query; shortlisted candidates do not have to predict exactly at that target.</td></tr>
           <tr><td>Prediction markers</td><td>For model-selected points, the plot can show the stored prediction mean and uncertainty as a distinct marker with an error bar. The measured value remains the actual observation and best-so-far trace.</td></tr>
           <tr><td>Live Random Walk</td><td>Separate live control trajectory. The app selects one random available candidate at a time, waits for the measured value, then appends it to the random-control plot/export without adding it to the BO training context.</td></tr>
           <tr><td>Auto target jitter</td><td>Stochastic spread around the automatic inverse-design target multiplier. The default <code>0.05</code> gives current best x <code>Normal(1.2, 0.05)</code>; set it to <code>0</code> for deterministic targets.</td></tr>
