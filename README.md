@@ -97,12 +97,10 @@ Typical settings:
 - **Objective bounds**: optional. For phase percentages, use lower `0` and
   upper `100`; these bounds are given to the LLM and used to clip plotted
   prediction/error bars, but raw predictions and acquisition scores are kept.
-- **Initial random**: usually `1` or `2`.
+- **Initial random points**: real starting experiments, usually `1` or `2`,
+  capped at `3`.
 - **BO iterations**: number of sequential model-selected experiments.
 - **Workflow replicates**: repeated runs for mean and spread bands.
-- **Starting baseline**: `Dataset mean incumbent` can start the plot at the
-  full-dataset mean without adding a fake labeled procedure to the model
-  context.
 - **Greedy for final iteration**: optional final exploitation step.
 
 Click **Run & Append** to add the current configuration to the plot. Completed

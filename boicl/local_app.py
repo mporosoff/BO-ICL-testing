@@ -131,7 +131,6 @@ DEFAULT_CONFIG = {
     "benchmark_replicates": 5,
     "benchmark_initial_points": 1,
     "benchmark_seed": 0,
-    "benchmark_starting_baseline": "none",
     "greedy_final_iteration": False,
     "random_replicates": 0,
     "ucb_lambda": 0.1,
@@ -188,10 +187,8 @@ BENCHMARK_RESUME_MATCH_KEYS = [
     "benchmark_replicates",
     "benchmark_initial_points",
     "benchmark_seed",
-    "benchmark_starting_baseline",
     "greedy_final_iteration",
 ]
-BENCHMARK_STARTING_BASELINES = ["none", "mean"]
 
 
 class RunCancelled(RuntimeError):
@@ -701,10 +698,22 @@ def _write_env_value(env_path: Path, key: str, value: str) -> None:
     os.environ[key] = value
 
 
+def _merged_config(saved: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    config = dict(DEFAULT_CONFIG)
+    if isinstance(saved, dict):
+        for key in DEFAULT_CONFIG:
+            if key in saved:
+                config[key] = saved[key]
+    config["benchmark_initial_points"] = max(
+        1, min(3, int(config.get("benchmark_initial_points") or 1))
+    )
+    return config
+
+
 @dataclass
 class LocalBOState:
     root: Path
-    config: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_CONFIG))
+    config: Dict[str, Any] = field(default_factory=_merged_config)
     objective_names: List[str] = field(default_factory=lambda: ["objective"])
     candidates: List[Dict[str, Any]] = field(default_factory=list)
     observations: List[Dict[str, Any]] = field(default_factory=list)
@@ -1096,13 +1105,6 @@ class LocalBOState:
             available_candidates = self.available_candidates()
             labelled_values = self.candidate_objective_values()
             plot_steps = self.plot_horizon(len(active_observations))
-            random_baseline = (
-                float(np.mean(labelled_values))
-                if self.config.get("benchmark_starting_baseline") == "mean"
-                and labelled_values
-                else None
-            )
-            random_steps = plot_steps - 1 if random_baseline is not None else plot_steps
             return {
                 "config": self.config,
                 "campaign": {
@@ -1147,8 +1149,7 @@ class LocalBOState:
                 "random_walk_trace": _paper_random_trace(
                     labelled_values,
                     self.config["objective_direction"],
-                    random_steps,
-                    baseline_value=random_baseline,
+                    plot_steps,
                 ),
                 "dataset_stats": _dataset_stats(
                     labelled_values, self.config["objective_direction"]
@@ -1162,11 +1163,9 @@ class LocalBOState:
             }
 
     def plot_horizon(self, live_count: int = 0) -> int:
-        configured_horizon = int(self.config["benchmark_iterations"])
-        if self.config.get("benchmark_starting_baseline") == "mean":
-            configured_horizon += 1
-        else:
-            configured_horizon += int(self.config["benchmark_initial_points"])
+        configured_horizon = int(self.config["benchmark_iterations"]) + int(
+            self.config["benchmark_initial_points"]
+        )
         horizon = max(
             live_count,
             configured_horizon,
@@ -1424,8 +1423,7 @@ class LocalBOState:
             self.dataset_id = meta.get("dataset_id") or ""
             self.dataset_filename = meta.get("dataset_filename") or ""
             self.dataset_imported_at = meta.get("dataset_imported_at") or ""
-            self.config = dict(DEFAULT_CONFIG)
-            self.config.update(data.get("config", {}))
+            self.config = _merged_config(data.get("config", {}))
             self.objective_names = list(data.get("objective_names") or ["objective"])
             self.candidates = list(data.get("candidates") or [])
             self.observations = list(data.get("observations") or [])
@@ -1491,8 +1489,7 @@ class LocalBOState:
             self.dataset_id = meta.get("dataset_id") or ""
             self.dataset_filename = meta.get("dataset_filename") or ""
             self.dataset_imported_at = meta.get("dataset_imported_at") or ""
-            self.config = dict(DEFAULT_CONFIG)
-            self.config.update(data.get("config", {}))
+            self.config = _merged_config(data.get("config", {}))
             self.objective_names = list(data.get("objective_names") or ["objective"])
             self.candidates = list(data.get("candidates") or [])
             self.observations = list(data.get("observations") or [])
@@ -1537,7 +1534,7 @@ class LocalBOState:
 
     def start_fresh(self) -> Dict[str, Any]:
         with self.lock:
-            self.config = dict(DEFAULT_CONFIG)
+            self.config = _merged_config()
             self.objective_names = ["objective"]
             self.candidates = []
             self.observations = []
@@ -1838,8 +1835,6 @@ class LocalBOState:
                 self.config["plot_stat_guides"] = "max"
             if self.config.get("llm_pool_scope") not in {"full", "broad"}:
                 self.config["llm_pool_scope"] = "full"
-            if self.config["benchmark_starting_baseline"] not in BENCHMARK_STARTING_BASELINES:
-                self.config["benchmark_starting_baseline"] = "none"
             self.config["batch_size"] = max(1, min(25, int(self.config["batch_size"])))
             self.config["iterations_per_trial"] = max(
                 0, int(self.config["iterations_per_trial"])
@@ -1854,7 +1849,7 @@ class LocalBOState:
                 1, min(50, int(self.config["benchmark_replicates"]))
             )
             self.config["benchmark_initial_points"] = max(
-                1, int(self.config["benchmark_initial_points"])
+                1, min(3, int(self.config["benchmark_initial_points"]))
             )
             self.config["benchmark_seed"] = int(self.config["benchmark_seed"])
             self.config["random_replicates"] = max(0, int(self.config["random_replicates"]))
@@ -2963,7 +2958,6 @@ class LocalBOState:
                 "benchmark_replicates",
                 "benchmark_initial_points",
                 "benchmark_seed",
-                "benchmark_starting_baseline",
                 "greedy_final_iteration",
             ]
         }
@@ -3003,17 +2997,6 @@ class LocalBOState:
         if prediction:
             candidate["_prediction"] = prediction
         return candidate
-
-    def _benchmark_baseline_value(self, labelled: List[Dict[str, Any]]) -> Optional[float]:
-        if self.config.get("benchmark_starting_baseline") != "mean":
-            return None
-        objective = self.config["objective_name"]
-        values = [
-            float(candidate["objectives"][objective])
-            for candidate in labelled
-            if candidate.get("objectives", {}).get(objective) is not None
-        ]
-        return float(np.mean(values)) if values else None
 
     def _summarize_replicate_traces(
         self, replicate_traces: List[List[Dict[str, Any]]]
@@ -3219,30 +3202,19 @@ class LocalBOState:
                 or self._benchmark_name()
             )
             seed = int(self.config["benchmark_seed"])
-            baseline_value = self._benchmark_baseline_value(labelled)
-            trace_skip_count = initial_points if baseline_value is not None else 0
-            baseline_step_count = 1 if baseline_value is not None else 0
-            progress_steps_per_replicate = iterations + baseline_step_count
+            progress_steps_per_replicate = initial_points + iterations
             replicate_observations: List[List[Dict[str, Any]]] = [
                 [dict(obs) for obs in obs_list]
                 for obs_list in ((resume_run or {}).get("replicate_observations") or [])
             ]
             replicate_traces: List[List[Dict[str, Any]]] = [
-                _best_trace(
-                    obs_list,
-                    self.config["objective_direction"],
-                    baseline_value=baseline_value,
-                    skip_observations=trace_skip_count,
-                )
+                _best_trace(obs_list, self.config["objective_direction"])
                 for obs_list in replicate_observations
                 if obs_list
             ]
 
             def completed_display_steps(obs_list: List[Dict[str, Any]]) -> int:
-                completed_bo_steps = max(0, min(iterations, len(obs_list) - initial_points))
-                if baseline_step_count and len(obs_list) >= initial_points:
-                    return 1 + completed_bo_steps
-                return completed_bo_steps
+                return max(0, min(progress_steps_per_replicate, len(obs_list)))
 
             def completed_display_total() -> int:
                 return sum(
@@ -3285,12 +3257,7 @@ class LocalBOState:
                 obs_sets = [[dict(obs) for obs in obs_list] for obs_list in replicate_observations]
                 obs_sets = [obs_list for obs_list in obs_sets if obs_list]
                 traces = [
-                    _best_trace(
-                        obs_list,
-                        self.config["objective_direction"],
-                        baseline_value=baseline_value,
-                        skip_observations=trace_skip_count,
-                    )
+                    _best_trace(obs_list, self.config["objective_direction"])
                     for obs_list in obs_sets
                 ]
                 partial_run["time"] = _now()
@@ -3311,11 +3278,6 @@ class LocalBOState:
                     + (
                         "; final BO step uses greedy acquisition"
                         if self.config["greedy_final_iteration"]
-                        else ""
-                    )
-                    + (
-                        "; mean incumbent is experiment 1"
-                        if baseline_step_count
                         else ""
                     )
                     + (
@@ -3350,8 +3312,9 @@ class LocalBOState:
                         observations.append(self._observation_from_candidate(candidate))
                         selected_ids.add(candidate["id"])
                     update_partial_run(replicate, observations)
-                    if baseline_step_count and len(observations) >= initial_points:
+                    if len(observations) >= initial_points:
                         completed_steps = completed_display_total()
+                        initial_label = "point" if initial_points == 1 else "points"
                         self.set_progress(
                             f"Running benchmark: {name}",
                             completed_steps,
@@ -3359,7 +3322,8 @@ class LocalBOState:
                             detail=(
                                 f"Replicate {replicate + 1}/{replicates}, "
                                 f"experiment {completed_display_steps(observations)}/"
-                                f"{progress_steps_per_replicate}, mean incumbent initialized"
+                                f"{progress_steps_per_replicate}, initialized "
+                                f"{initial_points} random initial {initial_label}"
                             ),
                             extra={"partial_run": partial_run},
                         )
@@ -3388,19 +3352,11 @@ class LocalBOState:
                         update_partial_run(replicate, observations)
                         completed_steps = completed_display_total()
                         progress_detail = (
-                            (
-                                f"Replicate {replicate + 1}/{replicates}, "
-                                f"experiment {completed_display_steps(observations)}/"
-                                f"{progress_steps_per_replicate} complete "
-                                f"(BO choice {iteration + 1}/{iterations}, "
-                                f"{(acquisition_override or self.config['acquisition']).replace('_', ' ')})"
-                            )
-                            if baseline_step_count
-                            else (
-                                f"Replicate {replicate + 1}/{replicates}, "
-                                f"iteration {iteration + 1}/{iterations}, "
-                                f"{(acquisition_override or self.config['acquisition']).replace('_', ' ')}"
-                            )
+                            f"Replicate {replicate + 1}/{replicates}, "
+                            f"experiment {completed_display_steps(observations)}/"
+                            f"{progress_steps_per_replicate} complete "
+                            f"(BO choice {iteration + 1}/{iterations}, "
+                            f"{(acquisition_override or self.config['acquisition']).replace('_', ' ')})"
                         )
                         self.set_progress(
                             f"Running benchmark: {name}",
@@ -3413,12 +3369,7 @@ class LocalBOState:
                         replicate_observations.append([])
                     replicate_observations[replicate] = observations
                     replicate_traces = [
-                        _best_trace(
-                            obs_list,
-                            self.config["objective_direction"],
-                            baseline_value=baseline_value,
-                            skip_observations=trace_skip_count,
-                        )
+                        _best_trace(obs_list, self.config["objective_direction"])
                         for obs_list in replicate_observations
                         if obs_list
                     ]
@@ -4506,8 +4457,9 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="row">
           <div class="field">
-            <label for="benchmarkInitialPoints">Initial random</label>
-            <input id="benchmarkInitialPoints" type="number" min="1" value="1">
+            <label for="benchmarkInitialPoints">Initial random points</label>
+            <input id="benchmarkInitialPoints" type="number" min="1" max="3" value="1">
+            <div class="hint">Real evaluated starting points, not a plot-only baseline.</div>
           </div>
           <div class="field">
             <label for="benchmarkIterations">BO iterations</label>
@@ -4523,13 +4475,6 @@ INDEX_HTML = r"""<!doctype html>
             <label for="benchmarkSeed">Seed</label>
             <input id="benchmarkSeed" type="number" value="0">
           </div>
-        </div>
-        <div class="field">
-          <label for="benchmarkStartingBaseline">Starting baseline</label>
-          <select id="benchmarkStartingBaseline">
-            <option value="none">Observed initial points only</option>
-            <option value="mean">Dataset mean incumbent</option>
-          </select>
         </div>
         <div class="field">
           <label class="switchline" for="greedyFinalIteration">
@@ -4706,11 +4651,10 @@ INDEX_HTML = r"""<!doctype html>
       nNeighbors: 'GPR embedding neighbor count used by the local GP featurization pipeline.',
       autoSuggest: 'When checked, adding a live result immediately refreshes suggestions.',
       benchmarkName: 'Optional label for this appended offline benchmark curve.',
-      benchmarkInitialPoints: 'Number of random starting examples. The paper default was 1; 2 is also common for small pools.',
+      benchmarkInitialPoints: 'Number of real random starting experiments before BO model selection starts. Allowed range is 1 to 3; the paper default was 1.',
       benchmarkIterations: 'Number of BO choices after initialization. The paper notebook default was 30.',
       benchmarkReplicates: 'Number of repeated runs for the same workflow. The paper notebook default was 5.',
       benchmarkSeed: 'Starting random seed for reproducible benchmark replicates.',
-      benchmarkStartingBaseline: 'Plot-only incumbent value at experiment count 1. Dataset mean starts each benchmark curve from the mean label without adding a fake labeled procedure to the LLM context; BO-selected pool experiments begin at count 2.',
       greedyFinalIteration: 'When checked, only the final BO choice in each replicate switches to greedy acquisition. Earlier choices use the selected acquisition function.',
       candidateSearch: 'Search the full available pool by row number or procedure text, then choose a candidate for live result entry.',
       clearCandidate: 'Clear the selected pool candidate and use the manual procedure field instead.',
@@ -4901,7 +4845,6 @@ INDEX_HTML = r"""<!doctype html>
         benchmark_replicates: Number($('benchmarkReplicates').value || 5),
         benchmark_initial_points: Number($('benchmarkInitialPoints').value || 1),
         benchmark_seed: Number($('benchmarkSeed').value || 0),
-        benchmark_starting_baseline: $('benchmarkStartingBaseline').value,
         greedy_final_iteration: $('greedyFinalIteration').checked,
         ucb_lambda: Number($('ucbLambda').value || 0.1),
         score_limit: Number($('scoreLimit').value || 250),
@@ -5033,7 +4976,6 @@ INDEX_HTML = r"""<!doctype html>
       $('benchmarkReplicates').value = config.benchmark_replicates;
       $('benchmarkInitialPoints').value = config.benchmark_initial_points;
       $('benchmarkSeed').value = config.benchmark_seed;
-      $('benchmarkStartingBaseline').value = config.benchmark_starting_baseline || 'none';
       $('greedyFinalIteration').checked = Boolean(config.greedy_final_iteration);
       $('ucbLambda').value = config.ucb_lambda;
       $('scoreLimit').value = config.score_limit;
@@ -6597,7 +6539,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
         <li>Set <code>Workflow mode</code> to <code>Automatic benchmark: full labeled dataset</code>. The app switches to this automatically when imported labels are detected.</li>
         <li>Choose the active objective and whether to maximize or minimize it.</li>
         <li>Choose the suggestion engine, model, acquisition function, and target scaling.</li>
-        <li>Set <code>Initial random</code>, <code>BO iterations</code>, <code>Workflow replicates</code>, and <code>Seed</code>. <code>Seed</code> is the reproducible random-number seed, not an objective-value starting point. Use <code>Starting baseline</code> when you want the first plotted marker at x=1 to be the dataset-mean incumbent; BO-selected pool experiments begin at x=2 after their hidden label is evaluated. Optionally enable <code>Greedy for final iteration</code> so only the last BO choice in each replicate switches to greedy exploitation.</li>
+        <li>Set <code>Initial random points</code>, <code>BO iterations</code>, <code>Workflow replicates</code>, and <code>Seed</code>. <code>Seed</code> is the reproducible random-number seed, not an objective-value starting point. Initial random points are real simulated experiments with labels revealed only after selection. Optionally enable <code>Greedy for final iteration</code> so only the last BO choice in each replicate switches to greedy exploitation.</li>
         <li>Click <code>Run & Append</code>. Change settings and click it again to compare another configuration. If a run stopped after a connection, rate-limit, or model error, clicking <code>Run & Append</code> again with the same label/settings resumes the partial trajectory instead of creating a duplicate curve.</li>
       </ol>
       <div class="callout">Paper-style numerical defaults are <code>Initial random = 1</code>, <code>Batch size = 1</code>, <code>BO iterations = 30</code>, <code>Workflow replicates = 5</code>, and <code>UCB lambda = 0.1</code>. Current model defaults use supported modern model IDs rather than retired paper-era model names.</div>
@@ -6643,7 +6585,6 @@ USER_GUIDE_HTML = r"""<!doctype html>
           <tr><td>API pause / 429 cooldown / 429 retries</td><td><code>API pause</code> spaces out successful calls. <code>429 cooldown</code> waits after a rate-limit error before retrying. Retries controls how many recovery attempts are allowed before the partial run is saved for resume.</td></tr>
           <tr><td>Replicates</td><td>Live-mode repeated measurements allowed for the same candidate before it is removed from the available pool.</td></tr>
           <tr><td>Workflow replicates</td><td>Offline benchmark repeated runs of the whole BO workflow for averaging and spread bands.</td></tr>
-          <tr><td>Starting baseline</td><td>Offline benchmark plot option. <code>Dataset mean incumbent</code> draws the mean incumbent as the first marker at x=1 and initializes best-so-far from that value, without adding a fake labeled procedure to the model context. The first BO-selected pool experiment is plotted at x=2 only after its label is available.</td></tr>
           <tr><td>API keys</td><td>Keys are written only to the local ignored <code>.env</code> file. OpenAI keys are required for embeddings and OpenAI LLMs; OpenRouter and Anthropic keys are only needed for those model families.</td></tr>
           <tr><td>System messages</td><td>Generated from the uploaded dataset by default. They constrain the LLM to numeric predictions or procedure-style inverse designs without exposing hidden labels.</td></tr>
         </tbody>

@@ -181,7 +181,7 @@ def test_defaults_match_paper_style_numeric_settings():
     assert DEFAULT_CONFIG["batch_size"] == 1
     assert DEFAULT_CONFIG["benchmark_iterations"] == 30
     assert DEFAULT_CONFIG["benchmark_replicates"] == 5
-    assert DEFAULT_CONFIG["benchmark_starting_baseline"] == "none"
+    assert "benchmark_starting_baseline" not in DEFAULT_CONFIG
     assert DEFAULT_CONFIG["objective_lower_bound"] == ""
     assert DEFAULT_CONFIG["objective_upper_bound"] == ""
     assert DEFAULT_CONFIG["ucb_lambda"] == 0.1
@@ -205,6 +205,14 @@ def test_model_fields_are_real_selectors():
     assert 'id="objectiveUpperBound"' in INDEX_HTML
     assert 'id="modelOptions"' not in INDEX_HTML
     assert 'id="embeddingModelOptions"' not in INDEX_HTML
+
+
+def test_initial_random_points_are_capped_at_three(tmp_path):
+    state = LocalBOState(tmp_path)
+
+    state.update_config({"benchmark_initial_points": 99})
+
+    assert state.config["benchmark_initial_points"] == 3
 
 
 def test_non_benchmark_progress_clears_stale_partial_run(tmp_path):
@@ -344,32 +352,31 @@ def test_offline_benchmark_appends_random_config_without_live_observations(tmp_p
     assert payload["progress"]["percent"] == 100
 
 
-def test_offline_benchmark_can_start_plot_from_dataset_mean(tmp_path):
+def test_offline_benchmark_starts_from_real_initial_points(tmp_path):
     state = LocalBOState(tmp_path)
-    state.import_dataset("dataset.csv", b"procedure,value\nproc a,1\nproc b,3\nproc c,5\n")
+    state.import_dataset(
+        "dataset.csv",
+        b"procedure,value\nproc a,1\nproc b,3\nproc c,5\nproc d,7\n",
+    )
     state.update_config(
         {
             "acquisition": "random",
             "benchmark_iterations": 1,
             "benchmark_replicates": 1,
-            "benchmark_initial_points": 1,
-            "benchmark_starting_baseline": "mean",
+            "benchmark_initial_points": 2,
         }
     )
 
-    payload = state.run_benchmark({"name": "mean baseline"})
+    payload = state.run_benchmark({"name": "initial points"})
     run = payload["benchmark_runs"][0]
 
-    assert run["summary"][0]["index"] == 1
-    assert run["summary"][0]["mean"] == 3.0
-    assert run["replicate_traces"][0][0]["baseline"] is True
-    assert run["replicate_traces"][0][1]["index"] == 2
-    assert len(run["summary"]) == 2
+    assert [point["index"] for point in run["summary"]] == [1, 2, 3]
+    assert not any(point.get("baseline") for point in run["replicate_traces"][0])
     assert all(point["index"] >= 1 for point in run["replicate_traces"][0])
-    assert len(run["replicate_observations"][0]) == 2
+    assert len(run["replicate_observations"][0]) == 3
 
 
-def test_mean_baseline_progress_stays_on_seed_before_first_bo_result(tmp_path):
+def test_benchmark_progress_counts_initial_points_before_first_bo_result(tmp_path):
     state = LocalBOState(tmp_path)
     state.import_dataset(
         "dataset.csv",
@@ -381,8 +388,7 @@ def test_mean_baseline_progress_stays_on_seed_before_first_bo_result(tmp_path):
             "optimizer": "gpr",
             "benchmark_iterations": 2,
             "benchmark_replicates": 1,
-            "benchmark_initial_points": 1,
-            "benchmark_starting_baseline": "mean",
+            "benchmark_initial_points": 2,
         }
     )
     captured = {}
@@ -397,23 +403,22 @@ def test_mean_baseline_progress_stays_on_seed_before_first_bo_result(tmp_path):
         raise RunCancelled("stop before first BO result")
 
     state._benchmark_next_candidate = stop_before_first_bo_result
-    payload = state.run_benchmark({"name": "mean progress"})
+    payload = state.run_benchmark({"name": "initial progress"})
     partial = payload["benchmark_runs"][0]
 
-    assert captured["current"] == 1
-    assert captured["total"] == 3
-    assert "experiment 1/3" in captured["detail"]
-    assert [point["index"] for point in captured["summary"]] == [1]
-    assert captured["summary"][0]["mean"] == 2.5
+    assert captured["current"] == 2
+    assert captured["total"] == 4
+    assert "initialized 2 random initial points" in captured["detail"]
+    assert [point["index"] for point in captured["summary"]] == [1, 2]
     assert partial["status"] == "stopped"
-    assert [point["index"] for point in partial["summary"]] == [1]
+    assert [point["index"] for point in partial["summary"]] == [1, 2]
 
 
-def test_mean_baseline_plot_horizon_ignores_hidden_initial_context(tmp_path):
+def test_plot_horizon_counts_initial_points_and_bo_iterations(tmp_path):
     state = LocalBOState(tmp_path)
     state.import_dataset(
         "dataset.csv",
-        b"procedure,value\nproc a,1\nproc b,2\nproc c,3\nproc d,4\n",
+        b"procedure,value\nproc a,1\nproc b,2\nproc c,3\nproc d,4\nproc e,5\n",
     )
     state.update_config(
         {
@@ -422,16 +427,15 @@ def test_mean_baseline_plot_horizon_ignores_hidden_initial_context(tmp_path):
             "benchmark_iterations": 2,
             "benchmark_replicates": 1,
             "benchmark_initial_points": 2,
-            "benchmark_starting_baseline": "mean",
         }
     )
 
     payload = state.run_benchmark({"name": "mean horizon"})
     run = payload["benchmark_runs"][0]
 
-    assert state.plot_horizon() == 3
-    assert [point["index"] for point in run["summary"]] == [1, 2, 3]
-    assert [point["index"] for point in payload["random_walk_trace"]] == [1, 2, 3]
+    assert state.plot_horizon() == 4
+    assert [point["index"] for point in run["summary"]] == [1, 2, 3, 4]
+    assert [point["index"] for point in payload["random_walk_trace"]] == [1, 2, 3, 4]
 
 
 def test_llm_benchmark_scores_after_one_initial_point(tmp_path, monkeypatch):
