@@ -115,6 +115,7 @@ DEFAULT_CONFIG = {
     "prediction_system_message": DEFAULT_PREDICTION_SYSTEM_MESSAGE,
     "inverse_system_message": DEFAULT_INVERSE_SYSTEM_MESSAGE,
     "llm_samples": 3,
+    "llm_uncertainty_calibration": 4.33,
     "selector_k": 0,
     "llm_pool_scope": "full",
     "inverse_filter": 16,
@@ -172,6 +173,7 @@ BENCHMARK_RESUME_MATCH_KEYS = [
     "prediction_model",
     "inverse_model",
     "llm_samples",
+    "llm_uncertainty_calibration",
     "selector_k",
     "llm_pool_scope",
     "inverse_filter",
@@ -430,6 +432,96 @@ def _best_trace(
         else:
             best = max(best, value)
         trace.append({"index": plotted, "value": value, "best": best})
+    return trace
+
+
+def _collapse_live_observation_points(
+    observations: List[Dict[str, Any]], direction: str
+) -> List[Dict[str, Any]]:
+    groups: List[Dict[str, Any]] = []
+    by_key: Dict[str, Dict[str, Any]] = {}
+    for raw_index, obs in enumerate(observations, start=1):
+        value = obs.get("value")
+        if value is None:
+            continue
+        key = str(obs.get("candidate_id") or obs.get("procedure") or raw_index)
+        group = by_key.get(key)
+        if group is None:
+            group = {
+                "key": key,
+                "candidate_id": obs.get("candidate_id", ""),
+                "procedure": obs.get("procedure", ""),
+                "raw_indices": [],
+                "values": [],
+                "measurement_uncertainties": [],
+                "prediction": None,
+            }
+            by_key[key] = group
+            groups.append(group)
+        group["raw_indices"].append(raw_index)
+        group["values"].append(float(value))
+        uncertainty = _coerce_float(obs.get("uncertainty"))
+        if uncertainty is not None:
+            group["measurement_uncertainties"].append(float(uncertainty))
+        prediction = obs.get("prediction") or {}
+        if prediction.get("mean") is not None:
+            group["prediction"] = dict(prediction)
+
+    points = []
+    for index, group in enumerate(groups, start=1):
+        values = group["values"]
+        mean = float(np.mean(values))
+        replicate_std = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+        measurement_uncertainty = (
+            float(np.sqrt(np.mean(np.square(group["measurement_uncertainties"]))))
+            if group["measurement_uncertainties"]
+            else 0.0
+        )
+        points.append(
+            {
+                "index": index,
+                "candidate_id": group["candidate_id"],
+                "procedure": group["procedure"],
+                "value": mean,
+                "uncertainty": replicate_std if len(values) > 1 else measurement_uncertainty,
+                "replicate_std": replicate_std,
+                "measurement_uncertainty": measurement_uncertainty,
+                "replicate_count": len(values),
+                "raw_indices": group["raw_indices"],
+                "best_basis": "replicate_mean" if len(values) > 1 else "single_measurement",
+                "prediction": group["prediction"] or {},
+            }
+        )
+    return points
+
+
+def _best_trace_from_points(
+    points: List[Dict[str, Any]], direction: str
+) -> List[Dict[str, Any]]:
+    best_point: Optional[Dict[str, Any]] = None
+    trace = []
+    for point in points:
+        value = point.get("value")
+        if value is None:
+            continue
+        if best_point is None:
+            best_point = point
+        elif direction == "minimize":
+            if float(value) < float(best_point["value"]):
+                best_point = point
+        elif float(value) > float(best_point["value"]):
+            best_point = point
+        trace.append(
+            {
+                "index": int(point["index"]),
+                "value": float(value),
+                "best": float(best_point["value"]),
+                "best_uncertainty": float(best_point.get("uncertainty") or 0.0),
+                "best_replicate_count": int(best_point.get("replicate_count") or 1),
+                "best_candidate_id": best_point.get("candidate_id", ""),
+                "best_basis": best_point.get("best_basis", ""),
+            }
+        )
     return trace
 
 
@@ -1102,6 +1194,9 @@ class LocalBOState:
     def to_json(self) -> Dict[str, Any]:
         with self.lock:
             active_observations = self.active_observations()
+            live_observation_points = _collapse_live_observation_points(
+                active_observations, self.config["objective_direction"]
+            )
             available_candidates = self.available_candidates()
             labelled_values = self.candidate_objective_values()
             plot_steps = self.plot_horizon(len(active_observations))
@@ -1131,6 +1226,7 @@ class LocalBOState:
                 ],
                 "available_count": len(available_candidates),
                 "observations": self.observations,
+                "live_observation_points": live_observation_points,
                 "suggestions": self.suggestions,
                 "inverse_designs": self.inverse_designs,
                 "benchmark_runs": self.benchmark_runs,
@@ -1139,8 +1235,8 @@ class LocalBOState:
                 "last_error": self.last_error,
                 "last_model_status": self.last_model_status,
                 "progress": self.progress,
-                "best_trace": _best_trace(
-                    active_observations, self.config["objective_direction"]
+                "best_trace": _best_trace_from_points(
+                    live_observation_points, self.config["objective_direction"]
                 ),
                 "live_random_walk_trace": _best_trace(
                     self.live_random_walk.get("observations") or [],
@@ -1805,6 +1901,7 @@ class LocalBOState:
                 elif key == "ucb_lambda":
                     value = float(value)
                 elif key in {
+                    "llm_uncertainty_calibration",
                     "inverse_target_multiplier",
                     "inverse_target_jitter",
                     "api_pause_seconds",
@@ -1854,6 +1951,9 @@ class LocalBOState:
             self.config["benchmark_seed"] = int(self.config["benchmark_seed"])
             self.config["random_replicates"] = max(0, int(self.config["random_replicates"]))
             self.config["llm_samples"] = max(1, min(20, int(self.config["llm_samples"])))
+            self.config["llm_uncertainty_calibration"] = max(
+                0.0, min(100.0, float(self.config["llm_uncertainty_calibration"]))
+            )
             self.config["selector_k"] = max(0, int(self.config["selector_k"]))
             self.config["inverse_filter"] = max(0, int(self.config["inverse_filter"]))
             self.config["inverse_random_candidates"] = max(
@@ -2174,6 +2274,11 @@ class LocalBOState:
             "llm_samples": suggestion.get("llm_samples")
             if suggestion.get("llm_samples") is not None
             else self.config.get("llm_samples"),
+            "llm_uncertainty_calibration": suggestion.get(
+                "llm_uncertainty_calibration"
+            )
+            if suggestion.get("llm_uncertainty_calibration") is not None
+            else self.config.get("llm_uncertainty_calibration"),
             "score_limit": suggestion.get("score_limit")
             if suggestion.get("score_limit") is not None
             else self.config.get("score_limit"),
@@ -2200,6 +2305,9 @@ class LocalBOState:
             "inverse_filter": self.config.get("inverse_filter"),
             "inverse_random_candidates": self.config.get("inverse_random_candidates"),
             "llm_samples": self.config.get("llm_samples"),
+            "llm_uncertainty_calibration": self.config.get(
+                "llm_uncertainty_calibration"
+            ),
             "score_limit": self.config.get("score_limit"),
         }
 
@@ -2519,6 +2627,9 @@ class LocalBOState:
             x_name="procedure",
             y_formatter=lambda y: f"{float(y):0.6g}",
         )
+        calibration = float(self.config.get("llm_uncertainty_calibration") or 0.0)
+        if calibration > 0:
+            model.set_calibration_factor(calibration)
         for obs in active_observations:
             model.tell(obs["procedure"], obs["target"])
         return model, scaler
@@ -2940,6 +3051,7 @@ class LocalBOState:
                 "prediction_model",
                 "inverse_model",
                 "llm_samples",
+                "llm_uncertainty_calibration",
                 "selector_k",
                 "llm_pool_scope",
                 "inverse_filter",
@@ -3022,7 +3134,7 @@ class LocalBOState:
             if not values:
                 continue
             mean = float(np.mean(values))
-            std = float(np.std(values)) if len(values) > 1 else 0.0
+            std = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
             summary.append(
                 {
                     "index": index,
@@ -3064,7 +3176,7 @@ class LocalBOState:
             if not means:
                 continue
             mean_value = float(np.mean(means))
-            between = float(np.var(means)) if len(means) > 1 else 0.0
+            between = float(np.var(means, ddof=1)) if len(means) > 1 else 0.0
             within = float(np.mean(variances)) if variances else 0.0
             std_value = float(np.sqrt(max(0.0, between + within)))
             summary.append(
@@ -3518,6 +3630,7 @@ class LocalBOState:
                     "prediction_inverse_filter",
                     "prediction_inverse_random_candidates",
                     "prediction_llm_samples",
+                    "prediction_llm_uncertainty_calibration",
                     "prediction_score_limit",
                     "prediction_inverse_seed",
                     "prediction_time",
@@ -3558,6 +3671,9 @@ class LocalBOState:
                     "inverse_random_candidates", ""
                 )
                 row["prediction_llm_samples"] = prediction.get("llm_samples", "")
+                row["prediction_llm_uncertainty_calibration"] = prediction.get(
+                    "llm_uncertainty_calibration", ""
+                )
                 row["prediction_score_limit"] = prediction.get("score_limit", "")
                 row["prediction_inverse_seed"] = prediction.get("inverse_seed", "")
                 row["prediction_time"] = prediction.get("time", "")
@@ -4358,6 +4474,12 @@ INDEX_HTML = r"""<!doctype html>
             <input id="llmSamples" type="number" min="1" max="20" value="3">
           </div>
           <div class="field">
+            <label for="llmUncertaintyCalibration">LLM uncertainty scalar</label>
+            <input id="llmUncertaintyCalibration" type="number" min="0" max="100" step="0.01" value="4.33">
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
             <label for="selectorK">Selector examples</label>
             <input id="selectorK" type="number" min="0" value="0">
           </div>
@@ -4633,6 +4755,7 @@ INDEX_HTML = r"""<!doctype html>
       batchSize: 'Number of candidates suggested at once in live experimentation. The paper BO loop used 1.',
       ucbLambda: 'Exploration weight for upper confidence bound. The paper notebook default was 0.1.',
       llmSamples: 'Number of LLM prediction samples per shortlisted candidate for BO-ICL uncertainty estimates.',
+      llmUncertaintyCalibration: 'Multiplicative calibration factor applied to LLM predictive standard deviations before acquisition scoring and plotting. Default 4.33 comes from the paper gpt-4/topk calibration table.',
       selectorK: 'Number of nearest labeled examples to include in prompts. 0 uses the normal few-shot history.',
       inverseFilter: 'LLM-mode shortlist size retrieved with inverse-design text plus cached embeddings before completions are requested. Full pool mode searches every available candidate; Broad random pool mode searches the sampled broad pool. 0 disables the shortlist and scores the broad pool.',
       inverseRandomCandidates: 'Extra random candidates mixed with the LLM shortlist before completions are requested.',
@@ -4829,6 +4952,7 @@ INDEX_HTML = r"""<!doctype html>
         prediction_system_message: $('predictionSystemMessage').value,
         inverse_system_message: $('inverseSystemMessage').value,
         llm_samples: Number($('llmSamples').value || 3),
+        llm_uncertainty_calibration: Number($('llmUncertaintyCalibration').value || 0),
         selector_k: Number($('selectorK').value || 0),
         llm_pool_scope: $('llmPoolScope').value,
         inverse_filter: Number($('inverseFilter').value || 16),
@@ -4960,6 +5084,7 @@ INDEX_HTML = r"""<!doctype html>
       $('predictionSystemMessage').value = config.prediction_system_message;
       $('inverseSystemMessage').value = config.inverse_system_message;
       $('llmSamples').value = config.llm_samples;
+      $('llmUncertaintyCalibration').value = config.llm_uncertainty_calibration;
       $('selectorK').value = config.selector_k;
       $('llmPoolScope').value = config.llm_pool_scope || 'full';
       $('inverseFilter').value = config.inverse_filter;
@@ -5213,7 +5338,7 @@ INDEX_HTML = r"""<!doctype html>
         host.innerHTML = '<div class="empty" style="margin: 18px;">No observations, random baseline, or benchmark runs yet</div>';
         return;
       }
-      const obs = state.observations || [];
+      const obs = state.live_observation_points || state.observations || [];
       const randomObs = (state.live_random_walk || {}).observations || [];
       const width = Math.max(560, host.clientWidth || 760);
       const height = 330;
@@ -5267,6 +5392,10 @@ INDEX_HTML = r"""<!doctype html>
           return [clipToObjectiveBounds(item.value - unc), clipToObjectiveBounds(item.value + unc), item.value];
         }),
         trace.map((item) => item.best),
+        trace.flatMap((item) => {
+          const unc = Number(item.best_uncertainty || 0);
+          return [clipToObjectiveBounds(item.best - unc), clipToObjectiveBounds(item.best + unc)];
+        }),
         randomTrace.map((item) => item.best),
         liveRandomTrace.map((item) => item.best),
         benchmarkRuns.flatMap((run) => (run.summary || []).flatMap((item) => [item.lower, item.upper, item.mean])),
@@ -5310,6 +5439,9 @@ INDEX_HTML = r"""<!doctype html>
         ? items.map((item, idx) => `${idx ? 'L' : 'M'} ${x(item.index).toFixed(1)} ${y(item[valueKey]).toFixed(1)}`).join(' ')
         : '';
       const bestPath = pathFor(trace, 'best');
+      const bestBand = trace.length > 1 && trace.some((item) => Number(item.best_uncertainty || 0) > 0)
+        ? `M ${trace.map((item) => `${x(item.index).toFixed(1)} ${y(clipToObjectiveBounds(item.best + Number(item.best_uncertainty || 0))).toFixed(1)}`).join(' L ')} L ${[...trace].reverse().map((item) => `${x(item.index).toFixed(1)} ${y(clipToObjectiveBounds(item.best - Number(item.best_uncertainty || 0))).toFixed(1)}`).join(' L ')} Z`
+        : '';
       const randomPath = pathFor(randomTrace, 'best');
       const liveRandomPath = pathFor(liveRandomTrace, 'best');
       const randomMarkers = randomTrace.map((item) => (
@@ -5374,7 +5506,8 @@ INDEX_HTML = r"""<!doctype html>
         const cy = y(item.value);
         const unc = Number(item.uncertainty || 0);
         const err = unc ? `<line x1="${cx}" x2="${cx}" y1="${y(clipToObjectiveBounds(item.value - unc))}" y2="${y(clipToObjectiveBounds(item.value + unc))}" stroke="#b45309" stroke-width="1.5" />` : '';
-        return `${err}<circle cx="${cx}" cy="${cy}" r="4" fill="#2563eb"><title>${escapeHtml(item.procedure)}: ${fmt(item.value)}</title></circle>`;
+        const countText = item.replicate_count && item.replicate_count > 1 ? `, n=${item.replicate_count}` : '';
+        return `${err}<circle cx="${cx}" cy="${cy}" r="4" fill="#2563eb"><title>${escapeHtml(item.procedure)}: ${fmt(item.value)}${countText}</title></circle>`;
       }).join('');
       const ticks = [0, 0.25, 0.5, 0.75, 1].map((t) => {
         const value = minY + (maxY - minY) * t;
@@ -5428,6 +5561,7 @@ INDEX_HTML = r"""<!doctype html>
         ${liveRandomMarkers}
         ${runLayers}
         ${runPredictionLayers}
+        ${bestBand ? `<path d="${bestBand}" fill="#0f766e" opacity="0.12" />` : ''}
         ${bestPath ? `<path d="${bestPath}" fill="none" stroke="#0f766e" stroke-width="3" />` : ''}
         ${livePredictions}
         ${points}
@@ -5486,7 +5620,8 @@ INDEX_HTML = r"""<!doctype html>
         prediction.embedding_model ? `embedding model: ${prediction.embedding_model}` : '',
         prediction.llm_pool_scope ? `LLM pool: ${prediction.llm_pool_scope}` : '',
         prediction.inverse_filter !== undefined && prediction.inverse_filter !== null ? `shortlist: ${prediction.inverse_filter}` : '',
-        prediction.llm_samples !== undefined && prediction.llm_samples !== null ? `LLM samples: ${prediction.llm_samples}` : ''
+        prediction.llm_samples !== undefined && prediction.llm_samples !== null ? `LLM samples: ${prediction.llm_samples}` : '',
+        prediction.llm_uncertainty_calibration !== undefined && prediction.llm_uncertainty_calibration !== null ? `uncertainty scalar: ${prediction.llm_uncertainty_calibration}` : ''
       ].filter(Boolean);
       return fields.join('; ');
     }
@@ -6545,7 +6680,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
       <div class="callout">Paper-style numerical defaults are <code>Initial random = 1</code>, <code>Batch size = 1</code>, <code>BO iterations = 30</code>, <code>Workflow replicates = 5</code>, and <code>UCB lambda = 0.1</code>. Current model defaults use supported modern model IDs rather than retired paper-era model names.</div>
       <p>For BO-ICL LLM runs on large pools, <code>LLM shortlist</code> retrieves the smaller inverse-design/embedding shortlist that is actually scored by the LLM. The inverse-design target is based on the current replicate's labeled history: by default it uses current best x <code>Normal(1.2, 0.05)</code>, matching the paper-style stochastic target. If sparse observations are often zero, set <code>Auto target floor</code> to a meaningful minimum aspirational value so the inverse query does not stay anchored at zero. With <code>LLM pool scope = Full pool (paper)</code>, the shortlist searches the full available pool with cached embeddings and MMR/cosine similarity, then optional random add-ons. With <code>Broad random pool (fast)</code>, the app first samples <code>Broad pool</code> candidates and runs the same MMR/cosine step only inside that subset. The default <code>LLM shortlist = 16</code>, <code>Random add-ons = 0</code>, and <code>LLM samples = 3</code> scores at most 16 candidates per BO step.</p>
       <p>LLM runtime scales with <code>(LLM shortlist + Random add-ons) x LLM samples x BO iterations x Workflow replicates</code> when the shortlist is enabled. If <code>LLM shortlist = 0</code>, runtime falls back to <code>Broad pool x LLM samples</code>. Rate-limit errors are retried automatically; increase <code>429 cooldown (s)</code>, increase <code>API pause (s)</code>, or lower the shortlist/samples if 429s keep appearing. Use the <code>Stop</code> button in the progress panel to cancel after the current API call returns.</p>
-      <p>The plot shows the mean best-so-far trajectory and a +/- 1 standard deviation band. Model prediction markers show the predicted objective mean and uncertainty for BO-selected points separately from the measured value. The dashed random baseline is the paper notebook's random-mean quantile expectation. <code>Plot guides</code> defaults to the best labelled value only; switch it to <code>Paper stats</code> to add the mean and percentile guide lines.</p>
+      <p>The plot shows the mean best-so-far trajectory and a +/- 1 sample-standard-deviation band across workflow replicates. Model prediction markers show the predicted objective mean and calibrated uncertainty for BO-selected points separately from the measured value. The dashed random baseline is the paper notebook's random-mean quantile expectation. <code>Plot guides</code> defaults to the best labelled value only; switch it to <code>Paper stats</code> to add the mean and percentile guide lines.</p>
     </section>
 
     <section>
@@ -6559,7 +6694,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
         <li>Run the physical experiment offline, then enter the measured value and optional uncertainty.</li>
         <li>Repeat until the iteration cap is reached or you decide to stop.</li>
       </ol>
-      <p>The <code>Add Result</code> candidate field searches the full available pool by row number or procedure text, so large pools do not need a giant dropdown. If a test or incorrect result is added, use <code>Delete</code> in the <code>Observations</code> table and update suggestions again. Objective values should be entered in original units. Scaling is only used internally for fitting if enabled, and the plot remains in original units.</p>
+      <p>The <code>Add Result</code> candidate field searches the full available pool by row number or procedure text, so large pools do not need a giant dropdown. If a test or incorrect result is added, use <code>Delete</code> in the <code>Observations</code> table and update suggestions again. Objective values should be entered in original units. Scaling is only used internally for fitting if enabled, and the plot remains in original units. Repeated measurements of the same candidate are preserved as raw observation rows, but the live plot collapses them to one candidate marker using the replicate mean and sample standard deviation.</p>
       <p>Use <code>Live Random Walk</code> to collect a separate live random-control trace when full-dataset statistics are not known. Set the point count, click <code>Start / Next Random</code>, run that random candidate, enter its measured value and optional uncertainty, and click <code>Add Random Result</code>. These random-control rows do not train the BO model; they are saved, plotted, archived, and exported separately.</p>
       <p>The <code>Observations</code> table keeps the method used for each selected point, including source, model, and acquisition function. Saving changed model or acquisition settings clears old suggestions so they are not accidentally used under the new controls.</p>
     </section>
@@ -6576,6 +6711,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
           <tr><td>Broad pool</td><td>Caps candidates scored by GPR. In LLM mode, it is used only when <code>LLM shortlist = 0</code> or when <code>LLM pool scope = Broad random pool</code>.</td></tr>
           <tr><td>LLM shortlist</td><td>Number of candidates retrieved by inverse-design text plus cached embeddings before LLM scoring. In Full pool mode this matches the paper; in Broad random pool mode it is a faster approximation.</td></tr>
           <tr><td>LLM pool scope</td><td><code>Full pool (paper)</code> compares the inverse-design query against every available candidate. <code>Broad random pool (fast)</code> first samples the Broad pool and then applies MMR/cosine similarity inside that subset.</td></tr>
+          <tr><td>LLM uncertainty scalar</td><td>Multiplicative factor applied to LLM predictive standard deviations before acquisition scoring and plotting. The default <code>4.33</code> is the paper's <code>gpt-4/topk</code> recalibration factor; use <code>1</code> for uncalibrated sample spread.</td></tr>
           <tr><td>Suggestions Method / Acq / Mean</td><td><code>Method</code> records source, model, and acquisition function. <code>Mean</code> is the predicted objective in original units. <code>Acq</code> is the acquisition score used for ranking. The inverse-design target creates the retrieval query; shortlisted candidates do not have to predict exactly at that target.</td></tr>
           <tr><td>Prediction markers</td><td>For model-selected points, the plot can show the stored prediction mean and uncertainty as a distinct marker with an error bar. The measured value remains the actual observation and best-so-far trace.</td></tr>
           <tr><td>Live Random Walk</td><td>Separate live control trajectory. The app selects one random available candidate at a time, waits for the measured value, then appends it to the random-control plot/export without adding it to the BO training context.</td></tr>

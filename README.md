@@ -102,6 +102,9 @@ Typical settings:
 - **BO iterations**: number of sequential model-selected experiments.
 - **Workflow replicates**: repeated runs for mean and spread bands.
 - **Greedy for final iteration**: optional final exploitation step.
+- **LLM uncertainty scalar**: default `4.33`, the paper's `gpt-4/topk`
+  recalibration factor. It multiplies LLM predictive standard deviations before
+  acquisition scoring and plotting.
 
 Click **Run & Append** to add the current configuration to the plot. Completed
 runs stay in the saved campaign and are not overwritten by later runs.
@@ -156,6 +159,13 @@ The **Add Result** panel searches the full available candidate pool by row
 number or procedure text, so large pools do not need a huge dropdown. Suggested
 candidates still appear first, and you can also type a manual procedure when a
 result does not correspond to an uploaded pool row.
+
+Repeated measurements of the same candidate are preserved as individual rows in
+the **Observations** table, CSV export, and campaign archive. The live plot
+collapses those repeats into one candidate marker using the replicate mean and
+sample standard deviation, and the live best-so-far line is chosen by the
+highest replicate mean. If a candidate has only one measurement, that single
+value is used.
 
 Live observations autosave once a campaign has been saved. If you enter a test
 or incorrect value, delete it from the **Observations** table; the campaign is
@@ -224,6 +234,10 @@ and plot history.
   Runtime scales with `shortlist x samples x BO iterations x replicates`; the
   resulting mean/std are stored for selected points and plotted as prediction
   error bars.
+- **LLM uncertainty scalar**: editable multiplier applied to the predictive
+  standard deviation from LLM samples. `4.33` matches the paper's calibrated
+  `gpt-4/topk` uncertainty scaling; use `1` for uncalibrated sample spread or
+  `0` to disable multiplicative scaling.
 - **Auto target multiplier/jitter/floor**: controls the automatic inverse-design
   target used for shortlist retrieval.
 

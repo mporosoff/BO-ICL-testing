@@ -186,6 +186,7 @@ def test_defaults_match_paper_style_numeric_settings():
     assert DEFAULT_CONFIG["objective_upper_bound"] == ""
     assert DEFAULT_CONFIG["ucb_lambda"] == 0.1
     assert DEFAULT_CONFIG["llm_samples"] == 3
+    assert DEFAULT_CONFIG["llm_uncertainty_calibration"] == 4.33
     assert DEFAULT_CONFIG["llm_pool_scope"] == "full"
     assert DEFAULT_CONFIG["inverse_filter"] == 16
     assert DEFAULT_CONFIG["inverse_random_candidates"] == 0
@@ -695,6 +696,7 @@ def test_live_observation_keeps_model_prediction_for_plot_and_export(tmp_path):
             "inverse_model": "gpt-4o",
             "embedding_model": "text-embedding-ada-002",
             "llm_samples": 3,
+            "llm_uncertainty_calibration": 4.33,
             "inverse_filter": 16,
             "inverse_seed": "target-like generated procedure",
         }
@@ -722,11 +724,37 @@ def test_live_observation_keeps_model_prediction_for_plot_and_export(tmp_path):
     assert rows[0]["prediction_model"] == "gpt-4o"
     assert rows[0]["embedding_model"] == "text-embedding-ada-002"
     assert rows[0]["prediction_llm_samples"] == "3"
+    assert rows[0]["prediction_llm_uncertainty_calibration"] == "4.33"
     assert rows[0]["prediction_inverse_filter"] == "16"
     assert rows[0]["prediction_inverse_seed"] == "target-like generated procedure"
     assert rows[0]["alpha phase (%)_uncertainty"] == "0.6"
     assert "<th>Model / Acq.</th>" in INDEX_HTML
     assert "<th>Method</th>" in INDEX_HTML
+
+
+def test_live_plot_collapses_candidate_replicates_but_preserves_raw_rows(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset(
+        "alpha_pool.csv",
+        b"procedure,alpha phase (%)\nproc a,\nproc b,\n",
+        objective_name="alpha phase (%)",
+    )
+
+    state.add_observation({"candidate_id": "cand-0", "value": 10.0})
+    state.add_observation({"candidate_id": "cand-1", "value": 12.0})
+    payload = state.add_observation({"candidate_id": "cand-0", "value": 14.0})
+
+    assert len(payload["observations"]) == 3
+    points = payload["live_observation_points"]
+    assert len(points) == 2
+    assert points[0]["value"] == 12.0
+    assert round(points[0]["replicate_std"], 6) == round(2**0.5 * 2, 6)
+    assert points[0]["replicate_count"] == 2
+    assert [point["best"] for point in payload["best_trace"]] == [12.0, 12.0]
+    assert payload["best_trace"][0]["best_replicate_count"] == 2
+
+    rows = list(csv.DictReader(StringIO(state.export_observations_csv())))
+    assert len([row for row in rows if row["source"] == "live"]) == 3
 
 
 def test_config_change_clears_stale_model_suggestions(tmp_path):
@@ -758,10 +786,14 @@ def test_llm_model_keeps_original_units_when_target_scaling_is_enabled(
     import boicl as boicl_pkg
 
     told_values = []
+    calibration_values = []
 
     class FakeAskTellFewShotTopk:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+
+        def set_calibration_factor(self, value):
+            calibration_values.append(value)
 
         def tell(self, procedure, value):
             told_values.append((procedure, value))
@@ -789,6 +821,7 @@ def test_llm_model_keeps_original_units_when_target_scaling_is_enabled(
         ("zero procedure", 0.0),
         ("best procedure", 100.0),
     ]
+    assert calibration_values == [4.33]
     assert state._inverse_target_model_value(scaler, [observations[0]]) == 5.0
 
 
@@ -849,7 +882,7 @@ def test_prediction_summary_combines_offline_replicate_predictions(tmp_path):
 
     assert summary[0]["index"] == 1
     assert summary[0]["mean"] == 12.0
-    assert round(summary[0]["std"], 6) == round((4.0 + 5.0) ** 0.5, 6)
+    assert round(summary[0]["std"], 6) == round((8.0 + 5.0) ** 0.5, 6)
 
 
 def test_live_random_walk_records_control_points_and_exports_them(tmp_path):
