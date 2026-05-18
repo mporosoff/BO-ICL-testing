@@ -17,6 +17,9 @@ Paper: [Bayesian Optimization of Catalysts With In-context Learning](https://arx
 - Uses either BO-ICL LLM scoring or GPR over cached embeddings.
 - Lets you choose embedding, prediction LLM, inverse-design LLM, acquisition
   function, replicate count, BO iteration count, and rate-limit controls.
+- Plots selected-model predictions with uncertainty separately from measured
+  values.
+- Supports a live random-walk control trajectory for unlabeled live campaigns.
 - Saves API keys only to a local ignored `.env` file.
 - Saves campaigns under `saved_experiments/` so multi-day campaigns can be
   resumed without re-uploading data.
@@ -99,6 +102,9 @@ Typical settings:
 
 Click **Run & Append** to add the current configuration to the plot. Completed
 runs stay in the saved campaign and are not overwritten by later runs.
+For LLM and GPR-selected BO points, the plot also shows the model's predicted
+objective and uncertainty as separate prediction markers with error bars; the
+measured values remain the best-so-far trajectory.
 
 To compare controlled configurations on the same dataset, keep the campaign
 loaded, change the settings, and click **Run & Append** again. For example, run
@@ -142,6 +148,17 @@ number or procedure text, so large pools do not need a huge dropdown. Suggested
 candidates still appear first, and you can also type a manual procedure when a
 result does not correspond to an uploaded pool row.
 
+Live observations autosave once a campaign has been saved. If you enter a test
+or incorrect value, delete it from the **Observations** table; the campaign is
+autosaved again and suggestions should be updated before choosing the next
+experiment.
+
+The **Live Random Walk** panel is a live-control trajectory for unlabeled
+campaigns. Set the point count, click **Start / Next Random**, run the random
+candidate, enter its measured value and optional uncertainty, and click **Add
+Random Result**. It is plotted separately from the optimizer trajectory and is
+saved/exported with the campaign.
+
 Pool Builder exports live pools with a `procedure` column plus the selected
 objective column, such as `alpha phase (%)`. The objective cells are blank until
 measurements are available, so the runner treats the pool as unlabeled live
@@ -150,26 +167,32 @@ offline benchmark dataset.
 
 Use **Save** in the campaign panel so the pool, settings, observations,
 suggestions, inverse designs, and benchmark runs can be loaded later.
-Use **Start Fresh** when you want a clean browser state for a new dataset or
-campaign without deleting saved campaigns on disk.
+Use **Delete Saved** to remove a selected old test campaign from the local
+`saved_experiments/` folder. Use **Start Fresh** when you want a clean browser
+state for a new dataset or campaign without deleting saved campaigns on disk.
 
 If you import a new dataset or a Pool Builder pool while another project is
 loaded, the app saves the current project first and then creates a separate
-clean campaign for the new import. This prevents a multi-day campaign from
-being overwritten by a new pool.
+clean campaign for the new import. Model/optimizer settings such as BO-ICL LLM
+versus GPR are preserved so the app does not silently switch engines; use
+**Start Fresh** when you intentionally want default settings. This prevents a
+multi-day campaign from being overwritten by a new pool.
 
 ## Outputs
 
-**Export Observations CSV** writes live observations and offline benchmark rows
+**Export Observations CSV** writes live observations, live random-walk rows, and
+offline benchmark rows
 with campaign name/id, dataset filename/id, candidate id/row, active settings,
-per-run settings, timestamps, procedures, objectives, and uncertainties. Export
-filenames include the campaign name, dataset stem, and export timestamp so they
-can be matched back to a saved experiment.
+per-run settings, timestamps, procedures, objectives, measurement
+uncertainties, and any stored prediction mean/uncertainty/acquisition metadata.
+Export filenames include the campaign name, dataset stem, and export timestamp
+so they can be matched back to a saved experiment.
 
 **Export Archive** writes a portable JSON snapshot of the current campaign state
 without API keys. **Import Archive** reloads that snapshot and saves it as a
 local campaign, including the pool, labels, settings, observations, suggestions,
-inverse designs, benchmark runs, and plot history.
+inverse designs, live random-walk control, benchmark runs, stored predictions,
+and plot history.
 
 ## LLM BO-ICL Settings
 
@@ -178,15 +201,27 @@ inverse designs, benchmark runs, and plot history.
   query for shortlist construction.
 - **Embedding model**: model used for GPR features and inverse-filter nearest
   neighbor retrieval.
-- **Broad pool**: wider candidate subset considered first.
-- **LLM shortlist**: number of candidates retrieved from the broad pool using
-  inverse design plus cached embeddings.
+- **Broad pool**: GPR scoring cap. In LLM mode it is used only when LLM
+  shortlist is `0` or when `LLM pool scope` is set to the fast broad-pool mode.
+- **LLM shortlist**: number of candidates retrieved using inverse design plus
+  cached embeddings before LLM scoring.
+- **LLM pool scope**: `Full pool (paper)` searches all available candidates,
+  matching the paper notebook. `Broad random pool (fast)` randomly prefilters to
+  Broad pool size, then runs the same MMR/cosine shortlist step inside that
+  subset.
 - **Random add-ons**: extra random candidates added to the shortlist for
   diversity.
 - **LLM samples**: repeated LLM prediction samples per shortlisted candidate.
-  Runtime scales with `shortlist x samples x BO iterations x replicates`.
+  Runtime scales with `shortlist x samples x BO iterations x replicates`; the
+  resulting mean/std are stored for selected points and plotted as prediction
+  error bars.
 - **Auto target multiplier/jitter/floor**: controls the automatic inverse-design
   target used for shortlist retrieval.
+
+In the suggestions table, **Mean** is the LLM-predicted objective value in the
+original objective units, while **Acq** is the acquisition score used to rank the
+candidate. The inverse-design target is only a retrieval query for building the
+shortlist; candidate means do not have to equal that target.
 
 For sparse phase data with many zeros, set an **Auto target floor** such as
 `5` or `10` so the inverse-design query does not stay pinned at zero.
@@ -228,7 +263,7 @@ Run:
 
 The current local suite includes tests for dataset import, campaign save/load,
 offline benchmark progress/resume behavior, model selectors, LLM one-seed
-scoring, and plot numbering.
+scoring, prediction export, live random-walk controls, and plot numbering.
 
 ## Paper Package API
 

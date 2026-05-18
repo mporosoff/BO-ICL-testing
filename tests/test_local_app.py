@@ -6,6 +6,7 @@ from io import BytesIO, StringIO
 import numpy as np
 
 from boicl import AskTellFewShotTopk, Pool
+from boicl.llm_model import GaussDist
 from boicl.local_app import (
     DEFAULT_CONFIG,
     DEFAULT_PREDICTION_SYSTEM_MESSAGE,
@@ -109,8 +110,15 @@ def test_main_app_candidate_labels_surface_variable_values():
     assert "Clear & Re-run" in INDEX_HTML
     assert "Export Archive" in INDEX_HTML
     assert "Import Archive" in INDEX_HTML
+    assert "Delete Saved" in INDEX_HTML
+    assert "button-grid" in INDEX_HTML
+    assert "tooltip-target" in INDEX_HTML
+    assert "engineStatus" in INDEX_HTML
+    assert "llmPoolScope" in INDEX_HTML
     assert "candidateSearch" in INDEX_HTML
     assert "/api/candidate-search" in INDEX_HTML
+    assert "/api/delete-campaign" in INDEX_HTML
+    assert "/api/delete-observation" in INDEX_HTML
     assert "Pool Builder imported" in INDEX_HTML
     assert "boicl-focus-runner" in INDEX_HTML
     assert "BroadcastChannel" in INDEX_HTML
@@ -176,6 +184,7 @@ def test_defaults_match_paper_style_numeric_settings():
     assert DEFAULT_CONFIG["benchmark_starting_baseline"] == "none"
     assert DEFAULT_CONFIG["ucb_lambda"] == 0.1
     assert DEFAULT_CONFIG["llm_samples"] == 3
+    assert DEFAULT_CONFIG["llm_pool_scope"] == "full"
     assert DEFAULT_CONFIG["inverse_filter"] == 16
     assert DEFAULT_CONFIG["inverse_random_candidates"] == 0
     assert DEFAULT_CONFIG["inverse_target_multiplier"] == 1.2
@@ -534,8 +543,8 @@ def test_import_dataset_saves_active_project_and_starts_new_campaign(tmp_path):
     assert payload["campaign"]["saved"] is True
     assert payload["campaign"]["id"] != old_id
     assert payload["dataset"]["filename"] == "new_pool.csv"
-    assert payload["config"]["optimizer"] == DEFAULT_CONFIG["optimizer"]
-    assert payload["config"]["benchmark_iterations"] == DEFAULT_CONFIG["benchmark_iterations"]
+    assert payload["config"]["optimizer"] == "llm"
+    assert payload["config"]["benchmark_iterations"] == 9
     assert payload["candidate_count"] == 1
     assert payload["observations"] == []
     old_payload = json.loads(
@@ -547,6 +556,30 @@ def test_import_dataset_saves_active_project_and_starts_new_campaign(tmp_path):
     assert len(old_payload["observations"]) == 1
     new_id = payload["campaign"]["id"]
     assert (tmp_path / "saved_experiments" / new_id / "campaign.json").exists()
+
+
+def test_delete_observation_removes_live_row_and_autosaves(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset("live_pool.csv", b"procedure\nproc a\nproc b\n")
+    saved = state.save_campaign({"name": "Live delete"})
+    state.add_observation({"candidate_id": "cand-0", "value": 4.0})
+    state.add_observation({"candidate_id": "cand-1", "value": 6.0})
+
+    payload = state.delete_observation({"id": "obs-1"})
+
+    assert [obs["id"] for obs in payload["observations"]] == ["obs-2"]
+    assert payload["available_count"] == 1
+    saved_payload = json.loads(
+        (
+            tmp_path
+            / "saved_experiments"
+            / saved["campaign"]["id"]
+            / "campaign.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert [obs["id"] for obs in saved_payload["observations"]] == ["obs-2"]
+    state.add_observation({"candidate_id": "cand-0", "value": 8.0})
+    assert [obs["id"] for obs in state.observations] == ["obs-2", "obs-3"]
 
 
 def test_import_campaign_archive_restores_and_saves_copy(tmp_path):
@@ -593,6 +626,21 @@ def test_start_fresh_clears_loaded_state_without_deleting_saves(tmp_path):
     assert (tmp_path / "saved_experiments" / saved["campaign"]["id"] / "campaign.json").exists()
 
 
+def test_delete_campaign_removes_saved_folder_and_clears_active_save(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset("dataset.csv", b"procedure,value\nproc a,1\n")
+    saved = state.save_campaign({"name": "Delete me"})
+    campaign_id = saved["campaign"]["id"]
+
+    payload = state.delete_campaign({"id": campaign_id})
+
+    assert payload["campaign"]["saved"] is False
+    assert payload["campaign"]["name"] == ""
+    assert not (tmp_path / "saved_experiments" / campaign_id).exists()
+    assert all(campaign["id"] != campaign_id for campaign in payload["campaigns"])
+    assert "Deleted saved campaign: Delete me." in payload["last_model_status"]
+
+
 def test_export_observations_csv_includes_dataset_and_settings_metadata(tmp_path):
     state = LocalBOState(tmp_path)
     state.import_dataset(
@@ -619,6 +667,87 @@ def test_export_observations_csv_includes_dataset_and_settings_metadata(tmp_path
     assert state.export_observations_filename().startswith(
         "boicl_alpha_campaign_alpha_pool_"
     )
+
+
+def test_live_observation_keeps_model_prediction_for_plot_and_export(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset(
+        "alpha_pool.csv",
+        b"procedure,alpha phase (%)\nproc a,\nproc b,\n",
+        objective_name="alpha phase (%)",
+    )
+    state.suggestions = [
+        {
+            "candidate_id": "cand-0",
+            "procedure": "proc a",
+            "acquisition": 1.25,
+            "mean": 42.0,
+            "std": 3.5,
+            "source": "llm",
+            "prediction_model": "gpt-4o",
+            "inverse_model": "gpt-4o",
+        }
+    ]
+
+    payload = state.add_observation(
+        {"candidate_id": "cand-0", "value": 44.0, "uncertainty": 0.6}
+    )
+
+    observation = payload["observations"][0]
+    assert observation["prediction"]["mean"] == 42.0
+    assert observation["prediction"]["std"] == 3.5
+
+    rows = list(csv.DictReader(StringIO(state.export_observations_csv())))
+    assert rows[0]["prediction_mean"] == "42.0"
+    assert rows[0]["prediction_uncertainty"] == "3.5"
+    assert rows[0]["prediction_acquisition"] == "1.25"
+    assert rows[0]["prediction_model"] == "gpt-4o"
+    assert rows[0]["alpha phase (%)_uncertainty"] == "0.6"
+
+
+def test_prediction_summary_combines_offline_replicate_predictions(tmp_path):
+    state = LocalBOState(tmp_path)
+    summary = state._summarize_prediction_points(
+        [
+            [{"prediction": {"mean": 10.0, "std": 1.0}}],
+            [{"prediction": {"mean": 14.0, "std": 3.0}}],
+        ]
+    )
+
+    assert summary[0]["index"] == 1
+    assert summary[0]["mean"] == 12.0
+    assert round(summary[0]["std"], 6) == round((4.0 + 5.0) ** 0.5, 6)
+
+
+def test_live_random_walk_records_control_points_and_exports_them(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset(
+        "alpha_pool.csv",
+        b"procedure,alpha phase (%)\nproc a,\nproc b,\nproc c,\n",
+        objective_name="alpha phase (%)",
+    )
+
+    payload = state.start_live_random_walk({"target_count": 2, "seed": 5})
+    assert payload["live_random_walk"]["status"] == "waiting_for_result"
+    assert payload["live_random_walk"]["current_candidate"]["id"]
+
+    first_candidate = payload["live_random_walk"]["current_candidate"]["id"]
+    payload = state.add_live_random_walk_result({"value": 11.0, "uncertainty": 0.4})
+
+    walk = payload["live_random_walk"]
+    assert len(walk["observations"]) == 1
+    assert walk["observations"][0]["candidate_id"] == first_candidate
+    assert walk["observations"][0]["uncertainty"] == 0.4
+    assert payload["live_random_walk_trace"][0]["index"] == 1
+    assert payload["live_random_walk_trace"][0]["best"] == 11.0
+
+    rows = list(csv.DictReader(StringIO(state.export_observations_csv())))
+    random_row = next(row for row in rows if row["source"] == "live_random_walk")
+    assert random_row["run_name"] == "Live random walk"
+    assert random_row["experiment_count"] == "1"
+    assert random_row["alpha phase (%)"] == "11.0"
+    assert random_row["alpha phase (%)_uncertainty"] == "0.4"
+    assert '"target_count": 2' in random_row["run_settings_json"]
 
 
 def test_embedding_cache_status_counts_current_dataset_and_model(tmp_path):
@@ -860,9 +989,115 @@ def test_llm_scored_candidate_count_uses_shortlist(tmp_path):
 
     assert state._llm_scored_candidate_count(500) == 20
 
+    state.update_config({"score_limit": 10, "llm_pool_scope": "broad"})
+
+    assert state._llm_scored_candidate_count(500) == 10
+
     state.update_config({"inverse_filter": 0})
 
-    assert state._llm_scored_candidate_count(500) == 250
+    assert state._llm_scored_candidate_count(500) == 10
+
+
+def test_live_llm_shortlist_uses_full_available_pool_after_one_seed(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    state = LocalBOState(tmp_path)
+    rows = ["procedure", *[f"proc {index}" for index in range(10)]]
+    state.import_dataset("pool.csv", "\n".join(rows).encode("utf-8"))
+    state.update_config(
+        {
+            "optimizer": "llm",
+            "batch_size": 1,
+            "score_limit": 3,
+            "inverse_filter": 2,
+            "inverse_random_candidates": 0,
+        }
+    )
+    state.add_observation({"candidate_id": "cand-0", "value": 1})
+
+    class FakeModel:
+        def ask(self, *args, **kwargs):
+            raise AssertionError("live LLM scoring should bypass the <2-example fallback")
+
+        def predict(self, possible_x, system_message=""):
+            assert system_message
+            return [
+                GaussDist(8.5, 0.7) if procedure == "proc 8" else GaussDist(7.0, 0.2)
+                for procedure in possible_x
+            ]
+
+    seen = {"retrieval_counts": []}
+    targets = iter([10.0, 12.0])
+
+    state._build_llm_model = lambda observations=None: (FakeModel(), {"mode": "off"})
+    state._inverse_target_display_value = lambda *args, **kwargs: next(targets)
+    state._generate_inverse_text = lambda *args, **kwargs: "same inverse proposal"
+
+    def fake_cached_sample(procedures, query, k, lambda_mult=0.5):
+        seen["retrieval_counts"].append(len(procedures))
+        return procedures[-k:]
+
+    state._cached_approx_sample = fake_cached_sample
+
+    payload = state.suggest()
+    suggestion = payload["suggestions"][0]
+
+    assert seen["retrieval_counts"] == [9]
+    assert suggestion["procedure"] == "proc 8"
+    assert suggestion["acquisition"] == 8.57
+    assert suggestion["mean"] == 8.5
+    assert suggestion["std"] == 0.7
+    assert len(payload["inverse_designs"]) == 1
+
+    payload = state.suggest()
+
+    assert seen["retrieval_counts"] == [9, 9]
+    assert len(payload["inverse_designs"]) == 1
+    assert payload["inverse_designs"][0]["target"] == 12.0
+
+
+def test_live_llm_shortlist_can_prefilter_with_broad_pool(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    state = LocalBOState(tmp_path)
+    rows = ["procedure", *[f"proc {index}" for index in range(10)]]
+    state.import_dataset("pool.csv", "\n".join(rows).encode("utf-8"))
+    state.update_config(
+        {
+            "optimizer": "llm",
+            "batch_size": 1,
+            "score_limit": 3,
+            "llm_pool_scope": "broad",
+            "inverse_filter": 2,
+            "inverse_random_candidates": 0,
+        }
+    )
+    state.add_observation({"candidate_id": "cand-0", "value": 1})
+
+    class FakeModel:
+        def predict(self, possible_x, system_message=""):
+            return [
+                GaussDist(3.0, 1.0) if index == 0 else GaussDist(1.0, 0.1)
+                for index, _ in enumerate(possible_x)
+            ]
+
+    seen = {"retrieval_counts": []}
+    state._build_llm_model = lambda observations=None: (FakeModel(), {"mode": "off"})
+    state._inverse_target_display_value = lambda *args, **kwargs: 10.0
+    state._generate_inverse_text = lambda *args, **kwargs: "target proposal"
+
+    def fake_cached_sample(procedures, query, k, lambda_mult=0.5):
+        seen["retrieval_counts"].append(len(procedures))
+        return procedures[:k]
+
+    state._cached_approx_sample = fake_cached_sample
+
+    payload = state.suggest()
+
+    assert seen["retrieval_counts"] == [3]
+    assert payload["suggestions"][0]["acquisition"] == 3.1
+    assert payload["suggestions"][0]["mean"] == 3.0
+    assert payload["suggestions"][0]["std"] == 1.0
 
 
 def test_api_retry_recovers_from_rate_limit_message(tmp_path):

@@ -20,6 +20,7 @@ import time
 import traceback
 import webbrowser
 from dataclasses import dataclass, field
+from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -112,6 +113,7 @@ DEFAULT_CONFIG = {
     "inverse_system_message": DEFAULT_INVERSE_SYSTEM_MESSAGE,
     "llm_samples": 3,
     "selector_k": 0,
+    "llm_pool_scope": "full",
     "inverse_filter": 16,
     "inverse_random_candidates": 0,
     "inverse_target_value": "",
@@ -167,6 +169,7 @@ BENCHMARK_RESUME_MATCH_KEYS = [
     "inverse_model",
     "llm_samples",
     "selector_k",
+    "llm_pool_scope",
     "inverse_filter",
     "inverse_random_candidates",
     "inverse_target_multiplier",
@@ -499,6 +502,17 @@ def _unscale_target(value: float, direction: str, scaler: Dict[str, float]) -> f
     return _display_value(target, direction)
 
 
+def _unscale_uncertainty(value: Optional[float], scaler: Dict[str, float]) -> Optional[float]:
+    if value is None:
+        return None
+    scale = 1.0
+    if scaler.get("mode") == "minmax":
+        scale = float(scaler["span"])
+    elif scaler.get("mode") == "zscore":
+        scale = float(scaler["std"])
+    return abs(float(value) * scale)
+
+
 def _group_training_observations(
     observations: List[Dict[str, Any]], direction: str, scaling_mode: str
 ) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
@@ -650,6 +664,7 @@ class LocalBOState:
     suggestions: List[Dict[str, Any]] = field(default_factory=list)
     inverse_designs: List[Dict[str, Any]] = field(default_factory=list)
     benchmark_runs: List[Dict[str, Any]] = field(default_factory=list)
+    live_random_walk: Dict[str, Any] = field(default_factory=dict)
     events: List[Dict[str, str]] = field(default_factory=list)
     last_error: Optional[str] = None
     last_model_status: str = "No dataset loaded."
@@ -831,6 +846,9 @@ class LocalBOState:
                     "candidate_count": len(payload.get("candidates", [])),
                     "observation_count": len(payload.get("observations", [])),
                     "benchmark_count": len(payload.get("benchmark_runs", [])),
+                    "random_walk_count": len(
+                        (payload.get("live_random_walk") or {}).get("observations") or []
+                    ),
                 }
             )
         campaigns.sort(key=lambda item: item.get("updated", ""), reverse=True)
@@ -866,6 +884,7 @@ class LocalBOState:
             "suggestions": self.suggestions,
             "inverse_designs": self.inverse_designs,
             "benchmark_runs": self.benchmark_runs,
+            "live_random_walk": self.live_random_walk,
             "last_model_status": self.last_model_status,
             "progress": self.progress,
             "events": self.events[:20],
@@ -900,6 +919,7 @@ class LocalBOState:
             or self.suggestions
             or self.inverse_designs
             or self.benchmark_runs
+            or self.live_random_walk
         )
 
     def _default_import_campaign_name(self, filename: str) -> str:
@@ -1061,12 +1081,17 @@ class LocalBOState:
                 "suggestions": self.suggestions,
                 "inverse_designs": self.inverse_designs,
                 "benchmark_runs": self.benchmark_runs,
+                "live_random_walk": self.live_random_walk,
                 "events": self.events,
                 "last_error": self.last_error,
                 "last_model_status": self.last_model_status,
                 "progress": self.progress,
                 "best_trace": _best_trace(
                     active_observations, self.config["objective_direction"]
+                ),
+                "live_random_walk_trace": _best_trace(
+                    self.live_random_walk.get("observations") or [],
+                    self.config["objective_direction"],
                 ),
                 "random_walk_trace": _paper_random_trace(
                     labelled_values,
@@ -1315,6 +1340,7 @@ class LocalBOState:
             self.suggestions = list(data.get("suggestions") or [])
             self.inverse_designs = list(data.get("inverse_designs") or [])
             self.benchmark_runs = list(data.get("benchmark_runs") or [])
+            self.live_random_walk = dict(data.get("live_random_walk") or {})
             self.progress = data.get("progress") or self.progress
             if self.progress.get("status") == "running":
                 partial = self.progress.get("partial_run")
@@ -1381,6 +1407,7 @@ class LocalBOState:
             self.suggestions = list(data.get("suggestions") or [])
             self.inverse_designs = list(data.get("inverse_designs") or [])
             self.benchmark_runs = list(data.get("benchmark_runs") or [])
+            self.live_random_walk = dict(data.get("live_random_walk") or {})
             self.progress = data.get("progress") or {
                 "status": "idle",
                 "label": "",
@@ -1425,6 +1452,7 @@ class LocalBOState:
             self.suggestions = []
             self.inverse_designs = []
             self.benchmark_runs = []
+            self.live_random_walk = {}
             self.campaign_id = None
             self.campaign_name = ""
             self.dataset_id = ""
@@ -1455,6 +1483,13 @@ class LocalBOState:
         if root not in path.parents or not path.exists():
             raise ValueError("Saved campaign was not found.")
         with self.lock:
+            saved_name = campaign_id
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                meta = data.get("meta", {}) if isinstance(data, dict) else {}
+                saved_name = str(meta.get("name") or campaign_id)
+            except (OSError, json.JSONDecodeError):
+                saved_name = campaign_id
             path.unlink()
             try:
                 path.parent.rmdir()
@@ -1463,8 +1498,8 @@ class LocalBOState:
             if self.campaign_id == campaign_id:
                 self.campaign_id = None
                 self.campaign_name = ""
-            self.last_model_status = "Deleted saved campaign."
-            self.log("Deleted saved campaign.")
+            self.last_model_status = f"Deleted saved campaign: {saved_name}."
+            self.log(f"Deleted saved campaign '{saved_name}'.")
             return self.to_json()
 
     def active_observations(self) -> List[Dict[str, Any]]:
@@ -1536,9 +1571,6 @@ class LocalBOState:
 
         with self.lock:
             previous_project = self._save_current_and_branch_for_import_locked(filename)
-            if previous_project:
-                self.config = dict(DEFAULT_CONFIG)
-                self.objective_names = ["objective"]
             self.dataset_filename = Path(filename).name
             self.dataset_id = _dataset_identifier(filename, raw)
             self.dataset_imported_at = _now()
@@ -1547,6 +1579,7 @@ class LocalBOState:
             self.suggestions = []
             self.inverse_designs = []
             self.benchmark_runs = []
+            self.live_random_walk = {}
             self.progress = {
                 "status": "idle",
                 "label": "",
@@ -1558,8 +1591,10 @@ class LocalBOState:
             }
             self.cancel_event.clear()
             self.last_error = None
+            engine = "BO-ICL LLM" if self.config["optimizer"] == "llm" else "GPR"
             self.last_model_status = (
-                "Dataset loaded. Add live observations or run an offline benchmark."
+                f"Dataset loaded with {engine} engine. Add live observations or "
+                "run an offline benchmark."
             )
             if value_columns:
                 self.objective_names = [str(column) for column in value_columns]
@@ -1676,6 +1711,8 @@ class LocalBOState:
                 self.config["objective_scaling"] = "off"
             if self.config["plot_stat_guides"] not in PLOT_STAT_GUIDES:
                 self.config["plot_stat_guides"] = "max"
+            if self.config.get("llm_pool_scope") not in {"full", "broad"}:
+                self.config["llm_pool_scope"] = "full"
             if self.config["benchmark_starting_baseline"] not in BENCHMARK_STARTING_BASELINES:
                 self.config["benchmark_starting_baseline"] = "none"
             self.config["batch_size"] = max(1, min(25, int(self.config["batch_size"])))
@@ -1743,6 +1780,7 @@ class LocalBOState:
             raise ValueError("Objective value must be numeric.")
         uncertainty = _coerce_float(payload.get("uncertainty"))
         with self.lock:
+            prediction = self._matching_prediction_locked(candidate_id, procedure)
             objective = self.config["objective_name"]
             if objective not in self.objective_names:
                 self.objective_names.append(objective)
@@ -1751,6 +1789,7 @@ class LocalBOState:
                 {objective: value},
                 {objective: uncertainty} if uncertainty is not None else {},
                 candidate_id,
+                prediction=prediction,
             )
             self.refresh_active_objective()
             self.suggestions = []
@@ -1760,12 +1799,167 @@ class LocalBOState:
             self._autosave_locked()
             return self.to_json()
 
+    def delete_observation(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        obs_id = str(payload.get("id") or "").strip()
+        if not obs_id:
+            raise ValueError("Choose an observation to delete.")
+        with self.lock:
+            index = next(
+                (
+                    idx
+                    for idx, obs in enumerate(self.observations)
+                    if str(obs.get("id") or "") == obs_id
+                ),
+                None,
+            )
+            if index is None:
+                raise ValueError("Observation was not found.")
+            removed = self.observations.pop(index)
+            self.refresh_active_objective()
+            self.suggestions = []
+            self.last_error = None
+            self.last_model_status = "Observation deleted. Suggestions need an update."
+            self.log(
+                f"Deleted observation {obs_id} with value {removed.get('value')}."
+            )
+            self._autosave_locked()
+            return self.to_json()
+
+    def _random_walk_available_locked(self) -> List[Dict[str, Any]]:
+        walk = self.live_random_walk or {}
+        used_ids = {
+            obs.get("candidate_id")
+            for obs in walk.get("observations", [])
+            if obs.get("candidate_id")
+        }
+        current_id = (walk.get("current_candidate") or {}).get("id")
+        if current_id:
+            used_ids.add(current_id)
+        return [
+            candidate
+            for candidate in self.available_candidates()
+            if candidate["id"] not in used_ids
+        ]
+
+    def _select_live_random_candidate_locked(self) -> Optional[Dict[str, Any]]:
+        available = self._random_walk_available_locked()
+        if not available:
+            return None
+        seed = int(self.live_random_walk.get("seed") or 0)
+        observations = self.live_random_walk.get("observations") or []
+        rng = random.Random(seed + len(observations))
+        return self.public_candidate(rng.choice(available))
+
+    def start_live_random_walk(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        with self.lock:
+            if not self.candidates:
+                raise ValueError("Import or build a candidate pool first.")
+            reset = bool(payload.get("reset"))
+            if reset or not self.live_random_walk:
+                self.live_random_walk = {
+                    "target_count": 0,
+                    "seed": int(payload.get("seed") or random.randint(1, 1_000_000)),
+                    "observations": [],
+                    "current_candidate": None,
+                    "status": "idle",
+                }
+            target_count = max(
+                len(self.live_random_walk.get("observations") or []),
+                int(payload.get("target_count") or 0),
+            )
+            if target_count <= 0:
+                target_count = max(1, len(self.active_observations()))
+            self.live_random_walk["target_count"] = target_count
+            if payload.get("seed") not in (None, ""):
+                self.live_random_walk["seed"] = int(payload.get("seed"))
+            observations = self.live_random_walk.get("observations") or []
+            if len(observations) >= target_count:
+                self.live_random_walk["current_candidate"] = None
+                self.live_random_walk["status"] = "complete"
+            elif not self.live_random_walk.get("current_candidate"):
+                candidate = self._select_live_random_candidate_locked()
+                if candidate is None:
+                    self.live_random_walk["status"] = "complete"
+                    self.live_random_walk["current_candidate"] = None
+                else:
+                    self.live_random_walk["current_candidate"] = candidate
+                    self.live_random_walk["status"] = "waiting_for_result"
+            else:
+                self.live_random_walk["status"] = "waiting_for_result"
+            self.last_model_status = "Live random walk updated."
+            self.log("Updated live random walk.")
+            self._autosave_locked()
+            return self.to_json()
+
+    def add_live_random_walk_result(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        value = _coerce_float(payload.get("value"))
+        if value is None:
+            raise ValueError("Random walk objective value must be numeric.")
+        uncertainty = _coerce_float(payload.get("uncertainty"))
+        with self.lock:
+            walk = self.live_random_walk or {}
+            candidate = walk.get("current_candidate") or {}
+            if not candidate:
+                raise ValueError("Select the next random-walk candidate first.")
+            objective = self.config["objective_name"]
+            observations = list(walk.get("observations") or [])
+            next_id = 1 + max(
+                [
+                    int(str(obs.get("id", "rw-0")).split("-")[-1])
+                    for obs in observations
+                    if str(obs.get("id", "")).startswith("rw-")
+                    and str(obs.get("id", "")).split("-")[-1].isdigit()
+                ]
+                or [0]
+            )
+            observations.append(
+                {
+                    "id": f"rw-{next_id}",
+                    "candidate_id": candidate.get("id"),
+                    "procedure": candidate.get("procedure") or "",
+                    "objectives": {objective: float(value)},
+                    "uncertainties": {objective: float(uncertainty)}
+                    if uncertainty is not None
+                    else {},
+                    "value": float(value),
+                    "target": float(self.target_value(value)),
+                    "uncertainty": uncertainty,
+                    "time": _now(),
+                }
+            )
+            walk["observations"] = observations
+            walk["current_candidate"] = None
+            target_count = int(walk.get("target_count") or len(observations))
+            if len(observations) < target_count:
+                next_candidate = self._select_live_random_candidate_locked()
+                if next_candidate is not None:
+                    walk["current_candidate"] = next_candidate
+                    walk["status"] = "waiting_for_result"
+                else:
+                    walk["status"] = "complete"
+            else:
+                walk["status"] = "complete"
+            self.live_random_walk = walk
+            self.last_model_status = "Added live random-walk result."
+            self.log(f"Added live random-walk value {value:g}.")
+            self._autosave_locked()
+            return self.to_json()
+
+    def clear_live_random_walk(self) -> Dict[str, Any]:
+        with self.lock:
+            self.live_random_walk = {}
+            self.last_model_status = "Cleared live random walk."
+            self.log("Cleared live random walk.")
+            self._autosave_locked()
+            return self.to_json()
+
     def _add_observation_locked(
         self,
         procedure: str,
         objectives: Dict[str, float],
         uncertainties: Dict[str, float],
         candidate_id: Optional[str] = None,
+        prediction: Optional[Dict[str, Any]] = None,
     ) -> None:
         if candidate_id is None:
             match = next(
@@ -1776,21 +1970,81 @@ class LocalBOState:
         objective = self.config["objective_name"]
         value = objectives.get(objective)
         uncertainty = uncertainties.get(objective)
-        self.observations.append(
-            {
-                "id": f"obs-{len(self.observations) + 1}",
-                "candidate_id": candidate_id,
-                "procedure": procedure,
-                "objectives": {key: float(val) for key, val in objectives.items()},
-                "uncertainties": {
-                    key: float(val) for key, val in uncertainties.items() if val is not None
-                },
-                "value": float(value) if value is not None else None,
-                "target": float(self.target_value(value)) if value is not None else None,
-                "uncertainty": uncertainty,
-                "time": _now(),
-            }
+        next_id = 1 + max(
+            [
+                int(str(obs.get("id", "obs-0")).split("-")[-1])
+                for obs in self.observations
+                if str(obs.get("id", "")).startswith("obs-")
+                and str(obs.get("id", "")).split("-")[-1].isdigit()
+            ]
+            or [0]
         )
+        observation = {
+            "id": f"obs-{next_id}",
+            "candidate_id": candidate_id,
+            "procedure": procedure,
+            "objectives": {key: float(val) for key, val in objectives.items()},
+            "uncertainties": {
+                key: float(val) for key, val in uncertainties.items() if val is not None
+            },
+            "value": float(value) if value is not None else None,
+            "target": float(self.target_value(value)) if value is not None else None,
+            "uncertainty": uncertainty,
+            "time": _now(),
+        }
+        if prediction:
+            observation["prediction"] = prediction
+        self.observations.append(observation)
+
+    def _prediction_from_suggestion(
+        self, suggestion: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        if not suggestion:
+            return None
+        mean = _coerce_float(suggestion.get("mean"))
+        std = _coerce_float(suggestion.get("std"))
+        acquisition = _coerce_float(suggestion.get("acquisition"))
+        if mean is None and std is None and acquisition is None:
+            return None
+        prediction = {
+            "mean": mean,
+            "std": std,
+            "acquisition": acquisition,
+            "source": suggestion.get("source") or self.config["optimizer"],
+            "prediction_model": suggestion.get("prediction_model")
+            or self.config.get("prediction_model"),
+            "inverse_model": suggestion.get("inverse_model")
+            or self.config.get("inverse_model"),
+            "embedding_model": self.config.get("embedding_model"),
+            "time": _now(),
+        }
+        if suggestion.get("inverse_seed"):
+            prediction["inverse_seed"] = suggestion.get("inverse_seed")
+        return prediction
+
+    def _matching_prediction_locked(
+        self, candidate_id: Optional[str], procedure: str
+    ) -> Optional[Dict[str, Any]]:
+        match = None
+        if candidate_id:
+            match = next(
+                (
+                    suggestion
+                    for suggestion in self.suggestions
+                    if suggestion.get("candidate_id") == candidate_id
+                ),
+                None,
+            )
+        if match is None and procedure:
+            match = next(
+                (
+                    suggestion
+                    for suggestion in self.suggestions
+                    if suggestion.get("procedure") == procedure
+                ),
+                None,
+            )
+        return self._prediction_from_suggestion(match)
 
     def suggest(self) -> Dict[str, Any]:
         with self.lock:
@@ -1860,14 +2114,12 @@ class LocalBOState:
                     0,
                     1,
                     detail=(
-                        f"Scoring up to "
-                        f"{self._llm_scored_candidate_count(len(available)) if self.config['optimizer'] == 'llm' else min(self.config['score_limit'], len(available))} "
-                        f"candidate(s)"
-                        + (
-                            f" x {self.config['llm_samples']} LLM sample(s) "
-                            f"from a {min(self.config['score_limit'], len(available))}-candidate broad pool"
-                            if self.config["optimizer"] == "llm"
-                            else ""
+                        self._llm_scoring_detail(len(available))
+                        if self.config["optimizer"] == "llm"
+                        else (
+                            f"Scoring up to "
+                            f"{min(self.config['score_limit'], len(available))} "
+                            "candidate(s)"
                         )
                     ),
                 )
@@ -1944,16 +2196,50 @@ class LocalBOState:
             return list(available)
         return (rng or random).sample(available, score_limit)
 
+    def _llm_retrieval_pool_count(self, available_count: int) -> int:
+        available_count = int(available_count)
+        if (
+            int(self.config["inverse_filter"]) > 0
+            and self.config.get("llm_pool_scope") == "broad"
+        ):
+            return min(int(self.config["score_limit"]), available_count)
+        return available_count
+
     def _llm_scored_candidate_count(self, available_count: int) -> int:
-        broad = min(int(self.config["score_limit"]), int(available_count))
+        available_count = int(available_count)
+        broad = min(int(self.config["score_limit"]), available_count)
         inverse_count = int(self.config["inverse_filter"])
         if inverse_count <= 0:
             return broad
-        filtered = min(inverse_count, broad)
+        retrieval_pool = self._llm_retrieval_pool_count(available_count)
+        filtered = min(inverse_count, retrieval_pool)
         random_addons = min(
-            int(self.config["inverse_random_candidates"]), max(0, broad - filtered)
+            int(self.config["inverse_random_candidates"]),
+            max(0, retrieval_pool - filtered),
         )
         return filtered + random_addons
+
+    def _llm_scoring_detail(self, available_count: int) -> str:
+        scored = self._llm_scored_candidate_count(available_count)
+        detail = (
+            f"Scoring up to {scored} candidate(s)"
+            f" x {self.config['llm_samples']} LLM sample(s)"
+        )
+        if int(self.config["inverse_filter"]) > 0:
+            retrieval_pool = self._llm_retrieval_pool_count(available_count)
+            if self.config.get("llm_pool_scope") == "broad":
+                return (
+                    f"{detail} selected by inverse-design embeddings from a "
+                    f"{retrieval_pool}-candidate random broad pool"
+                )
+            return (
+                f"{detail} selected from {available_count} available candidate(s) "
+                "by inverse-design embeddings"
+            )
+        return (
+            f"{detail} from a "
+            f"{min(self.config['score_limit'], available_count)}-candidate broad pool"
+        )
 
     def _gpr_suggestions(
         self,
@@ -2019,7 +2305,9 @@ class LocalBOState:
                 )
                 if mean is not None
                 else None,
-                "std": float(std) if std is not None else None,
+                "std": _unscale_uncertainty(float(std), scaler)
+                if std is not None
+                else None,
                 "source": "gpr",
             }
             for procedure, aq, mean, std in zip(selected, acquisition, means, stds)
@@ -2045,6 +2333,72 @@ class LocalBOState:
             model.tell(obs["procedure"], obs["target"])
         return model, scaler
 
+    def _llm_acquisition_callable(self, acquisition_name: str):
+        from boicl.aqfxns import (
+            expected_improvement,
+            greedy,
+            log_expected_improvement,
+            probability_of_improvement,
+            upper_confidence_bound,
+        )
+
+        if acquisition_name == "probability_of_improvement":
+            return probability_of_improvement
+        if acquisition_name == "expected_improvement":
+            return expected_improvement
+        if acquisition_name == "log_expected_improvement":
+            return log_expected_improvement
+        if acquisition_name == "upper_confidence_bound":
+            return partial(
+                upper_confidence_bound,
+                _lambda=float(self.config["ucb_lambda"]),
+            )
+        if acquisition_name == "greedy":
+            return greedy
+        if acquisition_name == "random":
+            return None
+        raise ValueError(f"Unknown acquisition function: {acquisition_name}")
+
+    def _llm_score_procedures(
+        self,
+        model,
+        procedures: List[str],
+        best: float,
+        aq_fxn,
+        k: int,
+    ) -> Tuple[List[str], List[float], List[float], List[Optional[float]]]:
+        results = model.predict(
+            procedures,
+            system_message=self.prediction_system_message(),
+        )
+        if not isinstance(results, list):
+            results = [results]
+        scored = []
+        for procedure, dist in zip(procedures, results):
+            try:
+                if len(dist) <= 0:
+                    continue
+                scored.append(
+                    {
+                        "procedure": procedure,
+                        "acquisition": float(aq_fxn(dist, best)),
+                        "mean": float(dist.mean()),
+                        "std": None
+                        if dist.std() is None
+                        else float(dist.std()),
+                    }
+                )
+            except (TypeError, ValueError, AttributeError):
+                continue
+        scored.sort(key=lambda item: item["acquisition"], reverse=True)
+        selected = scored[:k]
+        return (
+            [item["procedure"] for item in selected],
+            [item["acquisition"] for item in selected],
+            [item["mean"] for item in selected],
+            [item["std"] for item in selected],
+        )
+
     def _llm_suggestions(
         self,
         available: List[Dict[str, Any]],
@@ -2053,14 +2407,21 @@ class LocalBOState:
         k: Optional[int] = None,
         acquisition: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        acquisition_name = acquisition or self.config["acquisition"]
         model, scaler = self._build_llm_model(observations)
-        subset = self._candidate_subset(available, rng)
-        procedures = [cand["procedure"] for cand in subset]
+        if int(self.config["inverse_filter"]) > 0:
+            if self.config.get("llm_pool_scope") == "broad":
+                candidate_pool = self._candidate_subset(available, rng)
+            else:
+                candidate_pool = list(available)
+        else:
+            candidate_pool = self._candidate_subset(available, rng)
+        procedures = [cand["procedure"] for cand in candidate_pool]
         inverse_text = None
         target_observations = (
             observations if observations is not None else self.active_observations()
         )
-        if self.config["inverse_filter"] and procedures:
+        if int(self.config["inverse_filter"]) > 0 and procedures:
             self.check_cancelled()
             inverse_target = self._inverse_target_display_value(
                 target_observations, rng=rng
@@ -2080,40 +2441,65 @@ class LocalBOState:
                 inverse_text,
                 min(int(self.config["inverse_filter"]), len(procedures)),
             )
-            remaining = [procedure for procedure in procedures if procedure not in filtered]
+            filtered_lookup = set(filtered)
+            remaining = [
+                procedure for procedure in procedures if procedure not in filtered_lookup
+            ]
             random_count = min(int(self.config["inverse_random_candidates"]), len(remaining))
             procedures = filtered + (rng or random).sample(remaining, random_count)
-            self.inverse_designs.insert(
-                0,
-                {
-                    "procedure": inverse_text,
-                    "target": inverse_target,
-                    "model": self.config["inverse_model"],
-                    "time": _now(),
-                    "source": "inverse_filter",
-                },
-            )
+            inverse_entry = {
+                "procedure": inverse_text,
+                "target": inverse_target,
+                "model": self.config["inverse_model"],
+                "time": _now(),
+                "source": "inverse_filter",
+            }
+            normalized_inverse = str(inverse_text or "").strip()
+            self.inverse_designs = [
+                design
+                for design in self.inverse_designs
+                if not (
+                    design.get("source") == "inverse_filter"
+                    and str(design.get("procedure") or "").strip()
+                    == normalized_inverse
+                )
+            ]
+            self.inverse_designs.insert(0, inverse_entry)
             self.inverse_designs = self.inverse_designs[:20]
         if not procedures:
             return self._random_suggestions(available)
 
         self.check_cancelled()
-        raw = self._api_call_with_retries(
-            "Scoring LLM candidate shortlist",
-            lambda: model.ask(
-                procedures,
-                aq_fxn=acquisition or self.config["acquisition"],
-                k=min(k or self.config["batch_size"], len(procedures)),
-                inv_filter=0,
-                aug_random_filter=len(procedures),
-                _lambda=self.config["ucb_lambda"],
-                system_message=self.prediction_system_message(),
-                inv_system_message=self.inverse_system_message(),
-            ),
-        )
+        suggestion_count = min(k or self.config["batch_size"], len(procedures))
+        by_proc = {cand["procedure"]: cand for cand in candidate_pool}
+        aq_fxn = self._llm_acquisition_callable(acquisition_name)
+        if aq_fxn is None:
+            selected = (rng or random).sample(procedures, suggestion_count)
+            acq_values = [0.0] * len(selected)
+            means = [None] * len(selected)
+            stds = [None] * len(selected)
+        else:
+            training_rows, _ = self._training_rows_and_scaler(observations)
+            targets = [
+                float(row["target"])
+                for row in training_rows
+                if row.get("target") is not None
+            ]
+            best = max(targets) if targets else 0.0
+            raw = self._api_call_with_retries(
+                "Scoring LLM candidate shortlist",
+                lambda: self._llm_score_procedures(
+                    model,
+                    procedures,
+                    best,
+                    aq_fxn,
+                    suggestion_count,
+                ),
+            )
+            selected, acq_values, means, stds = raw
         self.check_cancelled()
-        selected, acquisition, means = raw[:3]
-        by_proc = {cand["procedure"]: cand for cand in subset}
+        if not selected:
+            return self._random_suggestions(available)
         return [
             {
                 "candidate_id": by_proc[procedure]["id"],
@@ -2124,13 +2510,13 @@ class LocalBOState:
                 )
                 if mean is not None
                 else None,
-                "std": None,
+                "std": _unscale_uncertainty(std, scaler),
                 "source": "llm",
                 "prediction_model": self.config["prediction_model"],
                 "inverse_model": self.config["inverse_model"],
                 "inverse_seed": inverse_text,
             }
-            for procedure, aq, mean in zip(selected, acquisition, means)
+            for procedure, aq, mean, std in zip(selected, acq_values, means, stds)
             if procedure in by_proc
         ]
 
@@ -2310,7 +2696,7 @@ class LocalBOState:
         objective = self.config["objective_name"]
         value = float(candidate["objectives"][objective])
         uncertainty = candidate.get("uncertainties", {}).get(objective)
-        return {
+        observation = {
             "id": "",
             "candidate_id": candidate["id"],
             "procedure": candidate["procedure"],
@@ -2321,6 +2707,9 @@ class LocalBOState:
             "uncertainty": uncertainty,
             "time": _now(),
         }
+        if candidate.get("_prediction"):
+            observation["prediction"] = dict(candidate["_prediction"])
+        return observation
 
     def _missing_key_for_benchmark(self) -> Optional[str]:
         if (
@@ -2356,6 +2745,7 @@ class LocalBOState:
                 "inverse_model",
                 "llm_samples",
                 "selector_k",
+                "llm_pool_scope",
                 "inverse_filter",
                 "inverse_random_candidates",
                 "inverse_target_multiplier",
@@ -2403,10 +2793,15 @@ class LocalBOState:
         if not suggestions:
             return rng.choice(available)
         candidate_id = suggestions[0]["candidate_id"]
-        return next(
+        candidate = next(
             (candidate for candidate in available if candidate["id"] == candidate_id),
             rng.choice(available),
         )
+        candidate = dict(candidate)
+        prediction = self._prediction_from_suggestion(suggestions[0])
+        if prediction:
+            candidate["_prediction"] = prediction
+        return candidate
 
     def _benchmark_baseline_value(self, labelled: List[Dict[str, Any]]) -> Optional[float]:
         if self.config.get("benchmark_starting_baseline") != "mean":
@@ -2452,6 +2847,50 @@ class LocalBOState:
                     "lower": mean - std,
                     "upper": mean + std,
                     "count": len(values),
+                }
+            )
+        return summary
+
+    def _summarize_prediction_points(
+        self, replicate_observations: List[List[Dict[str, Any]]]
+    ) -> List[Dict[str, Any]]:
+        indexes = sorted(
+            {
+                index
+                for observations in replicate_observations
+                for index, obs in enumerate(observations, start=1)
+                if (obs.get("prediction") or {}).get("mean") is not None
+            }
+        )
+        summary = []
+        for index in indexes:
+            means = []
+            variances = []
+            for observations in replicate_observations:
+                if len(observations) < index:
+                    continue
+                prediction = observations[index - 1].get("prediction") or {}
+                mean = _coerce_float(prediction.get("mean"))
+                if mean is None:
+                    continue
+                means.append(mean)
+                std = _coerce_float(prediction.get("std"))
+                if std is not None:
+                    variances.append(float(std) ** 2)
+            if not means:
+                continue
+            mean_value = float(np.mean(means))
+            between = float(np.var(means)) if len(means) > 1 else 0.0
+            within = float(np.mean(variances)) if variances else 0.0
+            std_value = float(np.sqrt(max(0.0, between + within)))
+            summary.append(
+                {
+                    "index": index,
+                    "mean": mean_value,
+                    "std": std_value,
+                    "lower": mean_value - std_value,
+                    "upper": mean_value + std_value,
+                    "count": len(means),
                 }
             )
         return summary
@@ -2625,6 +3064,9 @@ class LocalBOState:
                 "replicate_observations": replicate_observations,
                 "replicate_traces": replicate_traces,
                 "summary": self._summarize_replicate_traces(replicate_traces),
+                "prediction_summary": self._summarize_prediction_points(
+                    replicate_observations
+                ),
                 "partial": True,
                 "status": "running",
             }
@@ -2654,6 +3096,9 @@ class LocalBOState:
                 partial_run["replicate_observations"] = obs_sets
                 partial_run["replicate_traces"] = traces
                 partial_run["summary"] = self._summarize_replicate_traces(traces)
+                partial_run["prediction_summary"] = self._summarize_prediction_points(
+                    obs_sets
+                )
 
             self.set_progress(
                 f"Running benchmark: {name}",
@@ -2673,9 +3118,7 @@ class LocalBOState:
                         else ""
                     )
                     + (
-                        f"; scoring up to {self._llm_scored_candidate_count(len(labelled))} "
-                        f"candidate(s) x "
-                        f"{self.config['llm_samples']} samples per BO step"
+                        f"; {self._llm_scoring_detail(len(labelled))} per BO step"
                         if self.config["optimizer"] == "llm"
                         else ""
                     )
@@ -2826,6 +3269,9 @@ class LocalBOState:
                 "replicate_observations": replicate_observations,
                 "replicate_traces": replicate_traces,
                 "summary": self._summarize_replicate_traces(replicate_traces),
+                "prediction_summary": self._summarize_prediction_points(
+                    replicate_observations
+                ),
                 "partial": False,
                 "status": "complete",
             }
@@ -2904,12 +3350,30 @@ class LocalBOState:
                     "candidate_id",
                     "candidate_row",
                     "procedure",
+                    "prediction_mean",
+                    "prediction_uncertainty",
+                    "prediction_acquisition",
+                    "prediction_source",
+                    "prediction_model",
+                    "inverse_model",
+                    "prediction_time",
                     *objective_fields,
                     "time",
                 ],
                 lineterminator="\n",
             )
             writer.writeheader()
+
+            def add_prediction_fields(row: Dict[str, Any], obs: Dict[str, Any]) -> None:
+                prediction = obs.get("prediction") or {}
+                row["prediction_mean"] = prediction.get("mean", "")
+                row["prediction_uncertainty"] = prediction.get("std", "")
+                row["prediction_acquisition"] = prediction.get("acquisition", "")
+                row["prediction_source"] = prediction.get("source", "")
+                row["prediction_model"] = prediction.get("prediction_model", "")
+                row["inverse_model"] = prediction.get("inverse_model", "")
+                row["prediction_time"] = prediction.get("time", "")
+
             for index, obs in enumerate(self.observations, start=1):
                 candidate = candidate_lookup.get(obs.get("candidate_id") or "")
                 row = {
@@ -2932,6 +3396,46 @@ class LocalBOState:
                     "procedure": obs["procedure"],
                     "time": obs["time"],
                 }
+                add_prediction_fields(row, obs)
+                for name in self.objective_names:
+                    row[name] = obs.get("objectives", {}).get(name, "")
+                    row[f"{name}_uncertainty"] = obs.get("uncertainties", {}).get(
+                        name, ""
+                    )
+                writer.writerow(row)
+            for index, obs in enumerate(
+                (self.live_random_walk or {}).get("observations") or [], start=1
+            ):
+                candidate = candidate_lookup.get(obs.get("candidate_id") or "")
+                row = {
+                    "exported_at": exported_at,
+                    "campaign_id": self.campaign_id or "",
+                    "campaign_name": self.campaign_name,
+                    "dataset_id": self.dataset_id,
+                    "dataset_filename": self.dataset_filename,
+                    "dataset_imported_at": self.dataset_imported_at,
+                    "source": "live_random_walk",
+                    "run_id": "",
+                    "run_name": "Live random walk",
+                    "run_status": (self.live_random_walk or {}).get("status", ""),
+                    "settings_json": active_config_json,
+                    "run_settings_json": json.dumps(
+                        {
+                            "target_count": (self.live_random_walk or {}).get(
+                                "target_count", ""
+                            ),
+                            "seed": (self.live_random_walk or {}).get("seed", ""),
+                        },
+                        sort_keys=True,
+                    ),
+                    "replicate": "",
+                    "experiment_count": index,
+                    "candidate_id": obs.get("candidate_id", ""),
+                    "candidate_row": candidate.get("row", "") if candidate else "",
+                    "procedure": obs["procedure"],
+                    "time": obs.get("time", ""),
+                }
+                add_prediction_fields(row, obs)
                 for name in self.objective_names:
                     row[name] = obs.get("objectives", {}).get(name, "")
                     row[f"{name}_uncertainty"] = obs.get("uncertainties", {}).get(
@@ -2967,6 +3471,7 @@ class LocalBOState:
                             "procedure": obs["procedure"],
                             "time": obs.get("time", ""),
                         }
+                        add_prediction_fields(row, obs)
                         for name in self.objective_names:
                             row[name] = obs.get("objectives", {}).get(name, "")
                             row[f"{name}_uncertainty"] = obs.get(
@@ -3137,6 +3642,14 @@ class LocalAppHandler(BaseHTTPRequestHandler):
                 self._send_json(self.state.precompute_embeddings())
             elif parsed.path == "/api/observe":
                 self._send_json(self.state.add_observation(self._read_json()))
+            elif parsed.path == "/api/delete-observation":
+                self._send_json(self.state.delete_observation(self._read_json()))
+            elif parsed.path == "/api/random-walk/start":
+                self._send_json(self.state.start_live_random_walk(self._read_json()))
+            elif parsed.path == "/api/random-walk/observe":
+                self._send_json(self.state.add_live_random_walk_result(self._read_json()))
+            elif parsed.path == "/api/random-walk/clear":
+                self._send_json(self.state.clear_live_random_walk())
             elif parsed.path == "/api/suggest":
                 self._send_json(self.state.suggest())
             elif parsed.path == "/api/inverse-design":
@@ -3231,6 +3744,43 @@ INDEX_HTML = r"""<!doctype html>
       border-color: #fecdca;
       color: var(--bad);
     }
+    .tooltip-target {
+      position: relative;
+    }
+    .tooltip-target:hover::after,
+    .tooltip-target:focus-visible::after {
+      content: attr(data-tip);
+      position: absolute;
+      left: 50%;
+      bottom: calc(100% + 8px);
+      transform: translateX(-50%);
+      width: max-content;
+      max-width: 260px;
+      padding: 7px 9px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #101828;
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.35;
+      text-align: left;
+      white-space: normal;
+      z-index: 40;
+      box-shadow: 0 10px 24px rgba(16, 24, 40, 0.18);
+      pointer-events: none;
+    }
+    .tooltip-target:hover::before,
+    .tooltip-target:focus-visible::before {
+      content: "";
+      position: absolute;
+      left: 50%;
+      bottom: calc(100% + 3px);
+      transform: translateX(-50%);
+      border: 5px solid transparent;
+      border-top-color: #101828;
+      z-index: 41;
+      pointer-events: none;
+    }
     .button-link {
       display: inline-flex;
       align-items: center;
@@ -3303,6 +3853,17 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
       gap: 8px;
       flex-wrap: wrap;
+    }
+    .button-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .button-grid button {
+      width: 100%;
+    }
+    .button-grid .wide {
+      grid-column: 1 / -1;
     }
     .chip {
       display: inline-flex;
@@ -3439,6 +4000,7 @@ INDEX_HTML = r"""<!doctype html>
       <span class="chip" id="keyStatus">Key status</span>
       <span class="chip" id="campaignStatus">Unsaved campaign</span>
       <span class="chip" id="workflowStatus">Workflow</span>
+      <span class="chip" id="engineStatus">Engine</span>
       <span class="chip" id="datasetStatus">No dataset</span>
       <span class="chip" id="embeddingStatus">Embeddings</span>
       <span class="chip" id="observationStatus">0 observations</span>
@@ -3477,16 +4039,14 @@ INDEX_HTML = r"""<!doctype html>
           <label for="savedCampaign">Saved campaigns</label>
           <select id="savedCampaign"></select>
         </div>
-        <div class="toolbar">
+        <div class="button-grid">
           <button class="primary" id="saveCampaign">Save</button>
-          <button id="saveAsCampaign">Save As New</button>
-          <button id="loadCampaign">Load</button>
+          <button id="saveAsCampaign">Save Copy</button>
+          <button id="loadCampaign">Load Selected</button>
+          <button class="danger" id="deleteCampaign">Delete Saved</button>
           <button id="startFresh">Start Fresh</button>
-          <button id="deleteCampaign">Delete</button>
-        </div>
-        <div class="toolbar">
           <button id="exportArchive">Export Archive</button>
-          <button id="importArchive">Import Archive</button>
+          <button class="wide" id="importArchive">Import Archive</button>
           <input id="archiveFile" type="file" accept=".json" style="display:none">
         </div>
       </section>
@@ -3613,6 +4173,13 @@ INDEX_HTML = r"""<!doctype html>
             <label for="inverseRandomCandidates">Random add-ons</label>
             <input id="inverseRandomCandidates" type="number" min="0" value="0">
           </div>
+        </div>
+        <div class="field">
+          <label for="llmPoolScope">LLM pool scope</label>
+          <select id="llmPoolScope">
+            <option value="full">Full pool (paper)</option>
+            <option value="broad">Broad random pool (fast)</option>
+          </select>
         </div>
         <div class="row">
           <div class="field">
@@ -3783,6 +4350,36 @@ INDEX_HTML = r"""<!doctype html>
         <button class="primary" id="addObservation">Add Observation</button>
       </section>
 
+      <section class="panel" id="liveRandomPanel">
+        <div class="toolbar" style="justify-content: space-between; margin-bottom: 12px;">
+          <h2 style="margin:0;">Live Random Walk</h2>
+          <button id="clearRandomWalk">Clear</button>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="randomWalkTarget">Point count</label>
+            <input id="randomWalkTarget" type="number" min="1" value="8">
+          </div>
+          <div class="field">
+            <label for="randomWalkProgress">Progress</label>
+            <input id="randomWalkProgress" readonly>
+          </div>
+        </div>
+        <button id="startRandomWalk" type="button">Start / Next Random</button>
+        <div class="muted" id="randomWalkCandidate" style="margin: 10px 0 12px;"></div>
+        <div class="row">
+          <div class="field">
+            <label for="randomWalkValue">Random value</label>
+            <input id="randomWalkValue" type="number" step="any">
+          </div>
+          <div class="field">
+            <label for="randomWalkUncertainty">Random uncertainty</label>
+            <input id="randomWalkUncertainty" type="number" step="any" placeholder="optional">
+          </div>
+        </div>
+        <button class="primary" id="addRandomWalkResult">Add Random Result</button>
+      </section>
+
       <section class="panel" id="suggestionsPanel">
         <div class="toolbar" style="justify-content: space-between; margin-bottom: 12px;">
           <h2 style="margin:0;">Suggestions</h2>
@@ -3843,8 +4440,9 @@ INDEX_HTML = r"""<!doctype html>
       ucbLambda: 'Exploration weight for upper confidence bound. The paper notebook default was 0.1.',
       llmSamples: 'Number of LLM prediction samples per shortlisted candidate for BO-ICL uncertainty estimates.',
       selectorK: 'Number of nearest labeled examples to include in prompts. 0 uses the normal few-shot history.',
-      inverseFilter: 'LLM-mode shortlist size retrieved with inverse-design text plus embeddings before completions are requested. 0 disables this and scores the broad pool.',
+      inverseFilter: 'LLM-mode shortlist size retrieved with inverse-design text plus cached embeddings before completions are requested. Full pool mode searches every available candidate; Broad random pool mode searches the sampled broad pool. 0 disables the shortlist and scores the broad pool.',
       inverseRandomCandidates: 'Extra random candidates mixed with the LLM shortlist before completions are requested.',
+      llmPoolScope: 'Full pool matches the paper: compare inverse-design text against every available candidate. Broad random pool first samples Broad pool candidates, then applies MMR/cosine similarity within that subset for speed.',
       inverseTargetValue: 'Manual target for inverse design. Leave blank to use the current best value times the multiplier.',
       inverseTargetMultiplier: 'Mean multiplier used for automatic inverse-design targets when no explicit target is entered. The paper-style default is 1.2.',
       inverseTargetJitter: 'Standard deviation for the random multiplier used by automatic inverse-design targets. 0.05 means target = current best x Normal(1.2, 0.05); set 0 for deterministic.',
@@ -3852,7 +4450,7 @@ INDEX_HTML = r"""<!doctype html>
       inverseDesignCount: 'Number of free-form inverse-design proposals to generate.',
       iterationsPerTrial: 'Live-mode stopping point after this many active-objective observations. 0 means no cap.',
       replicatesPerCandidate: 'How many live measurements are allowed for the same candidate before it leaves the available pool.',
-      scoreLimit: 'Broad candidate pool sampled before scoring. GPR scores this many directly; LLM mode narrows it to the shortlist first when LLM shortlist is enabled.',
+      scoreLimit: 'Candidate scoring cap for GPR. In LLM mode, this is used only when LLM shortlist is 0 or when LLM pool scope is Broad random pool.',
       apiPauseSeconds: 'Small delay after provider API calls. Increase this when rate limits appear.',
       apiRetryAttempts: 'Number of automatic retries for 429/rate-limit or transient provider errors.',
       apiRateLimitCooldownSeconds: 'Extra cooldown after a 429/rate-limit error before retrying. Increase this for OpenAI TPM limits; it is separate from the normal API pause after successful calls.',
@@ -3869,7 +4467,11 @@ INDEX_HTML = r"""<!doctype html>
       clearCandidate: 'Clear the selected pool candidate and use the manual procedure field instead.',
       manualProcedure: 'Procedure text for a live observation. This fills automatically when you select a candidate.',
       objectiveValue: 'Measured objective value in original units. For tungsten phase optimization, enter whole percent units from 0 to 100, for example 73.5 for 73.5%, not 0.735.',
-      objectiveUncertainty: 'Optional measurement uncertainty or standard deviation in original units.'
+      objectiveUncertainty: 'Optional measurement uncertainty or standard deviation in original units.',
+      randomWalkTarget: 'Number of live random-control points to collect. The runner selects one random candidate at a time and waits for its measured value.',
+      randomWalkProgress: 'Completed random-control measurements out of the requested count.',
+      randomWalkValue: 'Measured objective value for the currently selected random-control candidate.',
+      randomWalkUncertainty: 'Optional measurement uncertainty or standard deviation for the random-control result.'
     };
 
     function escapeHtml(value) {
@@ -3915,7 +4517,7 @@ INDEX_HTML = r"""<!doctype html>
         saveAsCampaign: 'Create a separate saved campaign copy with the current state.',
         loadCampaign: 'Reload the selected saved campaign and continue where it left off.',
         startFresh: 'Clear the loaded dataset, observations, suggestions, and benchmark runs from this browser state without deleting saved campaigns.',
-        deleteCampaign: 'Delete the selected local campaign save folder.',
+        deleteCampaign: 'Permanently delete the selected saved campaign from the local saved_experiments folder.',
         exportArchive: 'Download the current campaign state as a portable JSON archive without API keys.',
         importArchive: 'Load a portable BO-ICL campaign archive and save it as a local campaign.',
         openPoolBuilderTop: 'Open or focus one reusable Pool Builder window.',
@@ -3931,13 +4533,20 @@ INDEX_HTML = r"""<!doctype html>
         clearBenchmarks: 'Remove appended offline benchmark curves from the plot.',
         stopRun: 'Ask the current long-running task to stop after the current API call returns.',
         addObservation: 'Record a live measurement for the selected or typed procedure.',
+        startRandomWalk: 'Select the next random-control candidate from the currently available pool.',
+        addRandomWalkResult: 'Record the measured value for the current random-control candidate and advance to the next one if needed.',
+        clearRandomWalk: 'Remove the live random-control trajectory from this campaign.',
         suggest: 'Update live-mode candidate suggestions.',
         suggestTop: 'Update live-mode candidate suggestions.',
         inverseDesign: 'Generate free-form inverse-design proposals from labeled examples.'
       };
       Object.entries(buttonHelp).forEach(([id, text]) => {
         const element = $(id);
-        if (element) element.title = text;
+        if (element) {
+          element.title = text;
+          element.dataset.tip = text;
+          element.classList.add('tooltip-target');
+        }
       });
     }
 
@@ -4026,6 +4635,7 @@ INDEX_HTML = r"""<!doctype html>
         inverse_system_message: $('inverseSystemMessage').value,
         llm_samples: Number($('llmSamples').value || 3),
         selector_k: Number($('selectorK').value || 0),
+        llm_pool_scope: $('llmPoolScope').value,
         inverse_filter: Number($('inverseFilter').value || 16),
         inverse_random_candidates: Number($('inverseRandomCandidates').value || 0),
         inverse_target_value: $('inverseTargetValue').value,
@@ -4090,6 +4700,9 @@ INDEX_HTML = r"""<!doctype html>
       const workflow = state.config.workflow_mode === 'offline' ? 'Automatic benchmark' : 'Live campaign';
       $('workflowStatus').textContent = workflow;
       $('workflowStatus').className = `chip ${state.config.workflow_mode === 'offline' ? 'good' : 'warn'}`;
+      const engine = state.config.optimizer === 'llm' ? 'BO-ICL LLM' : 'GPR';
+      $('engineStatus').textContent = `Engine: ${engine}`;
+      $('engineStatus').className = `chip ${state.config.optimizer === 'llm' ? 'good' : 'warn'}`;
       const dataset = state.dataset || {};
       const datasetSuffix = dataset.filename ? ` (${dataset.filename})` : '';
       $('datasetStatus').textContent = `${state.candidate_count} candidates, ${state.label_count || 0} labels${datasetSuffix}`;
@@ -4114,6 +4727,7 @@ INDEX_HTML = r"""<!doctype html>
       renderBenchmarkRuns();
       renderSuggestions();
       renderInverseDesigns();
+      renderLiveRandomWalk();
       renderObservations();
       renderMessages();
     }
@@ -4151,6 +4765,7 @@ INDEX_HTML = r"""<!doctype html>
       $('inverseSystemMessage').value = config.inverse_system_message;
       $('llmSamples').value = config.llm_samples;
       $('selectorK').value = config.selector_k;
+      $('llmPoolScope').value = config.llm_pool_scope || 'full';
       $('inverseFilter').value = config.inverse_filter;
       $('inverseRandomCandidates').value = config.inverse_random_candidates;
       $('inverseTargetValue').value = config.inverse_target_value;
@@ -4193,6 +4808,7 @@ INDEX_HTML = r"""<!doctype html>
       const isOffline = state.config.workflow_mode === 'offline';
       $('offlineBenchmarkPanel').classList.toggle('hidden', !isOffline);
       $('liveResultPanel').classList.toggle('hidden', isOffline);
+      $('liveRandomPanel').classList.toggle('hidden', isOffline);
       $('suggestionsPanel').classList.toggle('hidden', isOffline);
       $('inverseDesignPanel').classList.toggle('hidden', isOffline);
       $('suggestTop').classList.toggle('hidden', isOffline);
@@ -4200,6 +4816,29 @@ INDEX_HTML = r"""<!doctype html>
         $('workflowBanner').textContent = 'Automatic benchmark mode: use Run & Append. Uploaded labels are hidden from the model until each simulated experiment is selected. Do not use Add Result or Generate Proposals for this workflow.';
       } else {
         $('workflowBanner').textContent = 'Live campaign mode: use Update Suggestions to choose the next procedure, run the experiment offline, then enter the result with Add Observation.';
+      }
+    }
+
+    function renderLiveRandomWalk() {
+      const walk = state.live_random_walk || {};
+      const observations = walk.observations || [];
+      const target = Number(walk.target_count || 0);
+      const typedTarget = Number($('randomWalkTarget').value || 0);
+      const displayTarget = target || Math.max(observations.length, state.observations.length || 0, typedTarget || 8);
+      $('randomWalkTarget').value = displayTarget;
+      $('randomWalkProgress').value = `${observations.length}/${target || displayTarget}`;
+      const candidate = walk.current_candidate || null;
+      if (candidate) {
+        const summary = candidateProcedureSummary(candidate.procedure);
+        const row = candidate.row ? `row ${candidate.row}` : 'candidate';
+        $('randomWalkCandidate').textContent = `${row}: ${summary || candidate.procedure}`;
+        $('addRandomWalkResult').disabled = busy;
+      } else if (walk.status === 'complete' && observations.length) {
+        $('randomWalkCandidate').textContent = 'Random walk complete.';
+        $('addRandomWalkResult').disabled = true;
+      } else {
+        $('randomWalkCandidate').textContent = 'Click Start / Next Random to select a random control candidate.';
+        $('addRandomWalkResult').disabled = true;
       }
     }
 
@@ -4366,6 +5005,7 @@ INDEX_HTML = r"""<!doctype html>
       const host = $('plot');
       const trace = state.best_trace || [];
       const randomTrace = state.random_walk_trace || [];
+      const liveRandomTrace = state.live_random_walk_trace || [];
       const benchmarkRuns = benchmarkRunsForDisplay();
       const statMode = (state.config || {}).plot_stat_guides || 'max';
       const rawDatasetStats = state.dataset_stats || [];
@@ -4374,11 +5014,12 @@ INDEX_HTML = r"""<!doctype html>
         : (statMode === 'max'
           ? rawDatasetStats.filter((item) => ['max', 'min'].includes(item.label))
           : []);
-      if (!trace.length && !benchmarkRuns.length && !randomTrace.length && !datasetStats.length) {
+      if (!trace.length && !benchmarkRuns.length && !randomTrace.length && !liveRandomTrace.length && !datasetStats.length) {
         host.innerHTML = '<div class="empty" style="margin: 18px;">No observations, random baseline, or benchmark runs yet</div>';
         return;
       }
       const obs = state.observations || [];
+      const randomObs = (state.live_random_walk || {}).observations || [];
       const width = Math.max(560, host.clientWidth || 760);
       const height = 330;
       const pad = { left: 56, right: 76, top: 26, bottom: 46 };
@@ -4386,7 +5027,9 @@ INDEX_HTML = r"""<!doctype html>
       const xIndexes = [
         ...trace.map((item) => Number(item.index)),
         ...randomTrace.map((item) => Number(item.index)),
-        ...benchmarkRuns.flatMap((run) => (run.summary || []).map((item) => Number(item.index)))
+        ...liveRandomTrace.map((item) => Number(item.index)),
+        ...benchmarkRuns.flatMap((run) => (run.summary || []).map((item) => Number(item.index))),
+        ...benchmarkRuns.flatMap((run) => (run.prediction_summary || []).map((item) => Number(item.index)))
       ].filter((value) => Number.isFinite(value) && value >= 1);
       const minIndex = 1;
       const maxIndex = Math.max(1, ...xIndexes);
@@ -4394,9 +5037,21 @@ INDEX_HTML = r"""<!doctype html>
         const unc = Number(item.uncertainty || 0);
         return [item.value - unc, item.value + unc, item.value];
       }).concat(
+        activeObs.flatMap((item) => {
+          const prediction = item.prediction || {};
+          if (prediction.mean === null || prediction.mean === undefined) return [];
+          const std = Number(prediction.std || 0);
+          return [prediction.mean - std, prediction.mean + std, prediction.mean];
+        }),
+        randomObs.flatMap((item) => {
+          const unc = Number(item.uncertainty || 0);
+          return [item.value - unc, item.value + unc, item.value];
+        }),
         trace.map((item) => item.best),
         randomTrace.map((item) => item.best),
+        liveRandomTrace.map((item) => item.best),
         benchmarkRuns.flatMap((run) => (run.summary || []).flatMap((item) => [item.lower, item.upper, item.mean])),
+        benchmarkRuns.flatMap((run) => (run.prediction_summary || []).flatMap((item) => [item.lower, item.upper, item.mean])),
         datasetStats.map((item) => item.value)
       ).filter((value) => value !== null && value !== undefined && Number.isFinite(Number(value)));
       if (!values.length) {
@@ -4432,8 +5087,12 @@ INDEX_HTML = r"""<!doctype html>
         : '';
       const bestPath = pathFor(trace, 'best');
       const randomPath = pathFor(randomTrace, 'best');
+      const liveRandomPath = pathFor(liveRandomTrace, 'best');
       const randomMarkers = randomTrace.map((item) => (
         `<circle cx="${x(item.index).toFixed(1)}" cy="${y(item.best).toFixed(1)}" r="3" fill="#fff" stroke="#667085" stroke-width="1.5" />`
+      )).join('');
+      const liveRandomMarkers = liveRandomTrace.map((item) => (
+        `<circle cx="${x(item.index).toFixed(1)}" cy="${y(item.best).toFixed(1)}" r="3.5" fill="#fff" stroke="#b45309" stroke-width="2"><title>random walk: ${fmt(item.value ?? item.best)}</title></circle>`
       )).join('');
       const statLines = datasetStats.map((item, idx) => {
         const yy = y(item.value);
@@ -4454,6 +5113,27 @@ INDEX_HTML = r"""<!doctype html>
         return `${band ? `<path d="${band}" fill="${color}" opacity="0.14" />` : ''}
           ${meanPath ? `<path d="${meanPath}" fill="none" stroke="${color}" stroke-width="3" />` : ''}
           ${markers}`;
+      }).join('');
+      const runPredictionLayers = benchmarkRuns.map((run) => {
+        const points = run.prediction_summary || [];
+        if (!points.length) return '';
+        const color = run.color || '#7c3aed';
+        return points.map((item) => {
+          const cx = x(item.index);
+          const cy = y(item.mean);
+          const std = Number(item.std || 0);
+          const err = std ? `<line x1="${cx}" x2="${cx}" y1="${y(item.mean - std)}" y2="${y(item.mean + std)}" stroke="${color}" stroke-width="1.4" opacity="0.75" />` : '';
+          return `${err}<path d="M ${cx.toFixed(1)} ${(cy - 5).toFixed(1)} L ${(cx + 5).toFixed(1)} ${cy.toFixed(1)} L ${cx.toFixed(1)} ${(cy + 5).toFixed(1)} L ${(cx - 5).toFixed(1)} ${cy.toFixed(1)} Z" fill="#fff" stroke="${color}" stroke-width="1.8" opacity="0.85"><title>${escapeHtml(run.name)} predicted: ${fmt(item.mean)} +/- ${fmt(item.std)}</title></path>`;
+        }).join('');
+      }).join('');
+      const livePredictions = activeObs.map((item, idx) => {
+        const prediction = item.prediction || {};
+        if (prediction.mean === null || prediction.mean === undefined) return '';
+        const cx = x(idx + 1);
+        const cy = y(prediction.mean);
+        const std = Number(prediction.std || 0);
+        const err = std ? `<line x1="${cx}" x2="${cx}" y1="${y(prediction.mean - std)}" y2="${y(prediction.mean + std)}" stroke="#2563eb" stroke-width="1.4" opacity="0.75" />` : '';
+        return `${err}<path d="M ${cx.toFixed(1)} ${(cy - 5).toFixed(1)} L ${(cx + 5).toFixed(1)} ${cy.toFixed(1)} L ${cx.toFixed(1)} ${(cy + 5).toFixed(1)} L ${(cx - 5).toFixed(1)} ${cy.toFixed(1)} Z" fill="#fff" stroke="#2563eb" stroke-width="1.8"><title>${escapeHtml(item.procedure)} predicted: ${fmt(prediction.mean)} +/- ${fmt(prediction.std)}</title></path>`;
       }).join('');
       const points = activeObs.map((item, idx) => {
         const cx = x(idx + 1);
@@ -4489,7 +5169,9 @@ INDEX_HTML = r"""<!doctype html>
       }).join('');
       const legendItems = [
         bestPath ? { label: 'live best', color: '#0f766e', dash: '' } : null,
-        randomPath ? { label: 'random mean', color: '#667085', dash: '5 5' } : null,
+        randomPath ? { label: 'random expected', color: '#667085', dash: '5 5' } : null,
+        liveRandomPath ? { label: 'live random', color: '#b45309', dash: '5 3' } : null,
+        livePredictions || runPredictionLayers ? { label: 'model pred.', color: '#2563eb', dash: '2 3' } : null,
         ...benchmarkRuns.map((run) => ({ label: run.name, color: run.color || '#7c3aed', dash: '' }))
       ].filter(Boolean).slice(0, 6);
       const legend = legendItems.map((item, idx) => {
@@ -4507,8 +5189,12 @@ INDEX_HTML = r"""<!doctype html>
         ${xTicks}
         ${randomPath ? `<path d="${randomPath}" fill="none" stroke="#667085" stroke-width="2" stroke-dasharray="6 5" />` : ''}
         ${randomMarkers}
+        ${liveRandomPath ? `<path d="${liveRandomPath}" fill="none" stroke="#b45309" stroke-width="2.5" stroke-dasharray="6 4" />` : ''}
+        ${liveRandomMarkers}
         ${runLayers}
+        ${runPredictionLayers}
         ${bestPath ? `<path d="${bestPath}" fill="none" stroke="#0f766e" stroke-width="3" />` : ''}
+        ${livePredictions}
         ${points}
         <text x="${width / 2 - 44}" y="${height - 12}">experiment count</text>
       </svg>`;
@@ -4595,15 +5281,35 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       $('observations').innerHTML = `<div class="scroll"><table>
-        <thead><tr><th>#</th><th>Procedure</th><th>Value</th><th>Unc.</th><th>Time</th></tr></thead>
-        <tbody>${observations.map((obs, idx) => `<tr>
+        <thead><tr><th>#</th><th>Procedure</th><th>Value</th><th>Unc.</th><th>Prediction</th><th>Time</th><th></th></tr></thead>
+        <tbody>${observations.map((obs, idx) => {
+          const prediction = obs.prediction || {};
+          const predText = prediction.mean === null || prediction.mean === undefined
+            ? ''
+            : `${fmt(prediction.mean)}${prediction.std !== null && prediction.std !== undefined ? ` +/- ${fmt(prediction.std)}` : ''}`;
+          return `<tr>
           <td>${idx + 1}</td>
           <td class="procedure">${escapeHtml(obs.procedure)}</td>
           <td>${fmt(obs.value)}</td>
           <td>${fmt(obs.uncertainty)}</td>
+          <td>${escapeHtml(predText)}</td>
           <td>${escapeHtml(obs.time)}</td>
-        </tr>`).join('')}</tbody>
+          <td><button class="danger" data-delete-observation="${escapeHtml(obs.id || '')}">Delete</button></td>
+        </tr>`;
+        }).join('')}</tbody>
       </table></div>`;
+      document.querySelectorAll('[data-delete-observation]').forEach((button) => {
+        button.addEventListener('click', async () => {
+          const id = button.dataset.deleteObservation;
+          if (!id) return;
+          if (!window.confirm('Delete this live observation from the saved campaign?')) return;
+          await request('/api/delete-observation', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id })
+          });
+        });
+      });
     }
 
     function renderMessages() {
@@ -4744,7 +5450,8 @@ INDEX_HTML = r"""<!doctype html>
 
     $('deleteCampaign').addEventListener('click', async () => {
       if (!$('savedCampaign').value) return renderError('Choose a saved campaign.');
-      if (!window.confirm('Delete this saved campaign from disk?')) return;
+      const selectedLabel = $('savedCampaign').selectedOptions[0]?.textContent || $('savedCampaign').value;
+      if (!window.confirm(`Delete saved campaign "${selectedLabel}" from disk? This cannot be undone.`)) return;
       await request('/api/delete-campaign', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -4797,6 +5504,34 @@ INDEX_HTML = r"""<!doctype html>
       $('objectiveUncertainty').value = '';
       clearCandidateSelection(true);
       if (state && state.config.auto_suggest) await updateSuggestions();
+    });
+
+    $('startRandomWalk').addEventListener('click', async () => {
+      await request('/api/random-walk/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          target_count: $('randomWalkTarget').value
+        })
+      });
+    });
+
+    $('addRandomWalkResult').addEventListener('click', async () => {
+      await request('/api/random-walk/observe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          value: $('randomWalkValue').value,
+          uncertainty: $('randomWalkUncertainty').value
+        })
+      });
+      $('randomWalkValue').value = '';
+      $('randomWalkUncertainty').value = '';
+    });
+
+    $('clearRandomWalk').addEventListener('click', async () => {
+      if (!window.confirm('Clear the live random-walk trajectory from this campaign?')) return;
+      await request('/api/random-walk/clear', { method: 'POST' });
     });
 
     $('candidateSearch').addEventListener('input', queueCandidateSearch);
@@ -5480,11 +6215,11 @@ USER_GUIDE_HTML = r"""<!doctype html>
       <ol>
         <li>Enter a <code>Campaign name</code> and click <code>Save</code>.</li>
         <li>Import the dataset, choose settings, add observations, and update suggestions as usual.</li>
-        <li>Close the browser whenever needed. The saved campaign contains the uploaded pool, labels if present, observations, suggestions, settings, inverse designs, and benchmark runs.</li>
+        <li>Close the browser whenever needed. The saved campaign contains the uploaded pool, labels if present, observations, stored model predictions, live random-walk controls, suggestions, settings, inverse designs, and benchmark runs.</li>
         <li>Later, start the local runner, choose the campaign in <code>Saved campaigns</code>, and click <code>Load</code>.</li>
       </ol>
-      <p>Use <code>Save As New</code> to branch a campaign into a separate local copy before trying a different strategy. If you import a new dataset or Pool Builder pool while a project is loaded, the app saves the current project first, then starts a separate clean campaign for the new import.</p>
-      <p><code>Export Archive</code> downloads a portable JSON snapshot of the current campaign without API keys. <code>Import Archive</code> restores that snapshot as a local saved campaign, including the pool, settings, observations, suggestions, inverse designs, benchmark runs, and plot history.</p>
+      <p>Use <code>Save Copy</code> to branch a campaign into a separate local copy before trying a different strategy. Use <code>Delete Saved</code> to remove old test campaigns from <code>saved_experiments/</code>. If you import a new dataset or Pool Builder pool while a project is loaded, the app saves the current project first, then starts a separate clean campaign for the new import.</p>
+      <p><code>Export Archive</code> downloads a portable JSON snapshot of the current campaign without API keys. <code>Import Archive</code> restores that snapshot as a local saved campaign, including the pool, settings, observations, stored predictions, live random-walk controls, suggestions, inverse designs, benchmark runs, and plot history.</p>
     </section>
 
     <section>
@@ -5538,9 +6273,9 @@ USER_GUIDE_HTML = r"""<!doctype html>
         <li>Click <code>Run & Append</code>. Change settings and click it again to compare another configuration. If a run stopped after a connection, rate-limit, or model error, clicking <code>Run & Append</code> again with the same label/settings resumes the partial trajectory instead of creating a duplicate curve.</li>
       </ol>
       <div class="callout">Paper-style numerical defaults are <code>Initial random = 1</code>, <code>Batch size = 1</code>, <code>BO iterations = 30</code>, <code>Workflow replicates = 5</code>, and <code>UCB lambda = 0.1</code>. Current model defaults use supported modern model IDs rather than retired paper-era model names.</div>
-      <p>For BO-ICL LLM runs on large pools, <code>Broad pool</code> is the wider random pool considered first, and <code>LLM shortlist</code> retrieves the smaller inverse-design/embedding shortlist that is actually scored by the LLM. The inverse-design target is based on the current replicate's labeled history: by default it uses current best x <code>Normal(1.2, 0.05)</code>, matching the paper-style stochastic target. If sparse observations are often zero, set <code>Auto target floor</code> to a meaningful minimum aspirational value so the inverse query does not stay anchored at zero. The shortlist uses cached embeddings with MMR/cosine similarity, then optional random add-ons. The default <code>Broad pool = 250</code>, <code>LLM shortlist = 16</code>, <code>Random add-ons = 0</code>, and <code>LLM samples = 3</code> scores at most 16 candidates per BO step.</p>
+      <p>For BO-ICL LLM runs on large pools, <code>LLM shortlist</code> retrieves the smaller inverse-design/embedding shortlist that is actually scored by the LLM. The inverse-design target is based on the current replicate's labeled history: by default it uses current best x <code>Normal(1.2, 0.05)</code>, matching the paper-style stochastic target. If sparse observations are often zero, set <code>Auto target floor</code> to a meaningful minimum aspirational value so the inverse query does not stay anchored at zero. With <code>LLM pool scope = Full pool (paper)</code>, the shortlist searches the full available pool with cached embeddings and MMR/cosine similarity, then optional random add-ons. With <code>Broad random pool (fast)</code>, the app first samples <code>Broad pool</code> candidates and runs the same MMR/cosine step only inside that subset. The default <code>LLM shortlist = 16</code>, <code>Random add-ons = 0</code>, and <code>LLM samples = 3</code> scores at most 16 candidates per BO step.</p>
       <p>LLM runtime scales with <code>(LLM shortlist + Random add-ons) x LLM samples x BO iterations x Workflow replicates</code> when the shortlist is enabled. If <code>LLM shortlist = 0</code>, runtime falls back to <code>Broad pool x LLM samples</code>. Rate-limit errors are retried automatically; increase <code>429 cooldown (s)</code>, increase <code>API pause (s)</code>, or lower the shortlist/samples if 429s keep appearing. Use the <code>Stop</code> button in the progress panel to cancel after the current API call returns.</p>
-      <p>The plot shows the mean best-so-far trajectory and a +/- 1 standard deviation band. The dashed random baseline is the paper notebook's random-mean quantile expectation. <code>Plot guides</code> defaults to the best labelled value only; switch it to <code>Paper stats</code> to add the mean and percentile guide lines.</p>
+      <p>The plot shows the mean best-so-far trajectory and a +/- 1 standard deviation band. Model prediction markers show the predicted objective mean and uncertainty for BO-selected points separately from the measured value. The dashed random baseline is the paper notebook's random-mean quantile expectation. <code>Plot guides</code> defaults to the best labelled value only; switch it to <code>Paper stats</code> to add the mean and percentile guide lines.</p>
     </section>
 
     <section>
@@ -5554,7 +6289,8 @@ USER_GUIDE_HTML = r"""<!doctype html>
         <li>Run the physical experiment offline, then enter the measured value and optional uncertainty.</li>
         <li>Repeat until the iteration cap is reached or you decide to stop.</li>
       </ol>
-      <p>The <code>Add Result</code> candidate field searches the full available pool by row number or procedure text, so large pools do not need a giant dropdown. Objective values should be entered in original units. Scaling is only used internally for fitting if enabled, and the plot remains in original units.</p>
+      <p>The <code>Add Result</code> candidate field searches the full available pool by row number or procedure text, so large pools do not need a giant dropdown. If a test or incorrect result is added, use <code>Delete</code> in the <code>Observations</code> table and update suggestions again. Objective values should be entered in original units. Scaling is only used internally for fitting if enabled, and the plot remains in original units.</p>
+      <p>Use <code>Live Random Walk</code> to collect a separate live random-control trace when full-dataset statistics are not known. Set the point count, click <code>Start / Next Random</code>, run that random candidate, enter its measured value and optional uncertainty, and click <code>Add Random Result</code>. These random-control rows do not train the BO model; they are saved, plotted, archived, and exported separately.</p>
     </section>
 
     <section>
@@ -5565,8 +6301,12 @@ USER_GUIDE_HTML = r"""<!doctype html>
           <tr><td>Suggestion engine</td><td><code>GPR with embeddings</code> uses OpenAI embeddings plus a Gaussian process. <code>BO-ICL LLM</code> uses the selected LLM for in-context predictions.</td></tr>
           <tr><td>Acquisition</td><td>Rule for ranking the next experiment. UCB balances mean and uncertainty; expected improvement favors likely gains; greedy uses predicted best; random is a control.</td></tr>
           <tr><td>Target scaling</td><td>Off by default. Auto/min-max/z-score can help GPR numerics when bounded labels are not already near unit scale.</td></tr>
-          <tr><td>Broad pool</td><td>Caps the wider candidate pool considered first. GPR scores this many directly; BO-ICL LLM narrows this pool to the LLM shortlist before requesting completions.</td></tr>
-          <tr><td>LLM shortlist</td><td>Number of candidates retrieved by inverse-design text plus embeddings before LLM scoring. Set to 0 only when you intentionally want to score the full broad pool with the LLM.</td></tr>
+          <tr><td>Broad pool</td><td>Caps candidates scored by GPR. In LLM mode, it is used only when <code>LLM shortlist = 0</code> or when <code>LLM pool scope = Broad random pool</code>.</td></tr>
+          <tr><td>LLM shortlist</td><td>Number of candidates retrieved by inverse-design text plus cached embeddings before LLM scoring. In Full pool mode this matches the paper; in Broad random pool mode it is a faster approximation.</td></tr>
+          <tr><td>LLM pool scope</td><td><code>Full pool (paper)</code> compares the inverse-design query against every available candidate. <code>Broad random pool (fast)</code> first samples the Broad pool and then applies MMR/cosine similarity inside that subset.</td></tr>
+          <tr><td>Suggestions Acq / Mean</td><td><code>Mean</code> is the predicted objective in original units. <code>Acq</code> is the acquisition score used for ranking. The inverse-design target creates the retrieval query; shortlisted candidates do not have to predict exactly at that target.</td></tr>
+          <tr><td>Prediction markers</td><td>For model-selected points, the plot can show the stored prediction mean and uncertainty as a distinct marker with an error bar. The measured value remains the actual observation and best-so-far trace.</td></tr>
+          <tr><td>Live Random Walk</td><td>Separate live control trajectory. The app selects one random available candidate at a time, waits for the measured value, then appends it to the random-control plot/export without adding it to the BO training context.</td></tr>
           <tr><td>Auto target jitter</td><td>Stochastic spread around the automatic inverse-design target multiplier. The default <code>0.05</code> gives current best x <code>Normal(1.2, 0.05)</code>; set it to <code>0</code> for deterministic targets.</td></tr>
           <tr><td>Auto target floor</td><td>Optional minimum automatic inverse-design target for sparse-zero maximization campaigns. For phase percentages, use whole percent units such as <code>5</code> or <code>10</code>. Manual inverse target overrides it.</td></tr>
           <tr><td>Greedy for final iteration</td><td>Offline benchmark option that keeps the selected acquisition for earlier BO choices, then uses greedy acquisition for the final BO choice in each replicate.</td></tr>

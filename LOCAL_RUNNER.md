@@ -85,6 +85,10 @@ training. `Target scaling` is off by default. `Auto range`, `Min-max`, and
 `Z-score` scale the model target while plots and exports stay in the original
 objective units. Entered uncertainty is stored, exported, and plotted as an
 error bar.
+For model-selected points, the runner also stores the model prediction that was
+used for ranking. Those prediction means and uncertainties are plotted as
+separate prediction markers with error bars and are included in saved campaigns,
+archives, and CSV exports.
 The current BO-ICL `AskTellGPR` implementation does not yet use per-observation
 uncertainty as fixed noise during GP fitting.
 
@@ -135,6 +139,17 @@ intended for large pools where listing 10,000 procedures at once would be
 awkward. Suggested candidates are included in the search choices, and the manual
 procedure field remains available for off-pool results.
 
+Live observations autosave after a campaign has been saved. If a test or
+incorrect value is entered, use `Delete` in the `Observations` table to remove
+that row and autosave the corrected campaign state. Update suggestions again
+after deleting an observation.
+
+Use `Live Random Walk` when you want a live random-control trace for an
+unlabeled campaign. Set the point count, click `Start / Next Random`, run the
+selected random candidate, enter the measured value and optional uncertainty,
+and click `Add Random Result`. The random-control measurements do not train the
+BO model; they are plotted and exported separately as `live_random_walk` rows.
+
 Long-running actions show live progress in the browser and print progress lines
 to the terminal window that launched the app. This includes embedding
 preparation, benchmark runs, and suggestion updates. If the browser controls are
@@ -160,11 +175,13 @@ instead.
 The `Inverse Design` panel can generate free-form proposals from the labeled
 examples and the active objective target. Use those proposals directly as manual
 procedures, or use `LLM shortlist` to turn inverse-design output into ranked
-candidates from the uploaded pool before LLM completions are requested. `Broad
-pool` is the wider random candidate pool considered first. With the default
+candidates from the uploaded pool before LLM completions are requested. With the default
 `Broad pool = 250`, `LLM shortlist = 16`, `Random add-ons = 0`, and `LLM samples
 = 3`, each BO-ICL step scores at most 16 candidates with 48 sampled
-completions, not 250 candidates.
+completions, not 250 candidates. `LLM pool scope = Full pool (paper)` compares
+the inverse-design query against every available candidate, which matches the
+paper notebook. `Broad random pool (fast)` first samples `Broad pool` candidates
+and then applies the same MMR/cosine shortlist step inside that subset.
 
 LLM benchmark runtime scales with `(LLM shortlist + Random add-ons) x LLM
 samples x BO iterations x Workflow replicates` when the shortlist is enabled.
@@ -193,19 +210,24 @@ a campaign name and click `Save` once. The app writes a local JSON snapshot unde
 to that same campaign.
 
 Saved campaigns include the uploaded candidate pool, hidden labels if present,
-settings, observations, current suggestions, inverse-design proposals, benchmark
-runs, and recent event context. Restart the app later, choose the saved campaign,
-and click `Load` to continue without re-uploading the dataset. Use `Save As New`
-to branch a campaign before trying a different strategy. Use `Start Fresh` to
-clear the current loaded dataset, observations, suggestions, and benchmark runs
-from the browser state without deleting saved campaigns on disk.
+settings, observations, stored model predictions, current suggestions,
+inverse-design proposals, live random-walk controls, benchmark runs, and recent
+event context. Restart the app later, choose the saved campaign, and click
+`Load` to continue without re-uploading the dataset. Use `Save As New` to branch
+a campaign before trying a different strategy. Use `Delete Saved` to remove the
+selected old test campaign from the local `saved_experiments/` folder. Use
+`Start Fresh` to clear the current loaded dataset, observations, suggestions,
+and benchmark runs from the browser state without deleting saved campaigns on
+disk.
 
 If you import a new dataset or import from Pool Builder while another project is
 loaded, the runner first saves the current project. It then creates a separate
 clean campaign for the newly imported pool, clears previous observations and
 benchmark runs from the browser state, and makes the new dataset the active
-project. This keeps accidental imports from overwriting an active multi-day
-campaign.
+project. The selected suggestion engine and model settings are preserved, so a
+live BO-ICL LLM setup will not silently fall back to GPR during import. Use
+`Start Fresh` when you intentionally want to reset settings to defaults. This
+keeps accidental imports from overwriting an active multi-day campaign.
 
 Use `Offline Benchmark` when the uploaded dataset already contains labels and
 you want paper-style controlled experiments. Set the current suggestion engine,
@@ -231,15 +253,23 @@ names default to currently supported models rather than retired paper-era model
 IDs.
 
 For BO-ICL LLM runs on large pools, keep `Score limit` moderate at first
-(`100-250`) so each iteration scores a manageable subset. Increase it toward the
-full pool size only when you are comfortable with the added runtime and API cost.
-In LLM mode, `LLM shortlist` first generates an inverse-design query from the
-current replicate history. With the default automatic target settings, that
-target is `current best x Normal(1.2, 0.05)`, which matches the paper-style
-stochastic inverse-filter target. Set `Auto target jitter = 0` if you want a
-deterministic `current best x multiplier` target instead. The app then uses
-cached embeddings and MMR/cosine similarity to choose the subpool scored by LLM
-completions.
+(`100-250`) for GPR baselines, LLM runs where `LLM shortlist = 0`, or LLM runs
+using `LLM pool scope = Broad random pool`.
+In the normal LLM workflow, `LLM shortlist` first generates an inverse-design
+query from the current replicate history. With the default automatic target
+settings, that target is `current best x Normal(1.2, 0.05)`, which matches the
+paper-style stochastic inverse-filter target. Set `Auto target jitter = 0` if
+you want a deterministic `current best x multiplier` target instead. In Full
+pool mode, the app compares that query against the full available pool using
+cached embeddings and MMR/cosine similarity. In Broad random pool mode, it first
+samples the Broad pool and does the same comparison inside that subset. Only the
+shortlist plus optional random add-ons is scored by LLM completions.
+
+In the suggestions table, `Mean` is the LLM-predicted objective value in the
+original objective units, while `Acq` is the acquisition score calculated from
+the prediction samples. The inverse-design target is the retrieval query that
+creates the shortlist; it is not a promise that each shortlisted candidate's
+predicted mean will be close to that target.
 
 For sparse-zero campaigns, `current best x multiplier` can stay pinned at zero.
 Use `Auto target floor` to set a minimum automatic inverse-design target without
@@ -254,6 +284,8 @@ best-so-far trajectory with a +/- 1 standard deviation band. The dashed random
 baseline is the paper-style quantile expectation for random sampling, not a
 Monte Carlo replicate. When full labels are available, dashed guide lines mark
 the dataset mean, 75th, 95th, 99th percentile, and maximum.
+Model prediction markers show the predicted objective mean and uncertainty for
+BO-selected points separately from the measured best-so-far value.
 
 If a benchmark stops because of a connection, rate-limit, or model error, the
 partial run is saved. Clicking `Run & Append` again with the same run label and
@@ -265,15 +297,18 @@ curves and immediately rerun the current configuration from scratch.
 
 ## Exports
 
-`Export Observations CSV` includes both live observations and offline benchmark
-rows. Each row carries campaign id/name, dataset id/filename/import time,
-candidate id/row, source, run id/name/status, active settings JSON, per-run
-settings JSON, objective values, uncertainty values, and timestamps. Downloaded
-filenames include the campaign name, dataset stem, export timestamp, and
-`observations` suffix so exports are easy to match back to a saved experiment.
+`Export Observations CSV` includes live observations, live random-walk control
+rows, and offline benchmark rows. Each row carries campaign id/name, dataset
+id/filename/import time, candidate id/row, source, run id/name/status, active
+settings JSON, per-run settings JSON, objective values, measurement uncertainty
+values, stored prediction mean/uncertainty/acquisition metadata when available,
+and timestamps. Downloaded filenames include the campaign name, dataset stem,
+export timestamp, and `observations` suffix so exports are easy to match back
+to a saved experiment.
 
 `Export Archive` downloads a portable JSON campaign snapshot. It does not include
 API keys. `Import Archive` loads that JSON into the runner and saves it as a
 local campaign, restoring the candidate pool, hidden labels, selected settings,
-live observations, suggestions, inverse-design proposals, offline benchmark
-runs, and the plot history derived from those rows.
+live observations, stored predictions, live random-walk controls, suggestions,
+inverse-design proposals, offline benchmark runs, and the plot history derived
+from those rows.
