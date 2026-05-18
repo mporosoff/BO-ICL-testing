@@ -768,6 +768,30 @@ def test_embedding_cache_status_counts_current_dataset_and_model(tmp_path):
     assert status["missing_count"] == 1
 
 
+def test_precompute_embeddings_finishes_when_dataset_is_already_cached(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    state = LocalBOState(tmp_path)
+    state.import_dataset("dataset.csv", b"procedure,value\nproc a,\nproc b,\n")
+    state.cache_dir.mkdir()
+    state.embedding_cache_path().write_text(
+        "x,embedding,embedding_model\n"
+        '"proc a","[1.0, 0.0]",text-embedding-ada-002\n'
+        '"proc b","[0.0, 1.0]",text-embedding-ada-002\n',
+        encoding="utf-8",
+    )
+
+    payload = state.precompute_embeddings()
+
+    assert payload["progress"]["status"] == "complete"
+    assert payload["progress"]["percent"] == 100
+    assert payload["progress"]["current"] == 2
+    assert payload["progress"]["total"] == 2
+    assert "No new embeddings needed" in payload["progress"]["detail"]
+    assert "already cached" in payload["last_model_status"]
+
+
 def test_cached_approx_sample_uses_saved_embeddings_without_api(tmp_path):
     state = LocalBOState(tmp_path)
     state.cache_dir.mkdir()

@@ -713,7 +713,11 @@ class LocalBOState:
             detail = "Stop requested. Finishing the current API call before stopping."
         total = max(0, int(total))
         current = max(0, min(int(current), total if total else int(current)))
-        percent = int(round((current / total) * 100)) if total else 0
+        percent = (
+            int(round((current / total) * 100))
+            if total
+            else (100 if status == "complete" else 0)
+        )
         previous_partial = self.progress.get("partial_run")
         self.progress = {
             "status": status,
@@ -1270,10 +1274,30 @@ class LocalBOState:
             self.cancel_event.clear()
             if not self.candidates:
                 raise ValueError("Import a dataset before preparing embeddings.")
+            procedures = [candidate["procedure"] for candidate in self.candidates]
+            before_status = self.embedding_cache_status()
+            before = before_status["cached_count"]
+            total = before_status["total_count"]
+            self.set_progress(
+                "Preparing dataset embeddings",
+                before,
+                total,
+                detail=f"{before} of {total} cached.",
+            )
+            if before_status["missing_count"] <= 0:
+                self.last_model_status = (
+                    f"All {total} candidate embeddings were already cached for "
+                    f"{self.config['embedding_model']}."
+                )
+                self.log("All requested dataset embeddings were already cached.")
+                self.finish_progress(
+                    "Preparing dataset embeddings",
+                    f"{before} of {total} cached. No new embeddings needed.",
+                )
+                self._autosave_locked()
+                return self.to_json()
             if not os.environ.get("OPENAI_API_KEY"):
                 raise ValueError("OPENAI_API_KEY is required to prepare embeddings.")
-            procedures = [candidate["procedure"] for candidate in self.candidates]
-            before = self.embedding_cache_status()["cached_count"]
             try:
                 self._cached_embeddings(procedures, "Preparing dataset embeddings")
             except RunCancelled:
