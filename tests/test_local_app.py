@@ -1203,6 +1203,34 @@ def test_dataset_prompt_regeneration_preserves_custom_prompt_on_import(tmp_path)
     assert "1.2" not in payload["config"]["inverse_system_message"]
 
 
+def test_auto_prompts_refresh_when_live_objective_name_changes(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset("pool.csv", b"procedure,objective\nproc a,\nproc b,\n")
+
+    payload = state.update_config({"objective_name": "alpha Mo2C"})
+
+    assert "Active objective selected in the tool: alpha Mo2C" in payload["config"][
+        "prediction_system_message"
+    ]
+    assert "alpha Mo2C" in payload["config"]["inverse_system_message"]
+
+
+def test_custom_prompts_are_not_replaced_when_objective_name_changes(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset("pool.csv", b"procedure,objective\nproc a,\nproc b,\n")
+    state.update_config(
+        {
+            "prediction_system_message": "custom prediction",
+            "inverse_system_message": "custom inverse",
+        }
+    )
+
+    payload = state.update_config({"objective_name": "alpha Mo2C"})
+
+    assert payload["config"]["prediction_system_message"] == "custom prediction"
+    assert payload["config"]["inverse_system_message"] == "custom inverse"
+
+
 def test_browser_config_tracks_llm_and_inverse_models(tmp_path):
     state = LocalBOState(tmp_path)
 

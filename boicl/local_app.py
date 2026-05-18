@@ -233,15 +233,21 @@ def _is_auto_inverse_prompt(value: Optional[str]) -> bool:
 
 
 def _dataset_prompt_summary(
-    candidates: List[Dict[str, Any]], objective_names: List[str]
+    candidates: List[Dict[str, Any]],
+    objective_names: List[str],
+    active_objective: Optional[str] = None,
 ) -> str:
     objectives = ", ".join(objective_names) if objective_names else "objective"
     lines = [
         f"Uploaded dataset summary: {len(candidates)} candidate procedures.",
         f"Objective columns available to the tool: {objectives}.",
-        "The first uploaded column is the procedure text. Numeric labels, if present, "
-        "are used by the tool only when an experiment is observed or simulated.",
     ]
+    if active_objective:
+        lines.append(f"Active objective selected in the tool: {active_objective}.")
+    lines.append(
+        "The first uploaded column is the procedure text. Numeric labels, if present, "
+        "are used by the tool only when an experiment is observed or simulated."
+    )
     examples = _prompt_examples(candidates)
     if examples:
         lines.append("Procedure style examples from the uploaded pool:")
@@ -250,7 +256,9 @@ def _dataset_prompt_summary(
 
 
 def _dataset_prediction_prompt(
-    candidates: List[Dict[str, Any]], objective_names: List[str]
+    candidates: List[Dict[str, Any]],
+    objective_names: List[str],
+    active_objective: Optional[str] = None,
 ) -> str:
     return (
         f"{GENERATED_PREDICTION_PROMPT_PREFIX} You will receive relevant labeled "
@@ -262,12 +270,14 @@ def _dataset_prediction_prompt(
         "the prompt. Return exactly one numeric value in the original objective "
         "units. Do not include units, JSON, ranges, uncertainty, citations, "
         "explanations, or extra text.\n\n"
-        f"{_dataset_prompt_summary(candidates, objective_names)}"
+        f"{_dataset_prompt_summary(candidates, objective_names, active_objective)}"
     )
 
 
 def _dataset_inverse_prompt(
-    candidates: List[Dict[str, Any]], objective_names: List[str]
+    candidates: List[Dict[str, Any]],
+    objective_names: List[str],
+    active_objective: Optional[str] = None,
 ) -> str:
     return (
         f"{GENERATED_INVERSE_PROMPT_PREFIX} You will receive labeled examples and "
@@ -279,7 +289,7 @@ def _dataset_inverse_prompt(
         "reuse parameter names, units, syntax, reagents, ranges, and workflow steps "
         "seen in the examples unless the prompt explicitly allows otherwise. Return "
         "only the procedure text, with no explanation or formatting.\n\n"
-        f"{_dataset_prompt_summary(candidates, objective_names)}"
+        f"{_dataset_prompt_summary(candidates, objective_names, active_objective)}"
     )
 
 
@@ -1163,12 +1173,16 @@ class LocalBOState:
             self.config.get("prediction_system_message")
         ):
             self.config["prediction_system_message"] = _dataset_prediction_prompt(
-                self.candidates, self.objective_names
+                self.candidates,
+                self.objective_names,
+                self.config.get("objective_name"),
             )
             changed = True
         if force or _is_auto_inverse_prompt(self.config.get("inverse_system_message")):
             self.config["inverse_system_message"] = _dataset_inverse_prompt(
-                self.candidates, self.objective_names
+                self.candidates,
+                self.objective_names,
+                self.config.get("objective_name"),
             )
             changed = True
         if changed:
@@ -1680,6 +1694,7 @@ class LocalBOState:
 
     def update_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         with self.lock:
+            previous_objective_name = self.config.get("objective_name")
             for key in DEFAULT_CONFIG:
                 if key not in payload:
                     continue
@@ -1785,6 +1800,8 @@ class LocalBOState:
             if self.config["objective_name"] not in self.objective_names:
                 self.objective_names.append(self.config["objective_name"])
             self.refresh_active_objective()
+            if self.config.get("objective_name") != previous_objective_name:
+                self._refresh_dataset_prompts_locked()
             self.log("Updated run settings.")
             self._autosave_locked()
             return self.to_json()
