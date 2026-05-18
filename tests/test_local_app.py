@@ -795,6 +795,52 @@ def test_llm_model_keeps_original_units_when_target_scaling_is_enabled(
     assert state._inverse_target_model_value(scaler, [observations[0]]) == 5.0
 
 
+def test_llm_acquisition_best_uses_original_units_when_scaling_enabled(
+    tmp_path, monkeypatch
+):
+    state = LocalBOState(tmp_path)
+    state.import_dataset(
+        "alpha_pool.csv",
+        b"procedure,alpha\nseed zero,0\nseed high,100\ncandidate,50\n",
+        objective_name="alpha",
+    )
+    state.update_config(
+        {
+            "optimizer": "llm",
+            "objective_scaling": "minmax",
+            "inverse_filter": 0,
+            "batch_size": 1,
+        }
+    )
+
+    class FakeModel:
+        def predict(self, procedures, system_message=""):
+            assert system_message
+            return [GaussDist(50.0, 0.0) for _ in procedures]
+
+    best_values = []
+
+    def fake_aq(dist, best):
+        best_values.append(best)
+        return dist.mean() - best
+
+    state._build_llm_model = lambda observations=None: (FakeModel(), {"mode": "off"})
+    state._llm_acquisition_callable = lambda acquisition_name: fake_aq
+
+    suggestions = state._llm_suggestions(
+        [state.candidates[2]],
+        observations=[
+            state._observation_from_candidate(state.candidates[0]),
+            state._observation_from_candidate(state.candidates[1]),
+        ],
+        rng=random.Random(0),
+        k=1,
+    )
+
+    assert suggestions[0]["mean"] == 50.0
+    assert best_values == [100.0]
+
+
 def test_prediction_summary_combines_offline_replicate_predictions(tmp_path):
     state = LocalBOState(tmp_path)
     summary = state._summarize_prediction_points(

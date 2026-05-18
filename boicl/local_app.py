@@ -2690,7 +2690,11 @@ class LocalBOState:
             means = [None] * len(selected)
             stds = [None] * len(selected)
         else:
-            training_rows, _ = self._training_rows_and_scaler(observations)
+            training_rows, _ = _group_training_observations(
+                observations if observations is not None else self.active_observations(),
+                self.config["objective_direction"],
+                "off",
+            )
             targets = [
                 float(row["target"])
                 for row in training_rows
