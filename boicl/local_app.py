@@ -116,7 +116,7 @@ DEFAULT_CONFIG = {
     "prediction_system_message": DEFAULT_PREDICTION_SYSTEM_MESSAGE,
     "inverse_system_message": DEFAULT_INVERSE_SYSTEM_MESSAGE,
     "llm_samples": 3,
-    "llm_uncertainty_calibration": 4.33,
+    "llm_uncertainty_calibration": 1.0,
     "selector_k": 0,
     "llm_pool_scope": "full",
     "inverse_filter": 16,
@@ -132,6 +132,7 @@ DEFAULT_CONFIG = {
     "benchmark_iterations": 30,
     "benchmark_replicates": 5,
     "benchmark_initial_points": 1,
+    "benchmark_initial_seed_strategy": "random",
     "benchmark_seed": 0,
     "greedy_final_iteration": False,
     "random_replicates": 0,
@@ -189,6 +190,7 @@ BENCHMARK_RESUME_MATCH_KEYS = [
     "benchmark_iterations",
     "benchmark_replicates",
     "benchmark_initial_points",
+    "benchmark_initial_seed_strategy",
     "benchmark_seed",
     "greedy_final_iteration",
 ]
@@ -237,32 +239,13 @@ def _is_auto_inverse_prompt(value: Optional[str]) -> bool:
     )
 
 
-def _bounds_instruction(
-    lower: Optional[float], upper: Optional[float]
-) -> str:
-    if lower is None and upper is None:
-        return ""
-    if lower is not None and upper is not None:
-        return (
-            f"{OBJECTIVE_BOUNDS_PROMPT_MARKER} the active objective is physically "
-            f"bounded from {lower:g} to {upper:g} in original objective units. "
-            "Use these bounds only as validation limits; they are not observed "
-            "labels, inverse-design targets, or default predictions. Values "
-            "outside this range are physically invalid."
-        )
-    if lower is not None:
-        return (
-            f"{OBJECTIVE_BOUNDS_PROMPT_MARKER} the active objective has a lower "
-            f"bound of {lower:g} in original objective units. Use this only as "
-            "a validation limit, not an observed label, target, or default "
-            "prediction; values below this bound are physically invalid."
-        )
-    return (
-        f"{OBJECTIVE_BOUNDS_PROMPT_MARKER} the active objective has an upper "
-        f"bound of {upper:g} in original objective units. Use this only as "
-        "a validation limit, not an observed label, target, or default "
-        "prediction; values above this bound are physically invalid."
-    )
+def _strip_bounds_instruction(message: str) -> str:
+    lines = [
+        line
+        for line in str(message or "").splitlines()
+        if OBJECTIVE_BOUNDS_PROMPT_MARKER not in line
+    ]
+    return "\n".join(lines).strip()
 
 
 def _prediction_guardrail_instruction() -> str:
@@ -280,7 +263,6 @@ def _dataset_prompt_summary(
     candidates: List[Dict[str, Any]],
     objective_names: List[str],
     active_objective: Optional[str] = None,
-    objective_bounds: Optional[Tuple[Optional[float], Optional[float]]] = None,
 ) -> str:
     objectives = ", ".join(objective_names) if objective_names else "objective"
     lines = [
@@ -289,10 +271,6 @@ def _dataset_prompt_summary(
     ]
     if active_objective:
         lines.append(f"Active objective selected in the tool: {active_objective}.")
-    if objective_bounds:
-        instruction = _bounds_instruction(*objective_bounds)
-        if instruction:
-            lines.append(instruction)
     lines.append(
         "The first uploaded column is the procedure text. Numeric labels, if present, "
         "are used by the tool only when an experiment is observed or simulated."
@@ -308,7 +286,6 @@ def _dataset_prediction_prompt(
     candidates: List[Dict[str, Any]],
     objective_names: List[str],
     active_objective: Optional[str] = None,
-    objective_bounds: Optional[Tuple[Optional[float], Optional[float]]] = None,
 ) -> str:
     return (
         f"{GENERATED_PREDICTION_PROMPT_PREFIX} You will receive relevant labeled "
@@ -323,7 +300,7 @@ def _dataset_prediction_prompt(
         "candidate. Return exactly one numeric value in the original objective "
         "units. Do not include units, JSON, ranges, uncertainty, citations, "
         "explanations, or extra text.\n\n"
-        f"{_dataset_prompt_summary(candidates, objective_names, active_objective, objective_bounds)}"
+        f"{_dataset_prompt_summary(candidates, objective_names, active_objective)}"
     )
 
 
@@ -331,7 +308,6 @@ def _dataset_inverse_prompt(
     candidates: List[Dict[str, Any]],
     objective_names: List[str],
     active_objective: Optional[str] = None,
-    objective_bounds: Optional[Tuple[Optional[float], Optional[float]]] = None,
 ) -> str:
     return (
         f"{GENERATED_INVERSE_PROMPT_PREFIX} You will receive labeled examples and "
@@ -343,7 +319,7 @@ def _dataset_inverse_prompt(
         "reuse parameter names, units, syntax, reagents, ranges, and workflow steps "
         "seen in the examples unless the prompt explicitly allows otherwise. Return "
         "only the procedure text, with no explanation or formatting.\n\n"
-        f"{_dataset_prompt_summary(candidates, objective_names, active_objective, objective_bounds)}"
+        f"{_dataset_prompt_summary(candidates, objective_names, active_objective)}"
     )
 
 
@@ -617,6 +593,29 @@ def _display_value(value: float, direction: str) -> float:
     return -value if direction == "minimize" else value
 
 
+def _clip_to_bounds(
+    value: float, bounds: Tuple[Optional[float], Optional[float]]
+) -> float:
+    clipped = float(value)
+    lower, upper = bounds
+    if lower is not None:
+        clipped = max(float(lower), clipped)
+    if upper is not None:
+        clipped = min(float(upper), clipped)
+    return clipped
+
+
+def _bounded_interval(
+    center: float,
+    spread: float,
+    bounds: Tuple[Optional[float], Optional[float]],
+) -> Tuple[float, float]:
+    return (
+        _clip_to_bounds(float(center) - float(spread or 0.0), bounds),
+        _clip_to_bounds(float(center) + float(spread or 0.0), bounds),
+    )
+
+
 def _target_scaler(values: List[float], direction: str, mode: str) -> Dict[str, float]:
     mode = mode if mode in SCALING_MODES else "off"
     directed = np.array([_target_value(float(value), direction) for value in values])
@@ -816,6 +815,16 @@ def _merged_config(saved: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                 config[key] = saved[key]
     config["benchmark_initial_points"] = max(
         1, min(3, int(config.get("benchmark_initial_points") or 1))
+    )
+    strategy = str(config.get("benchmark_initial_seed_strategy") or "random").strip()
+    config["benchmark_initial_seed_strategy"] = (
+        strategy if strategy in {"random", "mean_nonzero"} else "random"
+    )
+    config["prediction_system_message"] = _strip_bounds_instruction(
+        config.get("prediction_system_message") or DEFAULT_PREDICTION_SYSTEM_MESSAGE
+    )
+    config["inverse_system_message"] = _strip_bounds_instruction(
+        config.get("inverse_system_message") or DEFAULT_INVERSE_SYSTEM_MESSAGE
     )
     return config
 
@@ -1217,6 +1226,7 @@ class LocalBOState:
             )
             available_candidates = self.available_candidates()
             labelled_values = self.candidate_objective_values()
+            plot_lower, plot_upper = self.plot_objective_bounds()
             plot_steps = self.plot_horizon(len(active_observations))
             return {
                 "config": self.config,
@@ -1238,6 +1248,10 @@ class LocalBOState:
                 ],
                 "candidate_count": len(self.candidates),
                 "label_count": len(labelled_values),
+                "plot_objective_bounds": {
+                    "lower": plot_lower,
+                    "upper": plot_upper,
+                },
                 "available_candidates": [
                     self.public_candidate(candidate)
                     for candidate in available_candidates[:500]
@@ -1311,25 +1325,59 @@ class LocalBOState:
             lower, upper = upper, lower
         return lower, upper
 
-    def _system_message_with_bounds(self, message: str) -> str:
-        instruction = _bounds_instruction(*self.objective_bounds())
-        if instruction and OBJECTIVE_BOUNDS_PROMPT_MARKER not in message:
-            return f"{message}\n\n{instruction}"
-        return message
+    def plot_objective_bounds(self) -> Tuple[Optional[float], Optional[float]]:
+        lower, upper = self.objective_bounds()
+        objective_name = str(self.config.get("objective_name") or "").lower()
+        percent_like = any(
+            token in objective_name for token in ["%", "pct", "percent"]
+        )
+        if percent_like:
+            lower = 0.0 if lower is None else lower
+            upper = 100.0 if upper is None else upper
+
+        values: List[float] = []
+        if lower is None or upper is None:
+            values.extend(self.candidate_objective_values())
+            values.extend(
+                float(obs["value"])
+                for obs in self.active_observations()
+                if obs.get("value") is not None
+            )
+            values.extend(
+                float(obs["value"])
+                for obs in (self.live_random_walk.get("observations") or [])
+                if obs.get("value") is not None
+            )
+            for run in self.benchmark_runs:
+                for obs_list in run.get("replicate_observations") or []:
+                    values.extend(
+                        float(obs["value"])
+                        for obs in obs_list
+                        if obs.get("value") is not None
+                    )
+        if values:
+            if lower is None:
+                lower = float(min(values))
+            if upper is None:
+                upper = float(max(values))
+        if lower is not None and upper is not None and lower > upper:
+            lower, upper = upper, lower
+        return lower, upper
 
     def prediction_system_message(self) -> str:
-        message = (
+        message = _strip_bounds_instruction(
             self.config.get("prediction_system_message")
             or DEFAULT_PREDICTION_SYSTEM_MESSAGE
         )
         guardrail = _prediction_guardrail_instruction()
         if PREDICTION_GUARDRAIL_MARKER not in message:
             message = f"{message}\n\n{guardrail}"
-        return self._system_message_with_bounds(message)
+        return message
 
     def inverse_system_message(self) -> str:
-        message = self.config.get("inverse_system_message") or DEFAULT_INVERSE_SYSTEM_MESSAGE
-        return self._system_message_with_bounds(message)
+        return _strip_bounds_instruction(
+            self.config.get("inverse_system_message") or DEFAULT_INVERSE_SYSTEM_MESSAGE
+        )
 
     def _refresh_dataset_prompts_locked(self, force: bool = False) -> bool:
         if not self.candidates:
@@ -1344,7 +1392,6 @@ class LocalBOState:
                 self.candidates,
                 self.objective_names,
                 self.config.get("objective_name"),
-                self.objective_bounds(),
             )
             changed = True
         if force or _is_auto_inverse_prompt(self.config.get("inverse_system_message")):
@@ -1352,7 +1399,6 @@ class LocalBOState:
                 self.candidates,
                 self.objective_names,
                 self.config.get("objective_name"),
-                self.objective_bounds(),
             )
             changed = True
         if changed:
@@ -1863,14 +1909,11 @@ class LocalBOState:
     def update_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         with self.lock:
             previous_objective_name = self.config.get("objective_name")
-            previous_objective_bounds = self.objective_bounds()
             suggestion_config_keys = {
                 "optimizer",
                 "objective_name",
                 "objective_direction",
                 "objective_scaling",
-                "objective_lower_bound",
-                "objective_upper_bound",
                 "acquisition",
                 "embedding_model",
                 "prediction_model",
@@ -1931,6 +1974,8 @@ class LocalBOState:
                     value = float(value)
                 elif key in {"auto_suggest", "greedy_final_iteration"}:
                     value = bool(value)
+                elif key in {"prediction_system_message", "inverse_system_message"}:
+                    value = _strip_bounds_instruction(value)
                 self.config[key] = value
             self.config["optimizer"] = (
                 "llm" if self.config["optimizer"] == "llm" else "gpr"
@@ -1969,6 +2014,14 @@ class LocalBOState:
             self.config["benchmark_initial_points"] = max(
                 1, min(3, int(self.config["benchmark_initial_points"]))
             )
+            strategy_value = str(
+                self.config.get("benchmark_initial_seed_strategy") or "random"
+            ).strip()
+            self.config["benchmark_initial_seed_strategy"] = (
+                strategy_value
+                if strategy_value in {"random", "mean_nonzero"}
+                else "random"
+            )
             self.config["benchmark_seed"] = int(self.config["benchmark_seed"])
             self.config["random_replicates"] = max(0, int(self.config["random_replicates"]))
             self.config["llm_samples"] = max(1, min(20, int(self.config["llm_samples"])))
@@ -2002,10 +2055,7 @@ class LocalBOState:
             if self.config["objective_name"] not in self.objective_names:
                 self.objective_names.append(self.config["objective_name"])
             self.refresh_active_objective()
-            if (
-                self.config.get("objective_name") != previous_objective_name
-                or self.objective_bounds() != previous_objective_bounds
-            ):
+            if self.config.get("objective_name") != previous_objective_name:
                 self._refresh_dataset_prompts_locked()
             current_suggestion_config = {
                 key: self.config.get(key) for key in suggestion_config_keys
@@ -2725,10 +2775,19 @@ class LocalBOState:
             except (TypeError, ValueError, AttributeError):
                 continue
         degenerate = self._llm_scores_are_degenerate(scored)
-        scored.sort(
-            key=lambda item: (item["acquisition"], item["mean"]),
-            reverse=True,
-        )
+        degenerate_info = {}
+        if degenerate and scored:
+            degenerate_info = {
+                "score_count": len(scored),
+                "mean": float(scored[0]["mean"]),
+                "std": float(scored[0]["std"] or 0.0),
+                "acquisition": float(scored[0]["acquisition"]),
+            }
+        if not degenerate:
+            scored.sort(
+                key=lambda item: (item["acquisition"], item["mean"]),
+                reverse=True,
+            )
         selected = scored[:k]
         return (
             [item["procedure"] for item in selected],
@@ -2736,6 +2795,7 @@ class LocalBOState:
             [item["mean"] for item in selected],
             [item["std"] for item in selected],
             degenerate,
+            degenerate_info,
         )
 
     @staticmethod
@@ -2826,6 +2886,7 @@ class LocalBOState:
         suggestion_count = min(k or self.config["batch_size"], len(procedures))
         by_proc = {cand["procedure"]: cand for cand in candidate_pool}
         aq_fxn = self._llm_acquisition_callable(acquisition_name)
+        selection_note = None
         if aq_fxn is None:
             selected = (rng or random).sample(procedures, suggestion_count)
             acq_values = [0.0] * len(selected)
@@ -2855,25 +2916,18 @@ class LocalBOState:
             )
             selected, acq_values, means, stds = raw[:4]
             degenerate_scores = bool(raw[4]) if len(raw) > 4 else False
+            degenerate_info = raw[5] if len(raw) > 5 else {}
             if degenerate_scores:
-                note = (
-                    "LLM predictions were flat across the scored shortlist; "
-                    "selected a random exploratory candidate instead of using "
-                    "an arbitrary tied acquisition ranking."
+                count = int(degenerate_info.get("score_count") or len(procedures))
+                flat_mean = float(degenerate_info.get("mean") or 0.0)
+                flat_std = float(degenerate_info.get("std") or 0.0)
+                selection_note = (
+                    f"LLM predictions were flat across {count} scored "
+                    f"candidate(s) at {flat_mean:g} +/- {flat_std:g}; "
+                    "selected by inverse-design/MMR retrieval rank because the "
+                    "acquisition function had no prediction-based ranking signal."
                 )
-                self.log(note)
-                fallback = self._random_suggestions(
-                    available,
-                    rng=rng,
-                    k=suggestion_count,
-                    source="llm",
-                    acquisition_name=acquisition_name,
-                    selection_note=note,
-                )
-                for suggestion in fallback:
-                    suggestion["inverse_seed"] = inverse_text
-                    suggestion["objective_scaling"] = scaler.get("mode", "off")
-                return fallback
+                self.log(selection_note)
         self.check_cancelled()
         if not selected:
             return self._random_suggestions(available)
@@ -2892,6 +2946,7 @@ class LocalBOState:
                 "std": _unscale_uncertainty(std, scaler),
                 **metadata,
                 "inverse_seed": inverse_text,
+                "selection_note": selection_note,
             }
             for procedure, aq, mean, std in zip(selected, acq_values, means, stds)
             if procedure in by_proc
@@ -3141,6 +3196,7 @@ class LocalBOState:
                 "benchmark_iterations",
                 "benchmark_replicates",
                 "benchmark_initial_points",
+                "benchmark_initial_seed_strategy",
                 "benchmark_seed",
                 "greedy_final_iteration",
             ]
@@ -3187,6 +3243,7 @@ class LocalBOState:
     ) -> List[Dict[str, Any]]:
         if not replicate_traces:
             return []
+        bounds = self.plot_objective_bounds()
         indexes = sorted(
             {
                 int(point["index"])
@@ -3207,13 +3264,14 @@ class LocalBOState:
                 continue
             mean = float(np.mean(values))
             std = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+            lower, upper = _bounded_interval(mean, std, bounds)
             summary.append(
                 {
                     "index": index,
                     "mean": mean,
                     "std": std,
-                    "lower": mean - std,
-                    "upper": mean + std,
+                    "lower": lower,
+                    "upper": upper,
                     "count": len(values),
                 }
             )
@@ -3222,6 +3280,7 @@ class LocalBOState:
     def _summarize_prediction_points(
         self, replicate_observations: List[List[Dict[str, Any]]]
     ) -> List[Dict[str, Any]]:
+        bounds = self.plot_objective_bounds()
         indexes = sorted(
             {
                 index
@@ -3251,13 +3310,14 @@ class LocalBOState:
             between = float(np.var(means, ddof=1)) if len(means) > 1 else 0.0
             within = float(np.mean(variances)) if variances else 0.0
             std_value = float(np.sqrt(max(0.0, between + within)))
+            lower, upper = _bounded_interval(mean_value, std_value, bounds)
             summary.append(
                 {
                     "index": index,
                     "mean": mean_value,
                     "std": std_value,
-                    "lower": mean_value - std_value,
-                    "upper": mean_value + std_value,
+                    "lower": lower,
+                    "upper": upper,
                     "count": len(means),
                 }
             )
@@ -3473,6 +3533,34 @@ class LocalBOState:
                 extra={"partial_run": partial_run},
             )
             try:
+                seed_strategy = (
+                    self.config.get("benchmark_initial_seed_strategy") or "random"
+                )
+                objective_name = self.config["objective_name"]
+                mean_seed_candidate = None
+                if seed_strategy == "mean_nonzero":
+                    all_values = [
+                        float(c["objectives"][objective_name]) for c in labelled
+                    ]
+                    nonzero_candidates = [
+                        c
+                        for c in labelled
+                        if float(c["objectives"][objective_name]) != 0.0
+                    ]
+                    if all_values and nonzero_candidates:
+                        mean_y = sum(all_values) / len(all_values)
+                        mean_seed_candidate = min(
+                            nonzero_candidates,
+                            key=lambda c: (
+                                abs(float(c["objectives"][objective_name]) - mean_y),
+                                str(c.get("id", "")),
+                            ),
+                        )
+                    else:
+                        self.log(
+                            "Mean-nonzero seed strategy requested but no nonzero "
+                            "labels found; falling back to random seed."
+                        )
                 for replicate in range(replicates):
                     self.check_cancelled()
                     rng = random.Random(seed + replicate)
@@ -3488,6 +3576,16 @@ class LocalBOState:
                         for obs in observations
                         if obs.get("candidate_id")
                     }
+                    if (
+                        mean_seed_candidate is not None
+                        and not observations
+                        and initial_points >= 1
+                        and mean_seed_candidate["id"] not in selected_ids
+                    ):
+                        observations.append(
+                            self._observation_from_candidate(mean_seed_candidate)
+                        )
+                        selected_ids.add(mean_seed_candidate["id"])
                     for candidate in shuffled:
                         if len(observations) >= initial_points:
                             break
@@ -3499,6 +3597,27 @@ class LocalBOState:
                     if len(observations) >= initial_points:
                         completed_steps = completed_display_total()
                         initial_label = "point" if initial_points == 1 else "points"
+                        used_mean_seed = (
+                            mean_seed_candidate is not None
+                            and observations
+                            and observations[0].get("candidate_id")
+                            == mean_seed_candidate["id"]
+                        )
+                        if used_mean_seed:
+                            if initial_points == 1:
+                                init_detail = (
+                                    "initialized 1 mean-nonzero seed point"
+                                )
+                            else:
+                                init_detail = (
+                                    f"initialized 1 mean-nonzero seed point + "
+                                    f"{initial_points - 1} random initial points"
+                                )
+                        else:
+                            init_detail = (
+                                f"initialized {initial_points} random initial "
+                                f"{initial_label}"
+                            )
                         self.set_progress(
                             f"Running benchmark: {name}",
                             completed_steps,
@@ -3506,8 +3625,7 @@ class LocalBOState:
                             detail=(
                                 f"Replicate {replicate + 1}/{replicates}, "
                                 f"experiment {completed_display_steps(observations)}/"
-                                f"{progress_steps_per_replicate}, initialized "
-                                f"{initial_points} random initial {initial_label}"
+                                f"{progress_steps_per_replicate}, {init_detail}"
                             ),
                             extra={"partial_run": partial_run},
                         )
@@ -4549,7 +4667,7 @@ INDEX_HTML = r"""<!doctype html>
           </div>
           <div class="field">
             <label for="llmUncertaintyCalibration">LLM uncertainty scalar</label>
-            <input id="llmUncertaintyCalibration" type="number" min="0" max="100" step="0.01" value="4.33">
+            <input id="llmUncertaintyCalibration" type="number" min="0" max="100" step="0.01" value="1">
           </div>
         </div>
         <div class="row">
@@ -4661,6 +4779,14 @@ INDEX_HTML = r"""<!doctype html>
             <label for="benchmarkIterations">BO iterations</label>
             <input id="benchmarkIterations" type="number" min="1" value="30">
           </div>
+        </div>
+        <div class="field">
+          <label for="benchmarkInitialSeedStrategy">Initial seed strategy</label>
+          <select id="benchmarkInitialSeedStrategy">
+            <option value="random">Random (default)</option>
+            <option value="mean_nonzero">Closest nonzero label to dataset mean</option>
+          </select>
+          <div class="hint">Controls the first initial point. <code>Random</code> samples uniformly and is the paper-style setting. <code>Closest nonzero label to dataset mean</code> is a labeled-data diagnostic for sparse offline datasets; it is not a live-realistic benchmark. Any extra initial points stay random.</div>
         </div>
         <div class="row">
           <div class="field">
@@ -4817,8 +4943,8 @@ INDEX_HTML = r"""<!doctype html>
       objectiveName: 'The numeric label column to optimize. If multiple objective columns were uploaded, choose one here.',
       objectiveDirection: 'Maximize for yields/selectivity/scores; minimize for losses, errors, or costs.',
       acquisition: 'Candidate ranking rule. The paper notebook default sweep included upper confidence bound, greedy, random, and random mean baseline.',
-      objectiveLowerBound: 'Optional physical or measurement lower bound in original units. Used only in LLM system messages and plot display, not acquisition math.',
-      objectiveUpperBound: 'Optional physical or measurement upper bound in original units. For phase percentages, use 100. Used only in LLM system messages and plot display.',
+      objectiveLowerBound: 'Optional physical or measurement lower bound in original units. Used only for plot guides and clipping displayed error-bar endpoints, not prompts or acquisition math.',
+      objectiveUpperBound: 'Optional physical or measurement upper bound in original units. For phase percentages, use 100. Used only for plot guides and clipping displayed error-bar endpoints, not prompts or acquisition math.',
       objectiveScaling: 'Off keeps labels in original units. Auto/min-max/z-score are used for GPR fitting only; BO-ICL LLM always uses original units so prompts, floors, and predictions stay consistent.',
       plotStatGuides: 'Controls full-dataset dashed reference lines. Best only is cleaner; Paper stats adds mean and percentile guides.',
       embeddingModel: 'OpenAI embedding model used to featurize procedures for GPR and nearest-neighbor inverse filtering.',
@@ -4829,7 +4955,7 @@ INDEX_HTML = r"""<!doctype html>
       batchSize: 'Number of candidates suggested at once in live experimentation. The paper BO loop used 1.',
       ucbLambda: 'Exploration weight for upper confidence bound. The paper notebook default was 0.1.',
       llmSamples: 'Number of LLM prediction samples per shortlisted candidate for BO-ICL uncertainty estimates.',
-      llmUncertaintyCalibration: 'Multiplicative calibration factor applied to LLM predictive standard deviations before acquisition scoring and plotting. Default 4.33 comes from the paper gpt-4/topk calibration table.',
+      llmUncertaintyCalibration: 'Multiplicative calibration factor applied to LLM predictive standard deviations before acquisition scoring and plotting. Default 1 leaves the LLM sample spread untouched. The paper used 4.33 as a per-dataset recalibrated value for gpt-4/topk on the C2 yield benchmark; that constant should not be assumed to transfer without refitting via uncertainty_toolbox.',
       selectorK: 'Number of nearest labeled examples to include in prompts. 0 uses the normal few-shot history.',
       inverseFilter: 'LLM-mode shortlist size retrieved with inverse-design text plus cached embeddings before completions are requested. Full pool mode searches every available candidate; Broad random pool mode searches the sampled broad pool. 0 disables the shortlist and scores the broad pool.',
       inverseRandomCandidates: 'Extra random candidates mixed with the LLM shortlist before completions are requested.',
@@ -4849,6 +4975,7 @@ INDEX_HTML = r"""<!doctype html>
       autoSuggest: 'When checked, adding a live result immediately refreshes suggestions.',
       benchmarkName: 'Optional label for this appended offline benchmark curve.',
       benchmarkInitialPoints: 'Number of real random starting experiments before BO model selection starts. Allowed range is 1 to 3; the paper default was 1.',
+      benchmarkInitialSeedStrategy: 'Controls how the first initial point is chosen for each benchmark replicate. Random samples uniformly from labeled candidates and is the paper-style/live-realistic setting. Closest nonzero label to dataset mean is a labeled-data diagnostic for sparse offline datasets; it deliberately uses hidden labels and should not be used for live-realistic performance claims. Any extra initial points beyond the first still come from the random shuffle.',
       benchmarkIterations: 'Number of BO choices after initialization. The paper notebook default was 30.',
       benchmarkReplicates: 'Number of repeated runs for the same workflow. The paper notebook default was 5.',
       benchmarkSeed: 'Starting random seed for reproducible benchmark replicates.',
@@ -5042,6 +5169,7 @@ INDEX_HTML = r"""<!doctype html>
         benchmark_iterations: Number($('benchmarkIterations').value || 30),
         benchmark_replicates: Number($('benchmarkReplicates').value || 5),
         benchmark_initial_points: Number($('benchmarkInitialPoints').value || 1),
+        benchmark_initial_seed_strategy: $('benchmarkInitialSeedStrategy').value || 'random',
         benchmark_seed: Number($('benchmarkSeed').value || 0),
         greedy_final_iteration: $('greedyFinalIteration').checked,
         ucb_lambda: Number($('ucbLambda').value || 0.1),
@@ -5174,6 +5302,7 @@ INDEX_HTML = r"""<!doctype html>
       $('benchmarkIterations').value = config.benchmark_iterations;
       $('benchmarkReplicates').value = config.benchmark_replicates;
       $('benchmarkInitialPoints').value = config.benchmark_initial_points;
+      $('benchmarkInitialSeedStrategy').value = config.benchmark_initial_seed_strategy || 'random';
       $('benchmarkSeed').value = config.benchmark_seed;
       $('greedyFinalIteration').checked = Boolean(config.greedy_final_iteration);
       $('ucbLambda').value = config.ucb_lambda;
@@ -5423,8 +5552,13 @@ INDEX_HTML = r"""<!doctype html>
         const number = Number(value);
         return Number.isFinite(number) ? number : null;
       };
-      let objectiveLower = optionalNumber((state.config || {}).objective_lower_bound);
-      let objectiveUpper = optionalNumber((state.config || {}).objective_upper_bound);
+      const plotBounds = state.plot_objective_bounds || {};
+      let objectiveLower = optionalNumber(
+        plotBounds.lower !== undefined ? plotBounds.lower : (state.config || {}).objective_lower_bound
+      );
+      let objectiveUpper = optionalNumber(
+        plotBounds.upper !== undefined ? plotBounds.upper : (state.config || {}).objective_upper_bound
+      );
       if (objectiveLower !== null && objectiveUpper !== null && objectiveLower > objectiveUpper) {
         const swapped = objectiveLower;
         objectiveLower = objectiveUpper;
@@ -5556,13 +5690,19 @@ INDEX_HTML = r"""<!doctype html>
         const points = run.prediction_summary || [];
         if (!points.length) return '';
         const color = run.color || '#7c3aed';
+        const expectedReps = Number((run.config || {}).benchmark_replicates || 0);
         return points.map((item) => {
           const cx = x(item.index);
           const displayMean = clipToObjectiveBounds(item.mean);
           const cy = y(displayMean);
           const std = Number(item.std || 0);
-          const err = std ? `<line x1="${cx}" x2="${cx}" y1="${y(clipToObjectiveBounds(item.mean - std))}" y2="${y(clipToObjectiveBounds(item.mean + std))}" stroke="${color}" stroke-width="1.4" opacity="0.75" />` : '';
-          return `${err}<path d="M ${cx.toFixed(1)} ${(cy - 5).toFixed(1)} L ${(cx + 5).toFixed(1)} ${cy.toFixed(1)} L ${cx.toFixed(1)} ${(cy + 5).toFixed(1)} L ${(cx - 5).toFixed(1)} ${cy.toFixed(1)} Z" fill="#fff" stroke="${color}" stroke-width="1.8" opacity="0.85"><title>${escapeHtml(run.name)} predicted: ${fmt(item.mean)} +/- ${fmt(item.std)}</title></path>`;
+          const count = Number(item.count || 0);
+          const partial = expectedReps > 1 && count > 0 && count < expectedReps;
+          const opacity = partial ? '0.45' : '0.85';
+          const dashAttr = partial ? ' stroke-dasharray="3 2"' : '';
+          const err = std ? `<line x1="${cx}" x2="${cx}" y1="${y(clipToObjectiveBounds(item.mean - std))}" y2="${y(clipToObjectiveBounds(item.mean + std))}" stroke="${color}" stroke-width="1.4" opacity="${partial ? '0.4' : '0.75'}"${dashAttr} />` : '';
+          const tooltipCount = expectedReps > 0 ? ` (n=${count}/${expectedReps}${partial ? ', partial' : ''})` : '';
+          return `${err}<path d="M ${cx.toFixed(1)} ${(cy - 5).toFixed(1)} L ${(cx + 5).toFixed(1)} ${cy.toFixed(1)} L ${cx.toFixed(1)} ${(cy + 5).toFixed(1)} L ${(cx - 5).toFixed(1)} ${cy.toFixed(1)} Z" fill="#fff" stroke="${color}" stroke-width="1.8" opacity="${opacity}"${dashAttr}><title>${escapeHtml(run.name)} predicted: ${fmt(item.mean)} +/- ${fmt(item.std)}${tooltipCount}</title></path>`;
         }).join('');
       }).join('');
       const livePredictions = activeObs.map((item, idx) => {
@@ -6754,7 +6894,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
       </ol>
       <div class="callout">Paper-style numerical defaults are <code>Initial random = 1</code>, <code>Batch size = 1</code>, <code>BO iterations = 30</code>, <code>Workflow replicates = 5</code>, and <code>UCB lambda = 0.1</code>. Current model defaults use supported modern model IDs rather than retired paper-era model names.</div>
       <p>For BO-ICL LLM runs on large pools, <code>LLM shortlist</code> retrieves the smaller inverse-design/embedding shortlist that is actually scored by the LLM. The inverse-design target is based on the current replicate's labeled history: by default it uses current best x <code>Normal(1.2, 0.05)</code>, matching the paper-style stochastic target. If sparse observations are often zero, set <code>Auto target floor</code> to a meaningful minimum aspirational value so the inverse query does not stay anchored at zero. With <code>LLM pool scope = Full pool (paper)</code>, the shortlist searches the full available pool with cached embeddings and MMR/cosine similarity, then optional random add-ons. With <code>Broad random pool (fast)</code>, the app first samples <code>Broad pool</code> candidates and runs the same MMR/cosine step only inside that subset. The default <code>LLM shortlist = 16</code>, <code>Random add-ons = 0</code>, and <code>LLM samples = 3</code> scores at most 16 candidates per BO step.</p>
-      <p>LLM runtime scales with <code>(LLM shortlist + Random add-ons) x LLM samples x BO iterations x Workflow replicates</code> when the shortlist is enabled. If <code>LLM shortlist = 0</code>, runtime falls back to <code>Broad pool x LLM samples</code>. If every scored LLM prediction is flat, for example all candidates score <code>0 +/- 0</code>, the acquisition ranking is treated as uninformative and the app falls back to random exploration from the available pool instead of selecting an arbitrary first shortlist item. Rate-limit errors are retried automatically; increase <code>429 cooldown (s)</code>, increase <code>API pause (s)</code>, or lower the shortlist/samples if 429s keep appearing. Use the <code>Stop</code> button in the progress panel to cancel after the current API call returns.</p>
+      <p>LLM runtime scales with <code>(LLM shortlist + Random add-ons) x LLM samples x BO iterations x Workflow replicates</code> when the shortlist is enabled. If <code>LLM shortlist = 0</code>, runtime falls back to <code>Broad pool x LLM samples</code>. If every scored LLM prediction is flat, for example all candidates score <code>0 +/- 0</code>, the acquisition ranking is treated as uninformative and the app chooses by inverse-design/MMR retrieval rank while recording that the predictor did not provide a useful value ranking. Rate-limit errors are retried automatically; increase <code>429 cooldown (s)</code>, increase <code>API pause (s)</code>, or lower the shortlist/samples if 429s keep appearing. Use the <code>Stop</code> button in the progress panel to cancel after the current API call returns.</p>
       <p>The plot shows the mean best-so-far trajectory and a +/- 1 sample-standard-deviation band across workflow replicates. Model prediction markers show the predicted objective mean and calibrated uncertainty for BO-selected points separately from the measured value. The dashed random baseline is the paper notebook's random-mean quantile expectation. <code>Plot guides</code> defaults to the best labelled value only; switch it to <code>Paper stats</code> to add the mean and percentile guide lines.</p>
     </section>
 
@@ -6782,16 +6922,17 @@ USER_GUIDE_HTML = r"""<!doctype html>
           <tr><td>Suggestion engine</td><td><code>GPR with embeddings</code> uses OpenAI embeddings plus a Gaussian process. <code>BO-ICL LLM</code> uses the selected LLM for in-context predictions.</td></tr>
           <tr><td>Acquisition</td><td>Rule for ranking the next experiment. UCB balances mean and uncertainty; expected improvement favors likely gains; greedy uses predicted best; random is a control.</td></tr>
           <tr><td>Target scaling</td><td>Off by default. Auto/min-max/z-score can help GPR numerics when bounded labels are not already near unit scale. BO-ICL LLM keeps labels, inverse targets, floors, and predictions in original objective units.</td></tr>
-          <tr><td>Objective bounds</td><td>Optional lower/upper physical bounds in original units. They are added to LLM system-message context as validation limits and used to clip plot display of prediction/error bars, but they are not labels, targets, or default predictions. Raw predictions, exports, and acquisition scores are not clamped.</td></tr>
+          <tr><td>Objective bounds</td><td>Optional lower/upper physical bounds in original units. They are used for plot guide lines and to clip displayed prediction/error-bar endpoints, but they are not sent to LLM prompts and they do not change labels, targets, raw predictions, exports, or acquisition scores. Percent-like objectives infer 0-100 display bounds when these fields are blank.</td></tr>
           <tr><td>Broad pool</td><td>Caps candidates scored by GPR. In LLM mode, it is used only when <code>LLM shortlist = 0</code> or when <code>LLM pool scope = Broad random pool</code>.</td></tr>
           <tr><td>LLM shortlist</td><td>Number of candidates retrieved by inverse-design text plus cached embeddings before LLM scoring. In Full pool mode this matches the paper; in Broad random pool mode it is a faster approximation.</td></tr>
           <tr><td>LLM pool scope</td><td><code>Full pool (paper)</code> compares the inverse-design query against every available candidate. <code>Broad random pool (fast)</code> first samples the Broad pool and then applies MMR/cosine similarity inside that subset.</td></tr>
-          <tr><td>LLM uncertainty scalar</td><td>Multiplicative factor applied to LLM predictive standard deviations before acquisition scoring and plotting. The default <code>4.33</code> is the paper's <code>gpt-4/topk</code> recalibration factor; use <code>1</code> for uncalibrated sample spread.</td></tr>
+          <tr><td>LLM uncertainty scalar</td><td>Multiplicative factor applied to LLM predictive standard deviations before acquisition scoring and plotting. The default <code>1</code> leaves the LLM sample spread untouched. The paper used <code>4.33</code> as a per-dataset recalibrated value for <code>gpt-4/topk</code> on the C2 yield benchmark and refit it on a held-out slice via <code>uncertainty_toolbox</code>; do not assume that constant transfers to other datasets without refitting.</td></tr>
           <tr><td>Suggestions Method / Acq / Mean</td><td><code>Method</code> records source, model, and acquisition function. <code>Mean</code> is the predicted objective in original units. <code>Acq</code> is the acquisition score used for ranking. The inverse-design target creates the retrieval query; shortlisted candidates do not have to predict exactly at that target.</td></tr>
           <tr><td>Prediction markers</td><td>For model-selected points, the plot can show the stored prediction mean and uncertainty as a distinct marker with an error bar. The measured value remains the actual observation and best-so-far trace.</td></tr>
           <tr><td>Live Random Walk</td><td>Separate live control trajectory. The app selects one random available candidate at a time, waits for the measured value, then appends it to the random-control plot/export without adding it to the BO training context.</td></tr>
           <tr><td>Auto target jitter</td><td>Stochastic spread around the automatic inverse-design target multiplier. The default <code>0.05</code> gives current best x <code>Normal(1.2, 0.05)</code>; set it to <code>0</code> for deterministic targets.</td></tr>
           <tr><td>Auto target floor</td><td>Optional minimum automatic inverse-design target for sparse-zero maximization campaigns. For phase percentages, use whole percent units such as <code>5</code> or <code>10</code>. Manual inverse target overrides it.</td></tr>
+          <tr><td>Initial seed strategy</td><td>How the first initial point is chosen for each replicate of the offline benchmark. <code>Random</code> samples uniformly from labeled candidates and is the paper-style/live-realistic setting. <code>Closest nonzero label to dataset mean</code> is a labeled-data diagnostic for sparse offline datasets; it deliberately uses hidden labels and should not be used for live-realistic performance claims. Extra initial points beyond the first remain random.</td></tr>
           <tr><td>Greedy for final iteration</td><td>Offline benchmark option that keeps the selected acquisition for earlier BO choices, then uses greedy acquisition for the final BO choice in each replicate.</td></tr>
           <tr><td>API pause / 429 cooldown / 429 retries</td><td><code>API pause</code> spaces out successful calls. <code>429 cooldown</code> waits after a rate-limit error before retrying. Retries controls how many recovery attempts are allowed before the partial run is saved for resume.</td></tr>
           <tr><td>Replicates</td><td>Live-mode repeated measurements allowed for the same candidate before it is removed from the available pool.</td></tr>

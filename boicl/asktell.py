@@ -248,16 +248,15 @@ class AskTellFewShot:
         results, tokens = self._predict(queries, system_message=system_message)
         self.tokens_used += tokens
 
-        # need to replace any GaussDist with pop std
+        # GaussDist comes back with no std when all LLM samples agreed on one
+        # value. Default it to 0 so the calibration multiply below is well
+        # defined; this is an honest "the LLM agreed with itself across
+        # samples" reading instead of the prior substitution which used
+        # np.std(self._ys) and produced a growing band tied to label spread
+        # rather than to prediction confidence.
         for i, result in enumerate(results):
-            if len(self._ys) > 1:
-                ystd = np.std(self._ys)
-            elif len(self._ys) == 1:
-                ystd = self._ys[0]
-            else:
-                ystd = 10
-            if isinstance(result, GaussDist):
-                results[i].set_std(ystd)
+            if isinstance(result, GaussDist) and result.std() is None:
+                results[i].set_std(0.0)
 
         if self._calibration_factor:
             for i, result in enumerate(results):

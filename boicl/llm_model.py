@@ -32,7 +32,7 @@ _KEYED_NUMERIC_RE = re.compile(
 
 
 def extract_numeric_prediction(text):
-    """Extract a numeric prediction without treating prompt bounds as answers."""
+    """Extract a numeric prediction without treating prompt ranges as answers."""
     text = str(text or "").strip()
     if "###" in text:
         text = text.split("###", 1)[0].strip()

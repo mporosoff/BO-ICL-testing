@@ -94,19 +94,21 @@ Typical settings:
 - **Target scaling**: start with `Off` for LLM BO-ICL on bounded percentages.
   The LLM path keeps labels, inverse-design targets, floors, and predictions in
   original objective units; auto/min-max/z-score scaling is used only for GPR.
-- **Objective bounds**: optional. For phase percentages, use lower `0` and
-  upper `100`; these bounds are given to the LLM as validation limits and used
-  to clip plotted prediction/error bars, but they are not treated as labels,
-  targets, or default predictions. Raw predictions and acquisition scores are
-  kept.
+- **Objective bounds**: optional display/math limits. For phase percentages,
+  use lower `0` and upper `100`; these bounds are used for plot guide lines and
+  to clip displayed prediction/error-bar endpoints, but they are not sent to
+  LLM prompts and they do not change labels, inverse-design targets, raw
+  predictions, CSV exports, or acquisition ranking.
 - **Initial random points**: real starting experiments, usually `1` or `2`,
   capped at `3`.
 - **BO iterations**: number of sequential model-selected experiments.
 - **Workflow replicates**: repeated runs for mean and spread bands.
 - **Greedy for final iteration**: optional final exploitation step.
-- **LLM uncertainty scalar**: default `4.33`, the paper's `gpt-4/topk`
-  recalibration factor. It multiplies LLM predictive standard deviations before
-  acquisition scoring and plotting.
+- **LLM uncertainty scalar**: default `1` (no rescaling). The paper used `4.33`
+  as a per-dataset recalibrated value for `gpt-4/topk` on the C2 yield
+  benchmark; that constant should not be assumed to transfer to other datasets
+  without refitting via `uncertainty_toolbox`. The scalar multiplies LLM
+  predictive standard deviations before acquisition scoring and plotting.
 
 Click **Run & Append** to add the current configuration to the plot. Completed
 runs stay in the saved campaign and are not overwritten by later runs.
@@ -237,9 +239,10 @@ and plot history.
   resulting mean/std are stored for selected points and plotted as prediction
   error bars.
 - **LLM uncertainty scalar**: editable multiplier applied to the predictive
-  standard deviation from LLM samples. `4.33` matches the paper's calibrated
-  `gpt-4/topk` uncertainty scaling; use `1` for uncalibrated sample spread or
-  `0` to disable multiplicative scaling.
+  standard deviation from LLM samples. The default `1` leaves the LLM sample
+  spread untouched. `4.33` was the paper's per-dataset recalibrated value for
+  `gpt-4/topk` on the C2 yield benchmark; that constant should not be reused on
+  other datasets without refitting. Use `0` to disable multiplicative scaling.
 - **Auto target multiplier/jitter/floor**: controls the automatic inverse-design
   target used for shortlist retrieval.
 
@@ -248,21 +251,21 @@ original objective units, while **Acq** is the acquisition score used to rank th
 candidate. The inverse-design target is only a retrieval query for building the
 shortlist; candidate means do not have to equal that target.
 If every scored LLM prediction is flat, for example all candidates score
-`0 +/- 0`, the app treats the acquisition ranking as uninformative and falls
-back to random exploration from the available pool instead of selecting an
-arbitrary first shortlist item.
+`0 +/- 0`, the app treats the acquisition ranking as uninformative and chooses
+by inverse-design/MMR retrieval rank. This keeps the run AI-directed while
+recording that the predictor did not provide a useful value ranking.
 The **Method** column shows the source, model, and acquisition used to generate
 the row. If you change model or acquisition settings and save them, old
 suggestions are cleared so they are not mistaken for suggestions from the new
 configuration.
 
 **Objective lower/upper bound** fields are optional physical or measurement
-bounds. They are included in the LLM system-message context and used to keep the
-plot display within sensible limits, for example clipping a `95 +/- 30`
-prediction error bar to the valid `0-100` percentage range. They do not clamp
-stored prediction values, measured observations, CSV exports, or acquisition
-ranking. A runtime prediction guardrail is also added so the LLM treats bounds
-as validation limits rather than answers.
+bounds for display and interval math only. They keep plotted intervals sensible,
+for example clipping the displayed endpoints of a `95 +/- 30` prediction error
+bar to the valid `0-100` percentage range. They are not included in LLM prompts
+and do not clamp stored prediction values, measured observations, CSV exports,
+or acquisition ranking. Percent-like objective names such as `alpha_pct` or
+`alpha phase (%)` infer `0-100` display bounds when the fields are blank.
 
 For sparse phase data with many zeros, set an **Auto target floor** such as
 `5` or `10` so the inverse-design query does not stay pinned at zero.

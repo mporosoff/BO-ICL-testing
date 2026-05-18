@@ -14,6 +14,7 @@ from boicl.local_app import (
     GENERATED_PREDICTION_PROMPT_PREFIX,
     INDEX_HTML,
     LocalBOState,
+    OBJECTIVE_BOUNDS_PROMPT_MARKER,
     POOL_BUILDER_HTML,
     RunCancelled,
     _best_trace,
@@ -176,7 +177,7 @@ def test_import_dataset_accepts_npy_table(tmp_path):
     assert state.candidates[1]["objectives"]["objective"] == 2.5
 
 
-def test_defaults_match_paper_style_numeric_settings():
+def test_defaults_match_current_numeric_settings():
     assert DEFAULT_CONFIG["benchmark_initial_points"] == 1
     assert DEFAULT_CONFIG["batch_size"] == 1
     assert DEFAULT_CONFIG["benchmark_iterations"] == 30
@@ -186,7 +187,7 @@ def test_defaults_match_paper_style_numeric_settings():
     assert DEFAULT_CONFIG["objective_upper_bound"] == ""
     assert DEFAULT_CONFIG["ucb_lambda"] == 0.1
     assert DEFAULT_CONFIG["llm_samples"] == 3
-    assert DEFAULT_CONFIG["llm_uncertainty_calibration"] == 4.33
+    assert DEFAULT_CONFIG["llm_uncertainty_calibration"] == 1.0
     assert DEFAULT_CONFIG["llm_pool_scope"] == "full"
     assert DEFAULT_CONFIG["inverse_filter"] == 16
     assert DEFAULT_CONFIG["inverse_random_candidates"] == 0
@@ -821,7 +822,7 @@ def test_llm_model_keeps_original_units_when_target_scaling_is_enabled(
         ("zero procedure", 0.0),
         ("best procedure", 100.0),
     ]
-    assert calibration_values == [4.33]
+    assert calibration_values == [1.0]
     assert state._inverse_target_model_value(scaler, [observations[0]]) == 5.0
 
 
@@ -883,6 +884,28 @@ def test_prediction_summary_combines_offline_replicate_predictions(tmp_path):
     assert summary[0]["index"] == 1
     assert summary[0]["mean"] == 12.0
     assert round(summary[0]["std"], 6) == round((8.0 + 5.0) ** 0.5, 6)
+
+
+def test_plot_intervals_are_clipped_to_objective_display_bounds(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.update_config({"objective_name": "alpha phase (%)"})
+
+    assert state.to_json()["plot_objective_bounds"] == {"lower": 0.0, "upper": 100.0}
+
+    prediction_summary = state._summarize_prediction_points(
+        [[{"prediction": {"mean": 95.0, "std": 30.0}}]]
+    )
+    assert prediction_summary[0]["mean"] == 95.0
+    assert prediction_summary[0]["std"] == 30.0
+    assert prediction_summary[0]["lower"] == 65.0
+    assert prediction_summary[0]["upper"] == 100.0
+
+    replicate_summary = state._summarize_replicate_traces(
+        [[{"index": 1, "best": 80.0}], [{"index": 1, "best": 100.0}]]
+    )
+    assert replicate_summary[0]["mean"] == 90.0
+    assert replicate_summary[0]["lower"] >= 0.0
+    assert replicate_summary[0]["upper"] == 100.0
 
 
 def test_live_random_walk_records_control_points_and_exports_them(tmp_path):
@@ -1290,7 +1313,7 @@ def test_live_llm_shortlist_can_prefilter_with_broad_pool(tmp_path, monkeypatch)
     assert payload["suggestions"][0]["std"] == 1.0
 
 
-def test_llm_flat_predictions_fall_back_to_random_exploration(tmp_path):
+def test_llm_flat_predictions_use_inverse_retrieval_rank(tmp_path):
     state = LocalBOState(tmp_path)
     rows = ["procedure", *[f"proc {index}" for index in range(5)]]
     state.import_dataset("pool.csv", "\n".join(rows).encode("utf-8"))
@@ -1309,10 +1332,6 @@ def test_llm_flat_predictions_fall_back_to_random_exploration(tmp_path):
         def predict(self, possible_x, system_message=""):
             return [GaussDist(0.0, 0.0) for _ in possible_x]
 
-    class LastSampler:
-        def sample(self, items, k):
-            return list(items)[-k:]
-
     state._build_llm_model = lambda observations=None: (FakeModel(), {"mode": "off"})
     state._inverse_target_display_value = lambda *args, **kwargs: 5.0
     state._generate_inverse_text = lambda *args, **kwargs: "target-like query"
@@ -1321,14 +1340,15 @@ def test_llm_flat_predictions_fall_back_to_random_exploration(tmp_path):
     suggestions = state._llm_suggestions(
         state.available_candidates(),
         state.active_observations(),
-        rng=LastSampler(),
+        rng=random.Random(99),
         k=1,
     )
 
-    assert suggestions[0]["procedure"] == "proc 4"
+    assert suggestions[0]["procedure"] == "proc 1"
     assert suggestions[0]["source"] == "llm"
-    assert suggestions[0]["mean"] is None
+    assert suggestions[0]["mean"] == 0.0
     assert "flat" in suggestions[0]["selection_note"].lower()
+    assert "inverse-design" in suggestions[0]["selection_note"]
     assert suggestions[0]["inverse_seed"] == "target-like query"
 
 
@@ -1414,7 +1434,7 @@ def test_dataset_prompt_regeneration_preserves_custom_prompt_on_import(tmp_path)
     assert "1.2" not in payload["config"]["inverse_system_message"]
 
 
-def test_auto_prompts_refresh_when_live_objective_name_changes(tmp_path):
+def test_auto_prompts_refresh_without_adding_bounds_to_llm_context(tmp_path):
     state = LocalBOState(tmp_path)
     state.import_dataset("pool.csv", b"procedure,objective\nproc a,\nproc b,\n")
 
@@ -1429,17 +1449,26 @@ def test_auto_prompts_refresh_when_live_objective_name_changes(tmp_path):
     assert "Active objective selected in the tool: alpha Mo2C" in payload["config"][
         "prediction_system_message"
     ]
-    assert "bounded from 0 to 100" in payload["config"]["prediction_system_message"]
+    assert "bounded from 0 to 100" not in payload["config"]["prediction_system_message"]
     assert "alpha Mo2C" in payload["config"]["inverse_system_message"]
+    assert payload["plot_objective_bounds"] == {"lower": 0.0, "upper": 100.0}
 
 
-def test_custom_prompts_are_not_replaced_but_runtime_bounds_are_appended(tmp_path):
+def test_custom_prompts_are_not_replaced_and_saved_bounds_are_stripped(tmp_path):
     state = LocalBOState(tmp_path)
     state.import_dataset("pool.csv", b"procedure,objective\nproc a,\nproc b,\n")
     state.update_config(
         {
-            "prediction_system_message": "custom prediction",
-            "inverse_system_message": "custom inverse",
+            "prediction_system_message": (
+                "custom prediction\n"
+                f"{OBJECTIVE_BOUNDS_PROMPT_MARKER} the active objective is physically "
+                "bounded from 0 to 100 in original objective units."
+            ),
+            "inverse_system_message": (
+                "custom inverse\n"
+                f"{OBJECTIVE_BOUNDS_PROMPT_MARKER} the active objective is physically "
+                "bounded from 0 to 100 in original objective units."
+            ),
         }
     )
 
@@ -1456,8 +1485,9 @@ def test_custom_prompts_are_not_replaced_but_runtime_bounds_are_appended(tmp_pat
     assert state.prediction_system_message().startswith("custom prediction")
     assert "Prediction task guardrail" in state.prediction_system_message()
     assert "not inverse design" in state.prediction_system_message()
-    assert "bounded from 0 to 100" in state.prediction_system_message()
-    assert "validation limits" in state.prediction_system_message()
+    assert "bounded from 0 to 100" not in state.prediction_system_message()
+    assert OBJECTIVE_BOUNDS_PROMPT_MARKER not in state.prediction_system_message()
+    assert OBJECTIVE_BOUNDS_PROMPT_MARKER not in state.inverse_system_message()
 
 
 def test_browser_config_tracks_llm_and_inverse_models(tmp_path):
