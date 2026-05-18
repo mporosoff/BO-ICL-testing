@@ -2292,22 +2292,6 @@ class LocalBOState:
                 )
                 self._autosave_locked()
                 return self.to_json()
-            if self.config["optimizer"] == "llm" and not self._llm_has_distinct_signal(
-                active_observations
-            ):
-                self.suggestions = self._random_suggestions(available)
-                self.last_model_status = (
-                    "Showing random cold-start candidates until at least two "
-                    "distinct objective values have been observed."
-                )
-                self.finish_progress(
-                    "Updating suggestions",
-                    "Showing random cold-start candidates until the LLM has "
-                    "non-constant labels.",
-                )
-                self._autosave_locked()
-                return self.to_json()
-
             try:
                 self.check_cancelled()
                 self.set_progress(
@@ -2996,9 +2980,7 @@ class LocalBOState:
             return rng.choice(available)
         training_rows, _ = self._training_rows_and_scaler(observations)
         if self.config["optimizer"] == "llm":
-            if len(training_rows) < 1 or not self._llm_has_distinct_signal(
-                observations
-            ):
+            if len(training_rows) < 1:
                 return rng.choice(available)
             suggestions = self._llm_suggestions(
                 available, observations, rng=rng, k=1, acquisition=acquisition
@@ -3527,21 +3509,6 @@ class LocalBOState:
     def _training_observations(self) -> List[Dict[str, Any]]:
         rows, _ = self._training_rows_and_scaler()
         return rows
-
-    def _llm_has_distinct_signal(
-        self, observations: Optional[List[Dict[str, Any]]] = None
-    ) -> bool:
-        rows, _ = _group_training_observations(
-            observations if observations is not None else self.active_observations(),
-            self.config["objective_direction"],
-            "off",
-        )
-        values = {
-            round(float(row["value"]), 12)
-            for row in rows
-            if row.get("value") is not None
-        }
-        return len(values) >= 2
 
     def reset_run(self) -> Dict[str, Any]:
         with self.lock:
@@ -6651,7 +6618,6 @@ USER_GUIDE_HTML = r"""<!doctype html>
         <li>Repeat until the iteration cap is reached or you decide to stop.</li>
       </ol>
       <p>The <code>Add Result</code> candidate field searches the full available pool by row number or procedure text, so large pools do not need a giant dropdown. If a test or incorrect result is added, use <code>Delete</code> in the <code>Observations</code> table and update suggestions again. Objective values should be entered in original units. Scaling is only used internally for fitting if enabled, and the plot remains in original units.</p>
-      <p>For BO-ICL LLM, the app shows random cold-start candidates until at least two distinct objective values have been observed. This prevents sparse objectives from collapsing into overconfident <code>0 +/- 0</code> predictions after a single zero-valued seed.</p>
       <p>Use <code>Live Random Walk</code> to collect a separate live random-control trace when full-dataset statistics are not known. Set the point count, click <code>Start / Next Random</code>, run that random candidate, enter its measured value and optional uncertainty, and click <code>Add Random Result</code>. These random-control rows do not train the BO model; they are saved, plotted, archived, and exported separately.</p>
       <p>The <code>Observations</code> table keeps the method used for each selected point, including source, model, and acquisition function. Saving changed model or acquisition settings clears old suggestions so they are not accidentally used under the new controls.</p>
     </section>
@@ -6664,7 +6630,6 @@ USER_GUIDE_HTML = r"""<!doctype html>
           <tr><td>Suggestion engine</td><td><code>GPR with embeddings</code> uses OpenAI embeddings plus a Gaussian process. <code>BO-ICL LLM</code> uses the selected LLM for in-context predictions.</td></tr>
           <tr><td>Acquisition</td><td>Rule for ranking the next experiment. UCB balances mean and uncertainty; expected improvement favors likely gains; greedy uses predicted best; random is a control.</td></tr>
           <tr><td>Target scaling</td><td>Off by default. Auto/min-max/z-score can help GPR numerics when bounded labels are not already near unit scale. BO-ICL LLM keeps labels, inverse targets, floors, and predictions in original objective units.</td></tr>
-          <tr><td>LLM cold start</td><td>BO-ICL LLM uses random/diverse candidates until at least two distinct objective values are observed, then switches to inverse-design shortlist plus LLM acquisition scoring.</td></tr>
           <tr><td>Objective bounds</td><td>Optional lower/upper physical bounds in original units. They are added to LLM system-message context and used to clip plot display of prediction/error bars, but raw predictions, exports, and acquisition scores are not clamped.</td></tr>
           <tr><td>Broad pool</td><td>Caps candidates scored by GPR. In LLM mode, it is used only when <code>LLM shortlist = 0</code> or when <code>LLM pool scope = Broad random pool</code>.</td></tr>
           <tr><td>LLM shortlist</td><td>Number of candidates retrieved by inverse-design text plus cached embeddings before LLM scoring. In Full pool mode this matches the paper; in Broad random pool mode it is a faster approximation.</td></tr>

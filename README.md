@@ -94,9 +94,6 @@ Typical settings:
 - **Target scaling**: start with `Off` for LLM BO-ICL on bounded percentages.
   The LLM path keeps labels, inverse-design targets, floors, and predictions in
   original objective units; auto/min-max/z-score scaling is used only for GPR.
-- **LLM cold start**: BO-ICL LLM now uses random/diverse candidates until at
-  least two distinct objective values have been observed. This prevents sparse
-  datasets from locking into `0 +/- 0` predictions after one zero seed.
 - **Objective bounds**: optional. For phase percentages, use lower `0` and
   upper `100`; these bounds are given to the LLM and used to clip plotted
   prediction/error bars, but raw predictions and acquisition scores are kept.

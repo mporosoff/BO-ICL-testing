@@ -434,9 +434,7 @@ def test_mean_baseline_plot_horizon_ignores_hidden_initial_context(tmp_path):
     assert [point["index"] for point in payload["random_walk_trace"]] == [1, 2, 3]
 
 
-def test_llm_benchmark_uses_random_until_distinct_cold_start_values(
-    tmp_path, monkeypatch
-):
+def test_llm_benchmark_scores_after_one_initial_point(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     state = LocalBOState(tmp_path)
     state.import_dataset(
@@ -476,12 +474,14 @@ def test_llm_benchmark_uses_random_until_distinct_cold_start_values(
     state._llm_suggestions = fake_llm_suggestions
     payload = state.run_benchmark({"name": "llm one seed"})
 
-    assert calls == []
+    assert calls == [
+        {"available": 3, "observations": 1, "acquisition": "upper_confidence_bound"}
+    ]
     assert payload["benchmark_runs"][0]["status"] == "complete"
     assert len(payload["benchmark_runs"][0]["replicate_observations"][0]) == 2
 
 
-def test_live_llm_uses_random_until_distinct_observations(tmp_path, monkeypatch):
+def test_live_llm_suggests_after_one_observation(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     state = LocalBOState(tmp_path)
     state.import_dataset("dataset.csv", b"procedure\nproc a\nproc b\nproc c\n")
@@ -505,14 +505,7 @@ def test_live_llm_uses_random_until_distinct_observations(tmp_path, monkeypatch)
     state._llm_suggestions = fake_llm_suggestions
     payload = state.suggest()
 
-    assert calls == []
-    assert payload["suggestions"][0]["source"] == "random"
-    assert "cold-start" in payload["last_model_status"]
-
-    state.add_observation({"candidate_id": "cand-1", "value": 2.0})
-    payload = state.suggest()
-
-    assert calls == [2]
+    assert calls == [1]
     assert payload["suggestions"][0]["source"] == "llm"
 
 
@@ -1158,7 +1151,7 @@ def test_llm_scored_candidate_count_uses_shortlist(tmp_path):
     assert state._llm_scored_candidate_count(500) == 10
 
 
-def test_live_llm_shortlist_uses_full_available_pool_after_distinct_values(
+def test_live_llm_shortlist_uses_full_available_pool_after_one_seed(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
@@ -1175,7 +1168,6 @@ def test_live_llm_shortlist_uses_full_available_pool_after_distinct_values(
         }
     )
     state.add_observation({"candidate_id": "cand-0", "value": 1})
-    state.add_observation({"candidate_id": "cand-1", "value": 2})
 
     class FakeModel:
         def ask(self, *args, **kwargs):
@@ -1204,7 +1196,7 @@ def test_live_llm_shortlist_uses_full_available_pool_after_distinct_values(
     payload = state.suggest()
     suggestion = payload["suggestions"][0]
 
-    assert seen["retrieval_counts"] == [8]
+    assert seen["retrieval_counts"] == [9]
     assert suggestion["procedure"] == "proc 8"
     assert suggestion["acquisition"] == 8.57
     assert suggestion["mean"] == 8.5
@@ -1213,7 +1205,7 @@ def test_live_llm_shortlist_uses_full_available_pool_after_distinct_values(
 
     payload = state.suggest()
 
-    assert seen["retrieval_counts"] == [8, 8]
+    assert seen["retrieval_counts"] == [9, 9]
     assert len(payload["inverse_designs"]) == 1
     assert payload["inverse_designs"][0]["target"] == 12.0
 
@@ -1234,7 +1226,6 @@ def test_live_llm_shortlist_can_prefilter_with_broad_pool(tmp_path, monkeypatch)
         }
     )
     state.add_observation({"candidate_id": "cand-0", "value": 1})
-    state.add_observation({"candidate_id": "cand-1", "value": 2})
 
     class FakeModel:
         def predict(self, possible_x, system_message=""):
