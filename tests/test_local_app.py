@@ -1344,7 +1344,10 @@ def test_blank_saved_system_message_falls_back_to_default(tmp_path):
     state = LocalBOState(tmp_path)
     state.config["prediction_system_message"] = ""
 
-    assert state.prediction_system_message() == DEFAULT_PREDICTION_SYSTEM_MESSAGE
+    message = state.prediction_system_message()
+
+    assert message.startswith(DEFAULT_PREDICTION_SYSTEM_MESSAGE)
+    assert "Prediction task guardrail" in message
 
 
 def test_dataset_prompt_regeneration_preserves_custom_prompt_on_import(tmp_path):
@@ -1409,7 +1412,10 @@ def test_custom_prompts_are_not_replaced_but_runtime_bounds_are_appended(tmp_pat
     assert payload["config"]["prediction_system_message"] == "custom prediction"
     assert payload["config"]["inverse_system_message"] == "custom inverse"
     assert state.prediction_system_message().startswith("custom prediction")
+    assert "Prediction task guardrail" in state.prediction_system_message()
+    assert "not inverse design" in state.prediction_system_message()
     assert "bounded from 0 to 100" in state.prediction_system_message()
+    assert "validation limits" in state.prediction_system_message()
 
 
 def test_browser_config_tracks_llm_and_inverse_models(tmp_path):

@@ -19,12 +19,35 @@ import warnings
 # langchain.llm_cache = InMemoryCache()
 
 
+_NUMERIC_PATTERN = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+_BARE_NUMERIC_RE = re.compile(
+    rf"^\s*({_NUMERIC_PATTERN})\s*(?:%|percent|percentage|pct)?\s*(?:#+)?\s*$",
+    re.IGNORECASE,
+)
+_KEYED_NUMERIC_RE = re.compile(
+    rf"(?:prediction|predicted|estimate|estimated|answer|value|mean|objective|result|phase)"
+    rf"[^-+\d]{{0,80}}({_NUMERIC_PATTERN})\s*(?:%|percent|percentage|pct)?",
+    re.IGNORECASE,
+)
+
+
+def extract_numeric_prediction(text):
+    """Extract a numeric prediction without treating prompt bounds as answers."""
+    text = str(text or "").strip()
+    if "###" in text:
+        text = text.split("###", 1)[0].strip()
+    bare = _BARE_NUMERIC_RE.match(text)
+    if bare:
+        return float(bare.group(1))
+    keyed_matches = list(_KEYED_NUMERIC_RE.finditer(text))
+    if keyed_matches:
+        return float(keyed_matches[-1].group(1))
+    raise ValueError(f"Could not parse a numeric-only prediction from: {text!r}")
+
+
 def truncate(s):
-    """Truncate to first number"""
-    try:
-        return re.findall(r"[-+]?\d*\.\d+|\d+", s)[0]
-    except IndexError:
-        return s
+    """Return the parsed numeric prediction as a string for legacy callers."""
+    return str(extract_numeric_prediction(s))
 
 
 @dataclass
@@ -279,9 +302,10 @@ class OpenAILLM(LLM):
             else:
                 logprobs.append(np.log(1.0))
 
-        eps = 1e-15
         probs = np.exp(np.array(logprobs))
-        probs = probs / np.sum(probs + eps)
+        denom = np.sum(probs)
+        if denom > 0:
+            probs = probs / denom
 
         return make_dd(np.array(values), probs)
 
@@ -353,10 +377,10 @@ class ChatOpenAILLM(LLM):
             else:
                 logprobs.append(np.log(1.0))
 
-        eps = 1e-15
-
         probs = np.exp(np.array(logprobs))
-        probs = probs / np.sum(probs + eps)
+        denom = np.sum(probs)
+        if denom > 0:
+            probs = probs / denom
 
         return make_dd(np.array(values), probs)
 
@@ -430,7 +454,9 @@ class OpenRouterLLM(LLM):
                 continue
             logprobs.append(np.log(1.0))
         probs = np.exp(np.array(logprobs))
-        probs = probs / np.sum(probs)
+        denom = np.sum(probs)
+        if denom > 0:
+            probs = probs / denom
 
         return make_dd(np.array(values), probs)
 
@@ -515,7 +541,9 @@ class AnthropicLLM(LLM):
 
             logprobs.append(np.log(1.0))
         probs = np.exp(np.array(logprobs))
-        probs = probs / np.sum(probs)
+        denom = np.sum(probs)
+        if denom > 0:
+            probs = probs / denom
 
         return make_dd(np.array(values), probs)
 

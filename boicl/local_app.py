@@ -98,6 +98,7 @@ GENERATED_INVERSE_PROMPT_PREFIX = (
     "You are a careful inverse-design assistant for Bayesian optimization."
 )
 OBJECTIVE_BOUNDS_PROMPT_MARKER = "Known objective bounds supplied by the user:"
+PREDICTION_GUARDRAIL_MARKER = "Prediction task guardrail:"
 
 
 DEFAULT_CONFIG = {
@@ -245,19 +246,33 @@ def _bounds_instruction(
         return (
             f"{OBJECTIVE_BOUNDS_PROMPT_MARKER} the active objective is physically "
             f"bounded from {lower:g} to {upper:g} in original objective units. "
-            "Use these bounds as measurement context; values outside this range "
-            "are physically invalid."
+            "Use these bounds only as validation limits; they are not observed "
+            "labels, inverse-design targets, or default predictions. Values "
+            "outside this range are physically invalid."
         )
     if lower is not None:
         return (
             f"{OBJECTIVE_BOUNDS_PROMPT_MARKER} the active objective has a lower "
-            f"bound of {lower:g} in original objective units. Use this as "
-            "measurement context; values below this bound are physically invalid."
+            f"bound of {lower:g} in original objective units. Use this only as "
+            "a validation limit, not an observed label, target, or default "
+            "prediction; values below this bound are physically invalid."
         )
     return (
         f"{OBJECTIVE_BOUNDS_PROMPT_MARKER} the active objective has an upper "
-        f"bound of {upper:g} in original objective units. Use this as measurement "
-        "context; values above this bound are physically invalid."
+        f"bound of {upper:g} in original objective units. Use this only as "
+        "a validation limit, not an observed label, target, or default "
+        "prediction; values above this bound are physically invalid."
+    )
+
+
+def _prediction_guardrail_instruction() -> str:
+    return (
+        f"{PREDICTION_GUARDRAIL_MARKER} This is a regression prediction for the "
+        "candidate procedure, not inverse design. Estimate the measured objective "
+        "value for that exact candidate from the labeled examples. Do not answer "
+        "with the optimization target, inverse-design target, acquisition score, "
+        "or objective lower/upper bound just because it appears in the prompt. "
+        "Return exactly one numeric expected measured value."
     )
 
 
@@ -302,7 +317,10 @@ def _dataset_prediction_prompt(
         "on the examples, the procedure text, and the objective name; use general "
         "scientific knowledge only as a weak prior when examples are sparse. Do not "
         "claim access to current literature, hidden labels, or information outside "
-        "the prompt. Return exactly one numeric value in the original objective "
+        "the prompt. This is not an inverse-design request: do not return the "
+        "desired target, best possible value, acquisition score, or physical "
+        "bound unless it is your actual predicted measurement for the specific "
+        "candidate. Return exactly one numeric value in the original objective "
         "units. Do not include units, JSON, ranges, uncertainty, citations, "
         "explanations, or extra text.\n\n"
         f"{_dataset_prompt_summary(candidates, objective_names, active_objective, objective_bounds)}"
@@ -1304,6 +1322,9 @@ class LocalBOState:
             self.config.get("prediction_system_message")
             or DEFAULT_PREDICTION_SYSTEM_MESSAGE
         )
+        guardrail = _prediction_guardrail_instruction()
+        if PREDICTION_GUARDRAIL_MARKER not in message:
+            message = f"{message}\n\n{guardrail}"
         return self._system_message_with_bounds(message)
 
     def inverse_system_message(self) -> str:
@@ -6707,7 +6728,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
           <tr><td>Suggestion engine</td><td><code>GPR with embeddings</code> uses OpenAI embeddings plus a Gaussian process. <code>BO-ICL LLM</code> uses the selected LLM for in-context predictions.</td></tr>
           <tr><td>Acquisition</td><td>Rule for ranking the next experiment. UCB balances mean and uncertainty; expected improvement favors likely gains; greedy uses predicted best; random is a control.</td></tr>
           <tr><td>Target scaling</td><td>Off by default. Auto/min-max/z-score can help GPR numerics when bounded labels are not already near unit scale. BO-ICL LLM keeps labels, inverse targets, floors, and predictions in original objective units.</td></tr>
-          <tr><td>Objective bounds</td><td>Optional lower/upper physical bounds in original units. They are added to LLM system-message context and used to clip plot display of prediction/error bars, but raw predictions, exports, and acquisition scores are not clamped.</td></tr>
+          <tr><td>Objective bounds</td><td>Optional lower/upper physical bounds in original units. They are added to LLM system-message context as validation limits and used to clip plot display of prediction/error bars, but they are not labels, targets, or default predictions. Raw predictions, exports, and acquisition scores are not clamped.</td></tr>
           <tr><td>Broad pool</td><td>Caps candidates scored by GPR. In LLM mode, it is used only when <code>LLM shortlist = 0</code> or when <code>LLM pool scope = Broad random pool</code>.</td></tr>
           <tr><td>LLM shortlist</td><td>Number of candidates retrieved by inverse-design text plus cached embeddings before LLM scoring. In Full pool mode this matches the paper; in Broad random pool mode it is a faster approximation.</td></tr>
           <tr><td>LLM pool scope</td><td><code>Full pool (paper)</code> compares the inverse-design query against every available candidate. <code>Broad random pool (fast)</code> first samples the Broad pool and then applies MMR/cosine similarity inside that subset.</td></tr>
@@ -6722,7 +6743,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
           <tr><td>Replicates</td><td>Live-mode repeated measurements allowed for the same candidate before it is removed from the available pool.</td></tr>
           <tr><td>Workflow replicates</td><td>Offline benchmark repeated runs of the whole BO workflow for averaging and spread bands.</td></tr>
           <tr><td>API keys</td><td>Keys are written only to the local ignored <code>.env</code> file. OpenAI keys are required for embeddings and OpenAI LLMs; OpenRouter and Anthropic keys are only needed for those model families.</td></tr>
-          <tr><td>System messages</td><td>Generated from the uploaded dataset by default. They constrain the LLM to numeric predictions or procedure-style inverse designs without exposing hidden labels.</td></tr>
+          <tr><td>System messages</td><td>Generated from the uploaded dataset by default. They constrain the LLM to numeric predictions or procedure-style inverse designs without exposing hidden labels. Prediction calls also add a guardrail so the LLM does not treat objective bounds, inverse-design targets, or acquisition scores as measured predictions.</td></tr>
         </tbody>
       </table>
     </section>

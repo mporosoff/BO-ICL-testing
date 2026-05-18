@@ -95,8 +95,10 @@ Typical settings:
   The LLM path keeps labels, inverse-design targets, floors, and predictions in
   original objective units; auto/min-max/z-score scaling is used only for GPR.
 - **Objective bounds**: optional. For phase percentages, use lower `0` and
-  upper `100`; these bounds are given to the LLM and used to clip plotted
-  prediction/error bars, but raw predictions and acquisition scores are kept.
+  upper `100`; these bounds are given to the LLM as validation limits and used
+  to clip plotted prediction/error bars, but they are not treated as labels,
+  targets, or default predictions. Raw predictions and acquisition scores are
+  kept.
 - **Initial random points**: real starting experiments, usually `1` or `2`,
   capped at `3`.
 - **BO iterations**: number of sequential model-selected experiments.
@@ -255,10 +257,16 @@ bounds. They are included in the LLM system-message context and used to keep the
 plot display within sensible limits, for example clipping a `95 +/- 30`
 prediction error bar to the valid `0-100` percentage range. They do not clamp
 stored prediction values, measured observations, CSV exports, or acquisition
-ranking.
+ranking. A runtime prediction guardrail is also added so the LLM treats bounds
+as validation limits rather than answers.
 
 For sparse phase data with many zeros, set an **Auto target floor** such as
 `5` or `10` so the inverse-design query does not stay pinned at zero.
+
+LLM prediction completions are parsed conservatively. Numeric-only answers such
+as `3.5` or `3.5%` are accepted; explanatory answers are accepted only when they
+contain an explicit prediction/estimate/value phrase. Bare ranges such as
+`0 to 100` are rejected instead of being silently interpreted as a prediction.
 
 ## GPR Notes
 

@@ -11,6 +11,27 @@ np.random.seed(0)
 LIVE_API_TESTS = os.environ.get("RUN_LIVE_API_TESTS") == "1"
 
 
+def test_extract_numeric_prediction_prefers_explicit_prediction_over_bounds():
+    response = "The valid range is 0 to 100. Prediction: 5.25"
+
+    assert llm_model.extract_numeric_prediction(response) == pytest.approx(5.25)
+
+
+def test_extract_numeric_prediction_rejects_bare_range():
+    with pytest.raises(ValueError):
+        llm_model.extract_numeric_prediction("0 to 100")
+
+
+def test_extract_numeric_prediction_ignores_confidence_percentage():
+    response = "100% confident that the value is 0%"
+
+    assert llm_model.extract_numeric_prediction(response) == pytest.approx(0.0)
+
+
+def test_extract_numeric_prediction_accepts_numeric_only_percentage():
+    assert llm_model.extract_numeric_prediction("3.5%") == pytest.approx(3.5)
+
+
 def pytest_generate_tests(metafunc):
     if "model_name" in metafunc.fixturenames:
         models = metafunc.cls.models_to_test()
