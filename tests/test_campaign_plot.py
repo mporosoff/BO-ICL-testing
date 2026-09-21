@@ -4,6 +4,7 @@ import json
 import pytest
 
 from boicl.campaign_plot import comparison_compatibility, measured_points, plot_payload
+from boicl.measurement_quality import default_definition
 
 
 def campaign(cid="main", engine="llm"):
@@ -236,6 +237,59 @@ def test_random_arm_is_separate_and_can_have_smaller_operator_budget():
     assert payload["live_random_walk"]["training_shared"] is False
     assert payload["plot_counts"]["new_completed"] == 0
     assert comparison_compatibility(main, control)["measurement_budgets"] == [10, 2]
+
+
+@pytest.mark.parametrize(
+    "method,normalization",
+    [("xrd_area_fraction", "all phases"), ("gsas_ii_mass_fraction", "selected phases")],
+)
+def test_declared_comparisons_still_reject_incompatible_explicit_measurements(
+    method, normalization
+):
+    main, control = campaign(), campaign("control")
+    declaration = {
+        **default_definition(),
+        "quantification_method": "gsas_ii_mass_fraction",
+        "normalization": "all phases",
+        "historical_policy": "exclude",
+        "decision_reason": "Use only the declared reported basis",
+    }
+    for data in (main, control):
+        data["config"]["measurement_definition"] = deepcopy(declaration)
+        for row in data["observations"]:
+            row["training_included"] = False
+    control["config"]["selection_policy"] = "random_control"
+    invalid = measurement("3", 90)
+    invalid["measurement_quality"] = {
+        "quantification_method": method,
+        "normalization": normalization,
+    }
+    control["observations"].append(invalid)
+    assert comparison_compatibility(main, control)["mismatches"] == [
+        "measurement_definition"
+    ]
+    with pytest.raises(ValueError, match="Random control"):
+        plot_payload(main, random_campaign=control)
+    control["observations"].pop()
+    control["config"]["measurement_definition"].update(
+        quantification_method=method, normalization=normalization
+    )
+    assert comparison_compatibility(main, control)["mismatches"] == [
+        "measurement_definition"
+    ]
+
+
+def test_undeclared_campaigns_do_not_compare_different_reported_explicit_bases():
+    main, other = campaign(), campaign("other")
+    for data, method in ((main, "gsas_ii_mass_fraction"), (other, "xrd_area_fraction")):
+        for row in data["observations"]:
+            row["measurement_quality"] = {
+                "quantification_method": method,
+                "normalization": "all phases",
+            }
+    assert comparison_compatibility(main, other)["mismatches"] == [
+        "measurement_definition"
+    ]
 
 
 def test_generic_minimization_and_unknown_sigma_are_preserved():

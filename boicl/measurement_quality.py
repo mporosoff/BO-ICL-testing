@@ -174,12 +174,23 @@ def quality_status(data):
 
 
 def comparison_definition(data):
-    validate_training_definitions(data)
-    definition = data["config"].get("measurement_definition", default_definition())
+    definition = validate_training_definitions(data)
+    declared = definition_signature(definition)
+    # A declared cohort remains the same while independent arms collect results
+    # at different times, including before their first compatible measurement.
+    # Legacy undeclared cohorts still need their reported explicit basis checked.
+    effective = declared
+    if effective is None:
+        effective = next(
+            (
+                signature
+                for row in active_records(data)
+                if (signature := definition_signature(row)) is not None
+            ),
+            None,
+        )
     return dict(
-        definitions=sorted(
-            {str(definition_signature(r)) for r in active_records(data)}
-        ),
-        declared=definition_signature(definition),
+        declared=declared,
+        effective=effective,
         historical_policy=definition["historical_policy"],
     )

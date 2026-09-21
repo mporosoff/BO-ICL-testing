@@ -9,7 +9,7 @@ import pytest
 
 from boicl.campaign import CampaignService, fingerprint
 from boicl.campaign_config import resolve_config
-from boicl.campaign_plot import comparison_compatibility
+from boicl.campaign_plot import comparison_compatibility, plot_payload
 from boicl.moc_import import load_moc_package
 from boicl.persistence import atomic_bytes, io_path
 
@@ -355,6 +355,58 @@ def test_definition_comparison_and_independent_control_inclusion(tmp_path):
     )
     assert service.active(service.get(control)) == []
     assert comparison_compatibility(service.get(a), service.get(control))["compatible"]
+
+
+@pytest.mark.parametrize("policy", ["exclude", "retain_with_justification"])
+def test_matched_definition_comparisons_survive_asynchronous_measurements(
+    tmp_path, policy
+):
+    service = CampaignService(tmp_path, runner=first)
+    main, peer = make(service), make(service)
+    definition = {
+        "quantification_method": "gsas_ii_mass_fraction",
+        "normalization": "total refined crystalline mass",
+    }
+    for cid in (main, peer):
+        service.revise_measurement_definition(
+            cid, definition, policy, "Matched scientific inclusion decision"
+        )
+    control = service.create_control(main)
+    service.measure(
+        main, reserve(service, main), {"value": 2, **explicit()}, refresh=False
+    )
+    main_state, peer_state, control_state = [
+        service.get(cid) for cid in (main, peer, control)
+    ]
+    assert comparison_compatibility(main_state, peer_state)["compatible"]
+    assert comparison_compatibility(main_state, control_state)["compatible"]
+    payload = plot_payload(
+        main_state, comparisons=[peer_state], random_campaign=control_state
+    )
+    assert payload["comparison_diagnostics"] == []
+    assert payload["live_random_walk"]["campaign_id"] == control
+    assert service.summary(control)["counts"]["new_measurements"] == 0
+    for value in (3, 4):
+        service.measure(
+            peer, reserve(service, peer), {"value": value, **explicit()}, refresh=False
+        )
+    service.measure(
+        control, reserve(service, control), {"value": 0, **explicit()}, refresh=False
+    )
+    restarted = CampaignService(tmp_path)
+    main_state, peer_state, control_state = [
+        restarted.get(cid) for cid in (main, peer, control)
+    ]
+    payload = plot_payload(
+        main_state, comparisons=[peer_state], random_campaign=control_state
+    )
+    assert payload["best_trace"][-1]["best"] == 2
+    assert payload["benchmark_runs"][0]["summary"][-1]["mean"] == 4
+    assert payload["live_random_walk"]["observations"][-1]["value"] == 0
+    assert [
+        restarted.summary(cid)["counts"]["new_measurements"]
+        for cid in (main, peer, control)
+    ] == [1, 2, 1]
 
 
 @pytest.mark.parametrize("policy", ["exclude", "retain_with_justification"])

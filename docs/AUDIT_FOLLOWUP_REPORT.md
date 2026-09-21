@@ -40,7 +40,10 @@ the repository and is not part of this patch.
    uncertainty provenance persist with measurements. Explicitly incompatible
    definitions cannot silently enter combined training or comparisons. Imported
    refinements must preserve original seed records and carry a documented, valid
-   chain of replacements for the same physical measurement.
+   chain of replacements for the same physical measurement. Comparison eligibility
+   uses the declared definition and historical policy after validating each
+   history; matched arms and random controls remain comparable as results arrive
+   asynchronously. Undeclared histories still require compatible reported methods.
 
 Initialization graph clarification: both views now place seeds at distinct
 successive positions labeled `i1`, `i2`, `i3`, etc., followed by new measurements
@@ -58,10 +61,15 @@ observations or production embedding caches are modified.
 - Crystal defaults and structured-GP preservation: **43 passed**, including the
   unchanged full-sampler first recommendation `moc-32c375b3a148b782` (550 °C,
   ramp 5 °C/min, N2 100 sccm, hold 10 h, sucrose:AMT 2).
-- Final full offline suite: **413 passed, 16 live-provider tests skipped** in 388.83 s
+- Full offline suite before the GitHub review follow-up: **413 passed, 16 live-provider tests skipped** in 388.83 s
   on Windows/Python 3.13. This includes generic maximization/minimization,
   numerical embedding-GP tests, independent concurrent campaigns, comparisons,
   random controls, import/export, and checkpoint restoration.
+- GitHub review follow-up: **36 passed** across the audit, plotting, and control
+  suites, including five new cases for asynchronous progress and incompatible
+  definitions. Both historical exclusion and justified retention reproduced the
+  reported failure before the fix and pass after it. Final GitHub check results
+  are recorded on the pull request.
 - New regression files: `test_acquisition_direction.py`, `test_llm_requests.py`,
   `test_campaign_audit.py`, `test_ui_polling.py`, and
   `test_initialization_plot.py`; shared HTTP and adapter coverage also expanded.
