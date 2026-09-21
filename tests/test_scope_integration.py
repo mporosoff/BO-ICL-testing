@@ -70,8 +70,14 @@ def test_main_and_focused_share_lifecycle_graph_settings_and_resume(shared_views
     focus = request("/api/moc/state?id=" + cid)
     assert main["shared_campaign"]["campaign_id"] == focus["campaign_id"] == cid
     assert main["shared_campaign"]["counts"]["measured"] == 3
-    assert {row["index"] for row in main["live_observation_points"]} == {0}
-    assert main["best_trace"][0]["index"] == 0
+    assert [row["index"] for row in main["live_observation_points"]] == [1, 2, 3]
+    assert [row["axis_label"] for row in main["live_observation_points"]] == [
+        "i1",
+        "i2",
+        "i3",
+    ]
+    assert main["best_trace"][0]["index"] == 1
+    assert main["best_trace"][0]["axis_label"] == "i1"
     assert calls == []
     request("/api/toolkit/action", dict(campaign=cid, action="suggest"))
     service.jobs[cid]["thread"].join(timeout=20)
@@ -101,8 +107,10 @@ def test_main_and_focused_share_lifecycle_graph_settings_and_resume(shared_views
     assert focus["counts"]["measured"] == 4 and focus["counts"]["pending"] == 0
     assert focus["observations"][-1]["moc_wt_pct"] == 0
     main = request("/api/toolkit/state?campaign=" + cid)
-    assert main["live_observation_points"][-1]["index"] == 1
-    assert main["best_trace"][-1]["index"] == 1
+    assert main["live_observation_points"][-1]["index"] == 4
+    assert main["live_observation_points"][-1]["optimization_step"] == 1
+    assert main["best_trace"][-1]["index"] == 4
+    assert main["best_trace"][-1]["axis_label"] == "1"
     assert main["best_trace"][-1]["best"] == 83.8
     request("/api/moc/config", dict(id=cid, changes={"llm": {"uncertainty_scalar": 0}}))
     main = request("/api/toolkit/state?campaign=" + cid)

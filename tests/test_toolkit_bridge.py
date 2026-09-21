@@ -216,8 +216,8 @@ def test_main_config_roundtrip_preserves_managed_null_custom_empty_zero_and_noop
     assert state["shared_config"]["llm"]["forward_system_message"] == ""
     assert state["shared_config"]["llm"]["uncertainty_scalar"] == 0
     assert (
-        state["shared_prompt_preview"]["forward"]
-        and "MoC" not in state["shared_prompt_preview"]["forward"]
+        state["shared_prompt_templates"]["forward"]
+        and "MoC" not in state["shared_prompt_templates"]["forward"]
     )
 
 

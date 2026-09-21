@@ -5,14 +5,15 @@ import numpy as np
 
 
 class DemoChat:
-    def __init__(self, procedure, bounds=(0, 100)):
+    def __init__(self, procedure, bounds=(0, 100), inverse_only=False):
         self.procedure = procedure
         self.bounds = bounds or (-100, 100)
+        self.inverse_only = inverse_only
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
 
     def create(self, **request):
-        if request["n"] == 1:
-            outputs = [self.procedure]
+        if self.inverse_only or request["n"] == 1:
+            outputs = [self.procedure for _ in range(request["n"])]
         else:
             # Stable canned responses; they are NOT a fitted model or an oracle.
             n = int(
@@ -36,17 +37,10 @@ class DemoChat:
         }
 
 
-def demo_runner(snapshot, eligible, cancel, progress):
-    from .campaign import CampaignService, run_engine
+def demo_vectors(snapshot):
     from .structured_gp import transform_features
-    from .llm_engine import LLMEngine
 
-    if snapshot["config"]["engine"] == "gpr_features":
-        result = run_engine(snapshot, eligible, None, cancel, progress)
-        result["synthetic_demo"] = True
-        return result
     candidates = snapshot["candidates"]
-    lookup = {r["candidate_id"]: r for r in candidates}
     generic = snapshot["config"].get("data_schema") == "generic"
     if generic:
         spec = snapshot["config"]["structured_gp"]["feature_spec"]
@@ -68,7 +62,21 @@ def demo_runner(snapshot, eligible, cancel, progress):
     else:
         features = transform_features(candidates)
     # Distinct demonstration vector space; never written to production embedding cache.
-    vectors = np.column_stack((np.ones(len(features)), features))
+    return np.column_stack((np.ones(len(features)), features))
+
+
+def demo_runner(snapshot, eligible, cancel, progress):
+    from .campaign import run_engine, llm_observations
+    from .llm_engine import LLMEngine
+
+    if snapshot["config"]["engine"] == "gpr_features":
+        result = run_engine(snapshot, eligible, None, cancel, progress)
+        result["synthetic_demo"] = True
+        return result
+    candidates = snapshot["candidates"]
+    lookup = {r["candidate_id"]: r for r in candidates}
+    generic = snapshot["config"].get("data_schema") == "generic"
+    vectors = demo_vectors(snapshot)
     if snapshot["config"]["engine"] == "gpr_embeddings":
         # Browser walkthrough mock only. Real model numerical behavior is separately tested.
         chosen = eligible[0]
@@ -90,14 +98,7 @@ def demo_runner(snapshot, eligible, cancel, progress):
             "synthetic_demo": True,
         }
     progress("Synthetic inverse query and forward completions; no network")
-    observations = [
-        {
-            **r,
-            "value": r[CampaignService.objective_field(snapshot)],
-            "procedure": lookup[r["candidate_id"]]["procedure"],
-        }
-        for r in CampaignService.active(snapshot)
-    ]
+    observations = llm_observations(snapshot)
     selected = eligible[0]
     config = snapshot["config"]
     engine = LLMEngine(

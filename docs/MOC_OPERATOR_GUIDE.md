@@ -35,6 +35,12 @@ The main view exposes **Prepare Embeddings** and **Validate and import cache** u
 
 Two to five accepted predictions can be scored, with partial counts displayed; zero or one cannot. Identical accepted predictions mean agreement among responses, not demonstrated scientific accuracy. No spread from old experimental labels is substituted. Rejected generations are recorded, not silently replaced by extra calls.
 
+Under **Advanced BO-ICL sampling → Inverse target and standalone proposal count**, set an optional **Inverse target** in original objective units. Blank restores automatic targeting; zero is an explicit target. The app rejects targets outside physical bounds and does not multiply a manual target again. These settings persist in archives and checkpoints. The focused view exposes **Manual inverse target (blank = automatic)** and **Standalone proposal count** under its LLM advanced settings.
+
+**Generate Proposals** in the main **Inverse Design** panel, or **Generate standalone proposals** in the focused view, deliberately requests free-form inverse text. The separate count applies only to this action; ordinary BO still uses one inverse completion. Proposal records retain their target, requested/returned counts, requests and outcomes. They do not add candidates, reserve experiments, record measurements or change the measured incumbent. This action may use paid model calls.
+
+Open **Preview full LLM request (no model calls)**, choose the role and current saved settings or a recorded suggestion, and press **Preview request**. Use **Find candidates** to select a forward procedure. The response includes effective model, settings, system/user messages and selected observed examples when they can be resolved without generating embeddings. Missing cached selector inputs and an unknown future shortlist are reported as unresolved; preview does not guess an exact request. Recorded requests retain the prompts and parameters actually used, even after settings change. Preview makes no provider calls and does not reserve or change campaign history.
+
 ## Optional embedding GP and eight-observation history
 
 **Embedding GP baseline** is separate from the synthesis-parameter GP. It uses bare procedures, `text-embedding-ada-002`, a fixed full-corpus Isomap projection (32 dimensions, five neighbors by default), and learned homoskedastic noise. It needs embeddings when missing but no chat or inverse calls. Projection construction over the full grid is more expensive than the structured GP; small/disconnected spaces disclose deterministic adjustments.
@@ -44,14 +50,27 @@ Two to five accepted predictions can be scored, with partial counts displayed; z
 ## Reserve, measure, revise, export
 
 1. Review the selection reason, recipe, prediction, uncertainty, and acquisition separately.
-2. Press **Reserve experiment** (**Reserve this experiment** in the focused view), then **Enter result**. Other jobs in that campaign cannot reserve the same candidate. Release a reservation explicitly if it will not be performed.
-3. After the physical experiment, enter the measured MoC fraction, esd, GOF, gap, and its source/override reason. A confirmed zero outcome is valid. Unknown quality metadata is not zero. Save once; repeated delivery of the same save request is idempotent.
+2. Press **Reserve experiment** (**Reserve this experiment** in the focused view), then use **Add Result** (**4 · Record measurement** in the focused view). Other jobs in that campaign cannot reserve the same candidate. Use **Release** (**Release reservation** in the focused view) if it will not be performed.
+3. After the physical experiment, enter the measured MoC fraction, esd, GOF, gap, and its source/override reason. Press **Add Observation** (**Save confirmed measurement** in the focused view). A confirmed zero outcome is valid. Unknown quality metadata is not zero. Save once; repeated delivery of the same save request is idempotent.
 4. If enabled, **Refresh suggestion after saving a measurement** schedules at most one next suggestion in an explicitly started campaign. It does not perform synthesis or collect results.
 5. Use **Export Archive** to save the portable JSON bundle after each measurement. It contains candidates, source mappings, individual/refinement records, reservations, resolved configuration, exact LLM requests/responses, scores, RNG/sampler metadata, and provenance. Credentials are never configuration fields. Resume using **Load Selected**, or restore with **Import Archive**. Independent comparison/control arms have their own archives; export each arm to preserve the whole comparison.
 
 Use **Refine** beside a measured row and supply a reason before **Save refinement**. The focused view calls this **Revise a measurement refinement**. The old refinement remains in history and prior unreserved suggestions become stale. A refinement is not an additional experiment. Apply Settings in the main view; the focused view provides a change preview before application. Both retain history and custom prompts and invalidate affected suggestions. **Reset Prompts** explicitly restores managed prompts. Cancellation stops scheduling new work; an issued provider call may finish, but late results cannot overwrite changed campaign history.
 
 Run one local application process against a state directory. Separate demo/live folders and independent campaign IDs prevent accidental history mixing; they are not a distributed multi-host database.
+
+Automatic refresh may issue paid LLM or embedding requests after saving a measurement. Turn it off before saving if the next suggestion should wait for another intentional start.
+
+Under **Measurement quality and source** (focused: **Measurement quality**), record **Quantification method**, **Normalization basis**, source file/record/refinement identifiers, and **Uncertainty method / provenance**. Supported definitions distinguish **GSAS-II mass fraction**, **Integrated phase-pattern area fraction**, **Other documented method**, and **Historical / unspecified (unknown)**. These are versioned provenance, not synthesis features. The confirmed 72.1, 83.8 and 23.4 values remain unchanged; their confirmation does not establish a quantification method or justify converting between definitions.
+
+Use **Measurement definition and historical training → Record definition decision** to declare a documented definition. Choose whether unknown historical records are excluded from model training or retained with a scientific justification, and give the reason. Explicit incompatible definitions are excluded from training rather than silently mixed; measurements remain visible with that status and retain their original values. Comparison compatibility also includes measurement definitions. This software decision records an operator's scientific judgment; it does not perform re-refinement or establish publication validity.
+
+For a documented refinement, load the observation's existing quality fields before editing. In the focused view use **Load observation into measurement fields**, then **Save refinement revision** with a reason. Prior provenance remains in history; never relabel unknown historical quantification merely to make a new method compatible.
+
+The MoC preset retains its historical `moc_wt_pct` objective name and wt% display.
+Declaring an area-fraction basis does not convert it to a calibrated mass fraction.
+Report the declared basis explicitly; a generic campaign can use a separately
+named objective and appropriate units for a different quantity.
 
 ## Run several campaigns and resume a saved point
 
@@ -65,9 +84,9 @@ See [the defaults audit](MOC_DEFAULTS_AUDIT.md) for the effective crystal settin
 
 ## Read the graph and collect an independent control
 
-The original toolkit graph displays shared campaigns. Initialization measurements appear at x=0; completed new physical experiments advance x=1, 2, … . Re-refinement updates the same experiment rather than adding a step. Measured values and their best-so-far curve are separate from prediction markers and intervals. A pending prediction never raises the measured incumbent. Sparse live campaigns have no invented full-pool statistics or hidden-label random expectation.
+The original toolkit graph displays shared campaigns. Initialization measurements have separate consecutive positions labeled i1, i2, i3, … in their supplied order, within a shaded initialization region. A divider separates them from BO steps 1, 2, … for completed new physical experiments. Initialization is not BO-selected and does not consume the new-measurement budget. Re-refinement updates the same experiment rather than adding a position. Measured values and their best-so-far curve are separate from prediction markers and intervals. A pending prediction never raises the measured incumbent. Sparse live campaigns have no invented full-pool statistics or hidden-label random expectation.
 
-Compatible saved campaigns appear as comparison traces when their pool, initialization, objective, units, bounds, direction, repeat policy, seed, and budget agree. Each is an independent history. A single arm's posterior interval is not a variation band across replicate campaigns. Changing comparison settings can make an arm ineligible for the overlay without deleting it.
+Compatible saved campaigns appear as comparison traces when their pool, initialization, objective, units, bounds, direction, repeat policy, seed, budget, and measurement definition agree. Each is an independent history. Arms can have different numbers of completed measurements and remain comparable as results arrive. A single arm's posterior interval is not a variation band across replicate campaigns. Changing comparison settings can make an arm ineligible for the overlay without deleting it.
 
 Use **Live Random Walk** for an independent random arm. Set **New control measurements**, press **Start / Next Random**, run the displayed reserved recipe, and save **Add Random Result** with its measured value and any reported uncertainty/quality. The arm starts from the parent's immutable initialization, uses its own reservations and results, and never trains the parent BO model. A finite parent budget caps the control's requested count. Missing quality remains unknown and a measured zero remains zero. **Start new control** releases the current reservation and creates a fresh arm while preserving the prior arm's records. Random selection uses no provider calls; the app still requires actual results before advancing.
 

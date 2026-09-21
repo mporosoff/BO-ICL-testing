@@ -58,7 +58,8 @@ def legacy_config(config):
         inverse_target_jitter=llm["inverse_jitter"],
         inverse_target_reference_scale=llm["reference_scale"],
         inverse_target_floor_value=llm.get("target_floor"),
-        inverse_design_count=1,
+        inverse_target_value=llm.get("manual_inverse_target"),
+        inverse_design_count=llm.get("inverse_proposal_count", 1),
         batch_size=config["batch_size"],
         iterations_per_trial=config["new_measurement_budget"],
         ucb_lambda=llm["ucb_lambda"],
@@ -114,6 +115,14 @@ def config_changes(payload, config):
             if c["inverse_target_floor_value"] in (None, "")
             else float(c["inverse_target_floor_value"])
         )
+    if "inverse_target_value" in c:
+        llm["manual_inverse_target"] = (
+            None
+            if c["inverse_target_value"] in (None, "")
+            else float(c["inverse_target_value"])
+        )
+    if "inverse_design_count" in c:
+        llm["inverse_proposal_count"] = c["inverse_design_count"]
     if "selector_mode" in c:
         llm["selector_mode"] = c["selector_mode"]
         llm["selector_k"] = c.get("selector_k", 5)
@@ -200,7 +209,9 @@ def project(service, cid, state):
         for row in data["suggestions"]
         if row.get("observation_id")
     }
-    for row in service.active(data):
+    for row in data["observations"]:
+        if row.get("record_status") != "measured":
+            continue
         record = {
             **row,
             "id": row["observation_id"],
@@ -278,6 +289,7 @@ def project(service, cid, state):
         observations=observations,
         suggestions=suggestions,
         inverse_designs=[],
+        shared_inverse_proposals=summary.get("inverse_proposals", []),
         progress=progress,
         live_benchmark_run=None,
         last_error=progress.get("detail", "") if progress["status"] == "error" else "",
@@ -313,7 +325,9 @@ def project(service, cid, state):
     )
     from .llm_engine import managed_system_message
 
-    payload["shared_prompt_preview"] = {
+    # These are editing placeholders only. Full effective requests (including
+    # custom text and selected examples) come from the read-only preview route.
+    payload["shared_prompt_templates"] = {
         role: managed_system_message(
             role,
             prompt_style=config["data_schema"],
@@ -369,7 +383,9 @@ def get(handler, parsed):
                     "suggestions",
                     "provenance",
                     "events",
+                    "inverse_proposals",
                 )
+                if key in bundle
             }
         )
         return
@@ -467,6 +483,8 @@ def post(handler, parsed):
         svc.update_config(cid, config_changes(p["values"], data["config"]))
     elif action == "suggest":
         svc.start_suggestion(cid)
+    elif action == "inverse-proposal":
+        svc.start_inverse_proposals(cid)
     elif action == "cancel":
         svc.cancel_job(cid)
     elif action == "reserve":

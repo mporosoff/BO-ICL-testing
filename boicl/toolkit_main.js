@@ -4,7 +4,30 @@ let sharedCampaignId =
 let sharedPoll = null;
 let featureUpload = null;
 let refinementId = null;
+let sharedConfigDirty = false;
+let sharedStateEpoch = 0;
 const graphOnly = location.pathname === "/campaign-graph";
+const quantificationFields = [
+  "quantification_method",
+  "normalization",
+  "source_file",
+  "source_identifier",
+  "refinement_id",
+  "uncertainty_method",
+  "definition_note",
+];
+function qualityValues() {
+  return Object.fromEntries(
+    quantificationFields.map((key) => [key, $("quality_" + key).value]),
+  );
+}
+function fillQualityValues(record = {}) {
+  const quality = record.measurement_quality || {};
+  for (const key of quantificationFields)
+    $("quality_" + key).value =
+      quality[key] ??
+      (key === "quantification_method" ? "historical_unspecified" : "");
+}
 
 async function toolkitFetch(path, body, method = "POST") {
   const response = await fetch(path, {
@@ -24,7 +47,14 @@ async function chooseSharedCampaign(id) {
   }
   const nextCampaign = id.replace(/^shared:/, "");
   if (nextCampaign !== sharedCampaignId) {
+    sharedConfigDirty = false;
+    sharedStateEpoch += 1;
     refinementId = null;
+    fillQualityValues();
+    $("requestPreviewResult").textContent = "";
+    $("requestPreviewCandidate").innerHTML = "";
+    $("definitionReason").value = "";
+    $("definitionNote").value = "";
     for (const field of [
       "objectiveValue",
       "objectiveUncertainty",
@@ -60,12 +90,14 @@ async function chooseSharedCampaign(id) {
 }
 async function toolkitAction(action, extra = {}) {
   const requestedCampaign = sharedCampaignId;
+  sharedStateEpoch += 1;
   const payload = await toolkitFetch("/api/toolkit/action", {
     campaign: requestedCampaign,
     action,
     ...extra,
   });
   if (requestedCampaign !== sharedCampaignId) return payload;
+  if (action === "config") sharedConfigDirty = false;
   state = payload;
   const returned = state.shared_campaign?.campaign_id;
   if (returned && returned !== sharedCampaignId) {
@@ -84,16 +116,23 @@ function scheduleSharedPoll() {
   sharedPoll = setTimeout(async () => {
     try {
       const requestedCampaign = sharedCampaignId;
+      const requestedEpoch = sharedStateEpoch;
       const next = await toolkitFetch(
         "/api/toolkit/state?campaign=" + encodeURIComponent(requestedCampaign),
         null,
         "GET",
       );
-      if (requestedCampaign !== sharedCampaignId) return;
+      if (
+        requestedCampaign !== sharedCampaignId ||
+        requestedEpoch !== sharedStateEpoch ||
+        busy
+      )
+        return;
       const active = document.activeElement;
       if (
-        active &&
-        ["INPUT", "SELECT", "TEXTAREA"].includes(active.tagName) &&
+        (sharedConfigDirty ||
+          (active &&
+            ["INPUT", "SELECT", "TEXTAREA"].includes(active.tagName))) &&
         !graphOnly
       ) {
         state = next;
@@ -105,8 +144,9 @@ function scheduleSharedPoll() {
       }
     } catch (error) {
       renderError(error.message);
+    } finally {
+      scheduleSharedPoll();
     }
-    scheduleSharedPoll();
   }, 2000);
 }
 function sharedMeasurement(
@@ -121,6 +161,7 @@ function sharedMeasurement(
     [generic ? "closure_gap" : "closure_gap_wt_pct"]: $("qualityGap").value,
     closure_gap_origin: $("qualityGapOrigin").value,
     source_note: $("qualityNote").value,
+    ...qualityValues(),
   };
 }
 async function toolkitRequest(path, options = {}) {
@@ -186,6 +227,8 @@ async function toolkitRequest(path, options = {}) {
       return await toolkitAction("config", { values: p });
     }
     if (path === "/api/suggest") return await toolkitAction("suggest");
+    if (path === "/api/inverse-design")
+      return await toolkitAction("inverse-proposal");
     if (path === "/api/save-campaign") return await toolkitAction("save", p);
     if (path === "/api/precompute-embeddings")
       return await toolkitAction("cache-prepare");
@@ -382,6 +425,8 @@ function renderShared() {
     "inverseTargetMultiplier",
     "inverseTargetJitter",
     "inverseTargetFloorValue",
+    "inverseTargetValue",
+    "inverseDesignCount",
   ])
     fieldVisible(id, llm);
   for (const id of [
@@ -398,8 +443,6 @@ function renderShared() {
     "objectiveScaling",
     "inverseRandomCandidates",
     "llmPoolScope",
-    "inverseTargetValue",
-    "inverseDesignCount",
     "scoreLimit",
     "replicatesPerCandidate",
     "batchSize",
@@ -407,7 +450,22 @@ function renderShared() {
   ])
     fieldVisible(id, false);
   $("regeneratePrompts").classList.toggle("hidden", !llm);
-  $("inverseDesignPanel").classList.add("hidden");
+  $("inverseDesignPanel").classList.toggle("hidden", !llm);
+  $("sharedInverseSettings").classList.toggle("hidden", !llm);
+  for (const id of ["inverseTargetValue", "inverseDesignCount"])
+    $("sharedInverseSettings").append($(id).closest(".field"));
+  $("inverseDesignCount").max = "20";
+  $("sharedRequestPreview").classList.toggle("hidden", !llm);
+  $("inverseDesignNote").textContent =
+    "Standalone proposals are free-form text records. Generating them can use paid model calls; it does not select, reserve or measure a pool candidate. Ordinary BO still requests one inverse completion.";
+  $("inverseDesigns").innerHTML =
+    (state.shared_inverse_proposals || [])
+      .map(
+        (record) =>
+          `<details><summary>${escapeHtml(record.status)} · ${escapeHtml(record.proposal_id || record.created_at || "Proposal record")}</summary><pre>${escapeHtml(JSON.stringify(record, null, 2))}</pre></details>`,
+      )
+      .join("") ||
+    '<div class="empty">No standalone inverse proposals recorded.</div>';
   $("objectiveName").readOnly = true;
   $("workflowMode").disabled = true;
   $("objectiveDirection").disabled = config.data_schema !== "generic";
@@ -421,8 +479,13 @@ function renderShared() {
   $("gpThin").value = config.structured_gp.predict_thin;
   $("sharedSelectorMode").value = config.llm.selector_mode;
   $("predictionSystemMessage").placeholder =
-    state.shared_prompt_preview.forward;
-  $("inverseSystemMessage").placeholder = state.shared_prompt_preview.inverse;
+    config.llm.forward_system_message === null
+      ? state.shared_prompt_templates.forward
+      : "";
+  $("inverseSystemMessage").placeholder =
+    config.llm.inverse_system_message === null
+      ? state.shared_prompt_templates.inverse
+      : "";
   for (const id of ["predictionSystemMessage", "inverseSystemMessage"])
     $(id).title =
       "Blank managed prompts are shown as placeholder text. Custom text, including an intentionally empty prompt, stays unchanged. Reset Prompts explicitly restores managed prompts.";
@@ -431,11 +494,30 @@ function renderShared() {
   document.querySelector('label[for="apiRetryAttempts"]').textContent =
     "Maximum attempts (including first)";
   $("iterationsPerTrial").value = config.new_measurement_budget ?? "";
+  $("iterationsPerTrial").title =
+    "New physical measurements only; initialization is excluded. Blank is unlimited. Zero prevents new suggestions and reservations.";
+  $("autoSuggest").title =
+    "After an intentional start, saving a measurement may launch another suggestion, including paid LLM or embedding calls.";
+  $("qualityStatus").textContent = JSON.stringify(
+    state.shared_campaign.quality_status || {},
+    null,
+    2,
+  );
+  const definition = config.measurement_definition || {};
+  if ($("definitionMethod").dataset.campaign !== sharedCampaignId) {
+    $("definitionMethod").dataset.campaign = sharedCampaignId;
+    $("definitionMethod").value =
+      definition.quantification_method === "historical_unspecified"
+        ? ""
+        : definition.quantification_method || "";
+    $("definitionNormalization").value = definition.normalization || "";
+    $("definitionNote").value = definition.definition_note || "";
+  }
   $("workflowBanner").textContent =
     (state.shared_campaign.synthetic_demo ? "SYNTHETIC DEMO · " : "") +
     "Shared campaign " +
     sharedCampaignId +
-    ". Reserve a recommendation, then record the measured outcome. Seeds are initialization at x=0; pending predictions do not enter the measured curve.";
+    ". Reserve a recommendation, then record the measured outcome. Initialization appears in order as i1, i2, i3, … in a shaded region before BO step 1; pending predictions do not enter the measured curve.";
   const pending = state.suggestions.filter((r) => r.status === "pending"),
     previous = $("pendingMeasurement").value;
   $("pendingMeasurement").innerHTML = pending
@@ -505,12 +587,24 @@ function renderShared() {
     );
   $("refinementControls").classList.toggle("hidden", !refinementId);
   $("addObservation").classList.toggle("hidden", Boolean(refinementId));
-  $("sharedReplayStep").innerHTML = state.shared_campaign.suggestions
+  const previousReplayStep = $("sharedReplayStep").value;
+  $("sharedReplayStep").innerHTML = [
+    ...state.shared_campaign.suggestions,
+    ...(state.shared_inverse_proposals || []),
+  ]
     .map(
       (r) =>
-        `<option value="${r.suggestion_id}">${escapeHtml(r.candidate_id || r.status)} · ${r.status}</option>`,
+        `<option value="${r.suggestion_id || r.proposal_id}">${escapeHtml(r.candidate_id || (r.proposal_id ? "Standalone inverse" : r.status))} · ${r.status}</option>`,
     )
     .join("");
+  if (previousReplayStep) $("sharedReplayStep").value = previousReplayStep;
+  if (!$("requestPreviewCandidate").options.length)
+    $("requestPreviewCandidate").innerHTML = state.suggestions
+      .map(
+        (r) =>
+          `<option value="${escapeHtml(r.candidate_id)}">${escapeHtml(r.candidate_id)}</option>`,
+      )
+      .join("");
   for (const anchor of document.querySelectorAll(
     'a[href="/api/export-procedures.csv"],a[href="/api/export-observations.csv"]',
   )) {
@@ -541,7 +635,7 @@ function renderSharedObservations() {
     rows
       .map(
         (r) =>
-          `<tr><td>${r.is_seed ? "Initialization" : escapeHtml(r.observation_id)}</td><td class="procedure">${escapeHtml(r.procedure)}</td><td>${fmt(r.value)}${r.uncertainty != null ? " ± " + fmt(r.uncertainty) : " (esd unknown)"}</td><td>GOF ${fmt(r.gof)}; gap ${fmt(r.closure_gap_wt_pct ?? r.closure_gap)}${r.refines_observation_id ? " · refinement" : ""}</td><td>${r.prediction?.mean != null ? fmt(r.prediction.mean) + (r.prediction.std != null ? " ± " + fmt(r.prediction.std) : "") : "—"}</td><td><button data-refine="${r.id}">Refine</button></td></tr>`,
+          `<tr><td>${r.is_seed ? "Initialization" : escapeHtml(r.observation_id)}${r.training_included === false ? " · excluded from training" : ""}</td><td class="procedure">${escapeHtml(r.procedure)}</td><td>${fmt(r.value)}${r.uncertainty != null ? " ± " + fmt(r.uncertainty) : " (esd unknown)"}</td><td>GOF ${fmt(r.gof)}; gap ${fmt(r.closure_gap_wt_pct ?? r.closure_gap)}${r.refines_observation_id ? " · refinement" : ""}<details><summary>Quantification provenance</summary><pre>${escapeHtml(JSON.stringify(r.measurement_quality || { quantification_method: "historical_unspecified" }, null, 2))}</pre></details></td><td>${r.prediction?.mean != null ? fmt(r.prediction.mean) + (r.prediction.std != null ? " ± " + fmt(r.prediction.std) : "") : "—"}</td><td><button data-refine="${r.id}">Refine</button></td></tr>`,
       )
       .join("") +
     "</tbody></table></div>";
@@ -556,6 +650,7 @@ function renderSharedObservations() {
         $("qualityGap").value = row.closure_gap_wt_pct ?? row.closure_gap ?? "";
         $("qualityGapOrigin").value = row.closure_gap_origin || "unknown";
         $("qualityNote").value = row.source_note || "";
+        fillQualityValues(row);
         $("manualProcedure").value = row.procedure;
         $("refinementReason").value = "";
         renderShared();
@@ -597,6 +692,76 @@ function renderSharedSuggestions() {
   );
 }
 document.addEventListener("DOMContentLoaded", () => {
+  const markSettingsDraft = (event) => {
+    if (sharedCampaignId && event.target.closest?.("#toolkitSettings"))
+      sharedConfigDirty = true;
+  };
+  document.addEventListener("input", markSettingsDraft);
+  document.addEventListener("change", markSettingsDraft);
+  $("requestPreviewSearch").onclick = async () => {
+    try {
+      const requestedCampaign = sharedCampaignId;
+      const result = await toolkitFetch(
+        "/api/toolkit/candidate-search?campaign=" +
+          encodeURIComponent(requestedCampaign) +
+          "&q=" +
+          encodeURIComponent($("requestPreviewQuery").value),
+        null,
+        "GET",
+      );
+      if (requestedCampaign !== sharedCampaignId) return;
+      $("requestPreviewCandidate").innerHTML = result.candidates
+        .map(
+          (r) =>
+            `<option value="${escapeHtml(r.candidate_id)}">${escapeHtml(r.candidate_id)} · ${escapeHtml(r.procedure.slice(0, 90))}</option>`,
+        )
+        .join("");
+    } catch (error) {
+      renderError(error.message);
+    }
+  };
+  $("requestPreview").onclick = async () => {
+    try {
+      const requestedCampaign = sharedCampaignId;
+      const result = await toolkitFetch("/api/moc/request-preview", {
+        id: requestedCampaign,
+        role: $("requestPreviewRole").value,
+        candidate_id:
+          $("requestPreviewSource").value === "recorded"
+            ? null
+            : $("requestPreviewCandidate").value || null,
+        suggestion_id:
+          $("requestPreviewSource").value === "recorded"
+            ? $("sharedReplayStep").value
+            : null,
+      });
+      if (requestedCampaign === sharedCampaignId)
+        $("requestPreviewResult").textContent = JSON.stringify(result, null, 2);
+    } catch (error) {
+      renderError(error.message);
+    }
+  };
+  $("applyDefinition").onclick = async () => {
+    try {
+      await toolkitFetch("/api/moc/measurement-definition", {
+        id: sharedCampaignId,
+        definition: {
+          quantification_method: $("definitionMethod").value,
+          normalization: $("definitionNormalization").value,
+          definition_note: $("definitionNote").value,
+        },
+        historical_policy: $("definitionHistoricalPolicy").value,
+        reason: $("definitionReason").value,
+      });
+      $("definitionMethod").dataset.campaign = "";
+      await refresh();
+      renderNotice(
+        "Measurement definition decision recorded. Original measurement values and provenance remain in history.",
+      );
+    } catch (error) {
+      renderError(error.message);
+    }
+  };
   $("openCampaignTab").onclick = () => {
     const selected = $("savedCampaign").value;
     if (!selected.startsWith("shared:")) {
@@ -728,11 +893,18 @@ document.addEventListener("DOMContentLoaded", () => {
   };
   $("sharedReplay").onclick = async () => {
     try {
+      const standalone = (state.shared_inverse_proposals || []).some(
+        (record) => record.proposal_id === $("sharedReplayStep").value,
+      );
       $("sharedReplayResult").textContent = JSON.stringify(
-        await toolkitFetch("/api/moc/replay", {
-          id: sharedCampaignId,
-          suggestion_id: $("sharedReplayStep").value,
-        }),
+        await toolkitFetch(
+          standalone ? "/api/moc/request-preview" : "/api/moc/replay",
+          {
+            id: sharedCampaignId,
+            suggestion_id: $("sharedReplayStep").value,
+            ...(standalone ? { role: "inverse" } : {}),
+          },
+        ),
         null,
         2,
       );

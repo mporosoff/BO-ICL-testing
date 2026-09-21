@@ -302,6 +302,313 @@ def render_messages(
     ]
 
 
+def build_chat_request(
+    config, role, observations=(), query=None, *, count=None, messages=None
+):
+    """Build the exact provider payload without constructing or calling a client."""
+    if role not in {"forward", "inverse"}:
+        raise ValueError("Unknown prompt kind")
+    n = config["n_samples"] if role == "forward" else 1
+    if count is not None:
+        if (
+            role != "inverse"
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or not 1 <= count <= 20
+        ):
+            raise ValueError(
+                "Standalone inverse proposal count must be an integer from 1 to 20"
+            )
+        n = count
+    if messages is None:
+        messages = render_messages(
+            role,
+            observations,
+            query,
+            config.get(f"{role}_system_message"),
+            config.get("include_phase_context", True),
+            **{
+                key: config.get(key, default)
+                for key, default in (
+                    ("prompt_style", "moc"),
+                    ("objective_name", "objective"),
+                    ("objective_units", ""),
+                )
+            },
+        )
+    return dict(
+        model=config[f"{role}_model"],
+        messages=deepcopy(messages),
+        temperature=config[f"{role}_temperature"],
+        max_tokens=config[f"{role}_max_tokens"],
+        n=n,
+    )
+
+
+def prompt_provenance(config):
+    result = {}
+    for role in ("forward", "inverse"):
+        message = build_chat_request(
+            config, role, query=0 if role == "inverse" else ""
+        )["messages"][0]["content"]
+        result[role] = dict(
+            origin="managed"
+            if config.get(f"{role}_system_message") is None
+            else "custom",
+            version=METHOD_VERSION,
+            sha256=hashlib.sha256(message.encode("utf-8")).hexdigest(),
+        )
+    return result
+
+
+def _active_observations(observations):
+    rows = [
+        dict(row)
+        for row in observations
+        if row.get("training_included", True)
+        and row.get("record_status", "measured") == "measured"
+    ]
+    ids = [str(row["candidate_id"]) for row in rows]
+    if len(set(ids)) != len(ids):
+        raise ValueError(
+            "Resolve refinements/replicates to one active demonstration per design"
+        )
+    return rows
+
+
+def select_examples(config, observations, query_vector=None, observation_vectors=None):
+    """Procedure-only selection shared by execution and previews, with no I/O."""
+    if config.get("selector_mode") == "all" or config["selector_k"] is None:
+        return list(observations)
+    if query_vector is None or observation_vectors is None:
+        raise ValueError(
+            "Nearest-example selection requires cached procedure embeddings; preview never generates embeddings"
+        )
+    matrix = normalized_vectors(observation_vectors)
+    vector = normalized_vectors([query_vector])[0]
+    if len(matrix) != len(observations) or matrix.shape[1] != len(vector):
+        raise ValueError(
+            "Observation IDs, query and selector embedding dimensions do not align"
+        )
+    rankings = sorted(
+        range(len(observations)),
+        key=lambda i: (-float(matrix[i] @ vector), observations[i]["observation_id"]),
+    )
+    return [observations[i] for i in rankings[: config["selector_k"]]]
+
+
+def _vector_lookup(rows, vectors, key):
+    if vectors is None:
+        return {}
+    if isinstance(vectors, dict):
+        return {str(k): normalized_vectors([v])[0] for k, v in vectors.items()}
+    matrix = normalized_vectors(vectors)
+    if len(matrix) != len(rows):
+        raise ValueError("Cached embedding matrix does not align with record IDs")
+    return {str(row[key]): matrix[i] for i, row in enumerate(rows)}
+
+
+def _cached_selector_vectors(
+    config,
+    candidates,
+    observations,
+    candidate_vectors=None,
+    observation_vectors=None,
+    selector_candidate_vectors=None,
+):
+    """Resolve only supplied vectors; absent cache entries remain absent."""
+    supplied = (
+        candidate_vectors
+        if config["selector_embedding_model"] == config["embedding_model"]
+        else selector_candidate_vectors
+    )
+    by_candidate = _vector_lookup(candidates, supplied, "candidate_id")
+    by_observation = _vector_lookup(observations, observation_vectors, "observation_id")
+    rows = [
+        by_observation.get(
+            str(row["observation_id"]), by_candidate.get(str(row["candidate_id"]))
+        )
+        for row in observations
+    ]
+    matrix = None if any(row is None for row in rows) else np.asarray(rows)
+    return by_candidate, matrix
+
+
+def _target(config, observations, rng, target=None):
+    if not observations:
+        raise ValueError(
+            "Inverse prompting requires at least one active measured observation"
+        )
+    best_row = (max if config["maximize"] else min)(observations, key=_value)
+    aspiration = resolve_inverse_target(
+        _value(best_row),
+        maximize=config["maximize"],
+        multiplier=config["inverse_multiplier"],
+        jitter=config["inverse_jitter"],
+        bounds=config["objective_bounds"],
+        reference_scale=config["reference_scale"],
+        manual=config.get("manual_inverse_target") if target is None else target,
+        floor=config.get("target_floor"),
+        ceiling=config.get("target_ceiling"),
+        rng=rng,
+    )
+    return best_row, aspiration
+
+
+def preview_request(
+    config,
+    candidates=(),
+    observations=(),
+    *,
+    role="forward",
+    candidate_id=None,
+    target=None,
+    candidate_vectors=None,
+    observation_vectors=None,
+    selector_candidate_vectors=None,
+    recorded_result=None,
+    rng_state=None,
+    count=None,
+):
+    """Preview a real payload or explain unresolved selection; never make provider calls.
+
+    A recorded result is authoritative even when current settings differ. Current
+    automatic targets use a cloned generator, leaving the campaign RNG untouched.
+    Partial vector mappings are allowed when they include the requested candidate
+    and all active observed procedures in the selector model's representation.
+    """
+    if role not in {"forward", "inverse"}:
+        raise ValueError("Unknown prompt kind")
+    result = dict(
+        role=role,
+        candidate_id=candidate_id,
+        source="recorded" if recorded_result is not None else "current",
+        status="unresolved",
+        request=None,
+        example_ids=None,
+    )
+    if recorded_result is not None:
+        key = (
+            candidate_id
+            if candidate_id is not None
+            else recorded_result.get("selected_candidate_id")
+        )
+        logs = [
+            row
+            for row in recorded_result.get("request_log", [])
+            if row.get("role") == role
+            and (role == "inverse" or row.get("candidate_id") == key)
+        ]
+        if not logs:
+            result["reason"] = "No recorded request for the selected role and candidate"
+            return result
+        log = logs[-1]
+        request = deepcopy(log["request"])
+        result.update(
+            status="exact",
+            candidate_id=log.get("candidate_id"),
+            request=request,
+            request_sha256=fingerprint(request),
+            target=deepcopy(recorded_result.get("target")),
+            example_ids=deepcopy(
+                recorded_result.get("inverse_example_ids", [])
+                if role == "inverse"
+                else recorded_result.get("predictions", {})
+                .get(key, {})
+                .get("example_ids", [])
+            ),
+            prompt_provenance=deepcopy(recorded_result.get("prompt_provenance", {})),
+            recorded_request_status=log.get("status"),
+            example_selection=dict(resolved=True, source="recorded"),
+        )
+        return result
+    engine = LLMEngine(config, rng_state=rng_state)
+    c = engine.config
+    result["prompt_provenance"] = prompt_provenance(c)
+    # Static request fields remain useful before a candidate or target can resolve.
+    template = build_chat_request(
+        c,
+        role,
+        query=0 if role == "inverse" else "[candidate not selected]",
+        count=count,
+    )
+    result.update(
+        request_parameters={
+            key: value for key, value in template.items() if key != "messages"
+        },
+        system_message=template["messages"][0]["content"],
+        query_message=None,
+        example_selection=dict(
+            resolved=False, mode=c["selector_mode"], count=c["selector_k"]
+        ),
+    )
+    observations = _active_observations(observations)
+    candidates = list(candidates)
+    # Show role, system, suffix and effective settings even when cache is missing.
+    try:
+        best_row, aspiration = _target(c, observations, engine.rng, target)
+        result["target"] = aspiration
+        if role == "inverse":
+            query = aspiration["resolved_target"]
+        else:
+            matches = [
+                row
+                for row in candidates
+                if str(row["candidate_id"]) == str(candidate_id)
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    "Select one candidate to preview its forward request; the next BO shortlist depends on the inverse response and retrieval"
+                )
+            query = _procedure(matches[0])
+        template = build_chat_request(c, role, query=query, count=count)
+        result.update(
+            request_parameters={
+                key: value for key, value in template.items() if key != "messages"
+            },
+            system_message=template["messages"][0]["content"],
+            query_message=template["messages"][1]["content"],
+            example_selection=dict(
+                resolved=False, mode=c["selector_mode"], count=c["selector_k"]
+            ),
+        )
+        by_candidate, matrix = (
+            ({}, None)
+            if c["selector_mode"] == "all" or c["selector_k"] is None
+            else _cached_selector_vectors(
+                c,
+                candidates,
+                observations,
+                candidate_vectors,
+                observation_vectors,
+                selector_candidate_vectors,
+            )
+        )
+        vector = (
+            (None if matrix is None else matrix[observations.index(best_row)])
+            if role == "inverse"
+            else by_candidate.get(str(candidate_id))
+        )
+        selected = select_examples(c, observations, vector, matrix)
+        request = build_chat_request(c, role, selected, query, count=count)
+        result.update(
+            status="exact",
+            request=request,
+            request_sha256=fingerprint(request),
+            example_ids=[row["observation_id"] for row in selected],
+            example_selection=dict(
+                resolved=True,
+                mode=c["selector_mode"],
+                source="supplied_cache"
+                if c["selector_mode"] != "all"
+                else "all_observations",
+            ),
+        )
+    except ValueError as error:
+        result["reason"] = str(error)
+    return result
+
+
 def score_responses(candidate_id, raw_responses, best, config, rank=0):
     """Pure replay function. Invalid completions retain reasons and ownership."""
     values, rejected = [], []
@@ -379,9 +686,12 @@ class LLMEngine:
         runtime = {
             key: llm.pop(key, default)
             for key, default in (
-                ("prompt_style", "moc"),
-                ("objective_name", "objective"),
-                ("objective_units", ""),
+                (
+                    "prompt_style",
+                    "generic" if supplied.get("data_schema") == "generic" else "moc",
+                ),
+                ("objective_name", supplied.get("objective", "objective")),
+                ("objective_units", supplied.get("units", "")),
             )
         }
         overrides = {"llm": llm}
@@ -425,19 +735,12 @@ class LLMEngine:
                     "Configured model requires a different sampling adapter; model substitution is disabled"
                 )
 
-    def _chat(self, role, messages, candidate_id=None):
+    def _chat(self, role, messages, candidate_id=None, count=None):
         if self.client is None:
             raise ValueError(
                 "A provider client must be explicitly supplied for a live suggestion"
             )
-        c = self.config
-        request = dict(
-            model=c[f"{role}_model"],
-            messages=messages,
-            temperature=c[f"{role}_temperature"],
-            max_tokens=c[f"{role}_max_tokens"],
-            n=c["n_samples"] if role == "forward" else 1,
-        )
+        request = build_chat_request(self.config, role, messages=messages, count=count)
         record = dict(
             role=role,
             candidate_id=candidate_id,
@@ -499,6 +802,83 @@ class LLMEngine:
         )
         return matrix
 
+    def propose_inverse(
+        self,
+        candidates,
+        observations,
+        *,
+        count=1,
+        target=None,
+        candidate_vectors=None,
+        observation_vectors=None,
+        cancel=None,
+    ):
+        """Generate standalone procedure queries; never score or reserve candidates."""
+        self.request_log = []
+        c = self.config
+        result = dict(
+            method_version=METHOD_VERSION,
+            status="failed",
+            procedures=[],
+            requested_count=count,
+            returned_count=0,
+            request_log=self.request_log,
+            config=deepcopy(c),
+            prompt_provenance=prompt_provenance(c),
+            rng_state_before=deepcopy(self.rng.bit_generator.state),
+        )
+        try:
+            if cancel and cancel():
+                raise InterruptedError("Inverse proposal cancelled")
+            # Validate count before drawing a target or making any provider call.
+            build_chat_request(c, "inverse", query=0, count=count)
+            observations = _active_observations(observations)
+            best_row, aspiration = _target(c, observations, self.rng, target)
+            result["target"] = aspiration
+            if c["selector_mode"] == "all" or c["selector_k"] is None:
+                selected = observations
+            else:
+                _, matrix = _cached_selector_vectors(
+                    c,
+                    list(candidates),
+                    observations,
+                    candidate_vectors,
+                    observation_vectors,
+                )
+                if matrix is None:
+                    matrix = self._embed(
+                        [_procedure(row) for row in observations],
+                        c["selector_embedding_model"],
+                    )
+                selected = select_examples(
+                    c, observations, matrix[observations.index(best_row)], matrix
+                )
+            result["inverse_example_ids"] = [row["observation_id"] for row in selected]
+            request = build_chat_request(
+                c, "inverse", selected, aspiration["resolved_target"], count=count
+            )
+            if cancel and cancel():
+                raise InterruptedError("Inverse proposal cancelled")
+            raw = self._chat("inverse", request["messages"], count=count)
+            result["raw_responses"] = raw
+            result["returned_count"] = len(raw)
+            result["procedures"] = [
+                value for value in raw if isinstance(value, str) and value.strip()
+            ]
+            if len(raw) != count or len(result["procedures"]) != count:
+                raise ValueError(
+                    "Inverse request did not return the requested number of nonempty procedures"
+                )
+            if cancel and cancel():
+                raise InterruptedError("Inverse proposal cancelled")
+            result["status"] = "proposed"
+        except InterruptedError as error:
+            result.update(status="cancelled", reason=str(error))
+        except Exception as error:
+            result.update(status="failed", reason=f"{type(error).__name__}: {error}")
+        result["rng_state_after"] = deepcopy(self.rng.bit_generator.state)
+        return result
+
     def suggest(
         self,
         candidates,
@@ -515,12 +895,7 @@ class LLMEngine:
         ids = [str(row["candidate_id"]) for row in candidates]
         if len(set(ids)) != len(ids):
             raise ValueError("Candidate IDs must be unique")
-        observations = [
-            dict(row)
-            for row in observations
-            if row.get("training_included", True)
-            and row.get("record_status", "measured") == "measured"
-        ]
+        observations = _active_observations(observations)
         observed_ids = [row["candidate_id"] for row in observations]
         if len(set(observed_ids)) != len(observed_ids):
             raise ValueError(
@@ -538,25 +913,7 @@ class LLMEngine:
             config=deepcopy(c),
             rng_state_before=deepcopy(self.rng.bit_generator.state),
         )
-        result["prompt_provenance"] = {}
-        for role in ("forward", "inverse"):
-            content = c.get(f"{role}_system_message")
-            effective = (
-                managed_system_message(
-                    role,
-                    **{
-                        key: c[key]
-                        for key in ("prompt_style", "objective_name", "objective_units")
-                    },
-                )
-                if content is None
-                else content
-            )
-            result["prompt_provenance"][role] = dict(
-                origin="managed" if content is None else "custom",
-                version=METHOD_VERSION,
-                sha256=hashlib.sha256(effective.encode("utf-8")).hexdigest(),
-            )
+        result["prompt_provenance"] = prompt_provenance(c)
         if not eligible_indices:
             result.update(status="exhausted", reason="No eligible candidates")
             return result
@@ -578,20 +935,8 @@ class LLMEngine:
 
         try:
             check_cancel()
-            best_row = (max if c["maximize"] else min)(observations, key=_value)
+            best_row, aspiration = _target(c, observations, self.rng, target)
             best = _value(best_row)
-            aspiration = resolve_inverse_target(
-                best,
-                maximize=c["maximize"],
-                multiplier=c["inverse_multiplier"],
-                jitter=c["inverse_jitter"],
-                bounds=c["objective_bounds"],
-                reference_scale=c["reference_scale"],
-                manual=target,
-                floor=c.get("target_floor"),
-                ceiling=c.get("target_ceiling"),
-                rng=self.rng,
-            )
             result["target"] = aspiration
             matrix = (
                 self._embed(
@@ -616,30 +961,13 @@ class LLMEngine:
                 )
 
             def examples(vector):
-                if c.get("selector_mode") == "all" or c["selector_k"] is None:
-                    return observations
-                rankings = sorted(
-                    range(len(observations)),
-                    key=lambda i: (
-                        -float(observed_vectors[i] @ vector),
-                        observations[i]["observation_id"],
-                    ),
-                )
-                return [observations[i] for i in rankings[: c["selector_k"]]]
+                return select_examples(c, observations, vector, observed_vectors)
 
             best_index = observations.index(best_row)
             inv_examples = examples(observed_vectors[best_index])
-            inv_messages = render_messages(
-                "inverse",
-                inv_examples,
-                aspiration["resolved_target"],
-                c.get("inverse_system_message"),
-                c.get("include_phase_context", True),
-                **{
-                    key: c[key]
-                    for key in ("prompt_style", "objective_name", "objective_units")
-                },
-            )
+            inv_messages = build_chat_request(
+                c, "inverse", inv_examples, aspiration["resolved_target"]
+            )["messages"]
             inverse = self._chat("inverse", inv_messages)
             if (
                 len(inverse) != 1
@@ -703,17 +1031,9 @@ class LLMEngine:
                     )[0]
                 )
                 selected_examples = examples(vector)
-                messages = render_messages(
-                    "forward",
-                    selected_examples,
-                    _procedure(candidate),
-                    c.get("forward_system_message"),
-                    c.get("include_phase_context", True),
-                    **{
-                        key: c[key]
-                        for key in ("prompt_style", "objective_name", "objective_units")
-                    },
-                )
+                messages = build_chat_request(
+                    c, "forward", selected_examples, _procedure(candidate)
+                )["messages"]
                 try:
                     raw = self._chat("forward", messages, key)
                     record = score_responses(key, raw, best, c, retrieval_row["rank"])

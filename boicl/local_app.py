@@ -5023,7 +5023,7 @@ INDEX_HTML = r"""<!doctype html>
         </details>
       </section>
 
-      <section class="panel">
+      <section class="panel" id="toolkitSettings">
         <h2>Settings</h2>
         <div class="field">
           <label for="workflowMode">Workflow mode</label>
@@ -5138,7 +5138,7 @@ INDEX_HTML = r"""<!doctype html>
           </div>
         </div>
         <details class="advanced-settings">
-          <summary>Advanced BO-ICL sampling</summary>
+          <summary>Advanced BO-ICL sampling</summary><details id="sharedInverseSettings" class="hidden"><summary>Inverse target and standalone proposal count</summary><p class="hint">A blank manual target uses the automatic target; zero is an explicit value in original objective units. Apply Settings to save. The standalone count does not change the one-completion BO step.</p></details>
           <div class="field hidden"><label for="inverseTargetReferenceScale">Zero-baseline target scale</label><input id="inverseTargetReferenceScale" type="number" min="0.000000000001" step="any" value="1"><div id="inverseTargetReferenceScaleHint" class="hint"></div></div>
           <div class="row">
             <div class="field">
@@ -5356,7 +5356,7 @@ INDEX_HTML = r"""<!doctype html>
           </div>
         </div>
         <div id="measurementHint" class="muted" style="margin-bottom: 12px;">Enter the measured outcome and its uncertainty in the original objective units.</div>
-        <details id="sharedQuality" class="hidden"><summary>Measurement quality and source</summary><p class="hint">MoC results require esd, GOF and closure gap. Generic measurements preserve unknown quality as missing. These entries also apply to the independent random result below.</p><div class="row"><div class="field"><label for="qualityGOF">GOF</label><input id="qualityGOF" type="number" step="any"></div><div class="field"><label for="qualityGap">Closure gap (wt%)</label><input id="qualityGap" type="number" step="any"></div></div><div class="field"><label for="qualityGapOrigin">Gap origin</label><select id="qualityGapOrigin"><option value="reported">Reported</option><option value="derived">Derived</option><option value="unknown">Unknown</option></select></div><div class="field"><label for="qualityNote">Source note</label><input id="qualityNote"></div></details>
+        <details id="sharedQuality" class="hidden"><summary>Measurement quality and source</summary><p class="hint">MoC results require esd, GOF and closure gap. Generic measurements preserve unknown quality as missing. These entries also apply to the independent random result below.</p><div class="row"><div class="field"><label for="qualityGOF">GOF</label><input id="qualityGOF" type="number" step="any"></div><div class="field"><label for="qualityGap">Closure gap (wt%)</label><input id="qualityGap" type="number" step="any"></div></div><div class="field"><label for="qualityGapOrigin">Gap origin</label><select id="qualityGapOrigin"><option value="reported">Reported</option><option value="derived">Derived</option><option value="unknown">Unknown</option></select></div><div class="field"><label for="qualityNote">Source note</label><input id="qualityNote"></div><p class="hint">Confirmed values do not establish a quantification method. Keep unknown historical methods unspecified. Record the actual method and normalization; mass fractions and pattern-area fractions are not interchangeable.</p><label>Quantification method<select id="quality_quantification_method"><option value="historical_unspecified">Historical / unspecified (unknown)</option><option value="gsas_ii_mass_fraction">GSAS-II mass fraction</option><option value="xrd_area_fraction">Integrated phase-pattern area fraction</option><option value="other">Other documented method</option></select></label><label>Normalization basis<input id="quality_normalization"></label><label>Source file<input id="quality_source_file"></label><label>Source record identifier<input id="quality_source_identifier"></label><label>Refinement identifier<input id="quality_refinement_id"></label><label>Uncertainty method / provenance<input id="quality_uncertainty_method"></label><label>Definition note<input id="quality_definition_note"></label><details><summary>Measurement definition and historical training</summary><p class="hint">Document a validated definition before mixing explicit methods with historical observations. This decision preserves original numbers and provenance. Incompatible explicit definitions are excluded from training; unknown historical records need exclusion or a scientific justification to retain them.</p><pre id="qualityStatus"></pre><label>Validated definition<select id="definitionMethod"><option value="">Choose validated method</option><option value="gsas_ii_mass_fraction">GSAS-II mass fraction</option><option value="xrd_area_fraction">Integrated phase-pattern area fraction</option><option value="other">Other documented method</option></select></label><label>Normalization basis<input id="definitionNormalization"></label><label>Definition note (required for other methods)<input id="definitionNote"></label><label>Unknown historical records<select id="definitionHistoricalPolicy"><option value="exclude">Exclude from model training</option><option value="retain_with_justification">Retain with scientific justification</option></select></label><label>Scientific decision / reason<input id="definitionReason"></label><button class="secondary" id="applyDefinition">Record definition decision</button></details></details>
         <button class="primary" id="addObservation">Add Observation</button>
         <div id="refinementControls" class="hidden"><div class="field"><label for="refinementReason">Reason for refinement</label><input id="refinementReason" placeholder="Required; original record remains in history"></div><button id="saveRefinement">Save refinement</button> <button id="cancelRefinement">Cancel refinement</button></div>
       </section>
@@ -5404,13 +5404,13 @@ INDEX_HTML = r"""<!doctype html>
           <h2 style="margin:0;">Inverse Design</h2>
           <button id="inverseDesign">Generate Proposals</button>
         </div>
-        <div id="inverseDesigns"></div>
+        <p id="inverseDesignNote" class="hint"></p><div id="inverseDesigns"></div>
       </section>
 
       <section class="panel">
         <h2>Observations</h2>
         <div id="observations"></div>
-        <details id="sharedProvenance" class="hidden"><summary>Campaign record, request log and replay</summary><div class="field"><label for="sharedReplayStep">Recorded suggestion</label><select id="sharedReplayStep"></select></div><button id="sharedReplay">Replay recorded score</button> <button id="sharedLog">Load exact request log</button><pre id="sharedReplayResult" style="white-space:pre-wrap;max-height:400px;overflow:auto"></pre><details><summary>Configuration and complete history</summary><pre id="sharedRecord" style="white-space:pre-wrap;max-height:500px;overflow:auto"></pre></details><div class="field"><label for="sharedCachePath">Local portable cache package path</label><input id="sharedCachePath"></div><button id="sharedCacheImport">Validate and import cache</button></details>
+        <details id="sharedRequestPreview" class="hidden"><summary>Preview full LLM request (no model calls)</summary><p class="hint">Uses saved settings. Choose a candidate for a forward preview, or the inverse role for its target. A recorded step uses its stored request. Missing cached selector inputs or an unknown future shortlist are reported as unresolved; preview does not generate embeddings.</p><label>Request role<select id="requestPreviewRole"><option value="forward">Forward prediction</option><option value="inverse">Inverse proposal</option></select></label><label>Request source<select id="requestPreviewSource"><option value="current">Current saved settings</option><option value="recorded">Recorded suggestion selected below</option></select></label><label>Find candidate by ID or procedure<input id="requestPreviewQuery"></label><button class="secondary" id="requestPreviewSearch">Find candidates</button><label>Selected candidate<select id="requestPreviewCandidate"></select></label><button class="secondary" id="requestPreview">Preview request</button><pre id="requestPreviewResult"></pre></details><details id="sharedProvenance" class="hidden"><summary>Campaign record, request log and replay</summary><div class="field"><label for="sharedReplayStep">Recorded suggestion</label><select id="sharedReplayStep"></select></div><button id="sharedReplay">Replay recorded score</button> <button id="sharedLog">Load exact request log</button><pre id="sharedReplayResult" style="white-space:pre-wrap;max-height:400px;overflow:auto"></pre><details><summary>Configuration and complete history</summary><pre id="sharedRecord" style="white-space:pre-wrap;max-height:500px;overflow:auto"></pre></details><div class="field"><label for="sharedCachePath">Local portable cache package path</label><input id="sharedCachePath"></div><button id="sharedCacheImport">Validate and import cache</button></details>
       </section>
 
       <section id="messages" class="stack"></section>
@@ -5439,12 +5439,12 @@ INDEX_HTML = r"""<!doctype html>
       savedCampaign: 'Previously saved local campaigns that can be loaded without re-uploading the dataset.',
       workflowMode: 'Choose automatic benchmark for fully labeled datasets; choose live campaign when labels arrive from experiments over time.',
       datasetFile: 'Accepted formats: CSV, TXT, XLS, XLSX, and NPY. The first column must be procedure text; later numeric columns are objectives.',
-      optimizer: 'Choose GPR with embeddings for the GP baseline, or BO-ICL LLM for in-context LLM predictions over the uploaded pool.',
+      optimizer: 'Choose a synthesis-parameter GP (no embeddings or API key), a separate text-embedding GP, or BO-ICL LLM. Shared campaigns use one saved history across both views.',
       objectiveName: 'The numeric label column to optimize. If multiple objective columns were uploaded, choose one here.',
       objectiveDirection: 'Maximize for yields/selectivity/scores; minimize for losses, errors, or costs.',
       acquisition: 'Candidate ranking rule. New LLM campaigns use expected improvement by default.',
-      objectiveLowerBound: 'Optional physical or measurement lower bound in original units. Used only for plot guides, clipping displayed error-bar endpoints, and clipping inverse-design targets, not prompts or acquisition math.',
-      objectiveUpperBound: 'Optional physical or measurement upper bound in original units. For phase percentages, use 100. Used only for plot guides, clipping displayed error-bar endpoints, and clipping inverse-design targets, not prompts or acquisition math.',
+      objectiveLowerBound: 'Physical lower bound in original units. Shared campaigns enforce it in model/acquisition behavior, accepted LLM samples, inverse targets and displayed intervals.',
+      objectiveUpperBound: 'Physical upper bound in original units. Shared campaigns enforce it in model/acquisition behavior, accepted LLM samples, inverse targets and displayed intervals. Generic units and bounds remain user-defined.',
       objectiveScaling: 'Off keeps labels in original units. Auto/min-max/z-score are used for GPR fitting only; BO-ICL LLM always uses original units so prompts, floors, and predictions stay consistent.',
       plotStatGuides: 'Controls full-dataset dashed reference lines. Best only is cleaner; Paper stats adds mean and percentile guides.',
       embeddingModel: 'OpenAI embedding model used to featurize procedures for GPR and nearest-neighbor inverse filtering.',
@@ -5463,19 +5463,19 @@ INDEX_HTML = r"""<!doctype html>
       inverseFilter: 'LLM-mode shortlist size retrieved with inverse-design text plus cached embeddings before completions are requested. Full pool mode searches every available candidate; Broad random pool mode searches the sampled broad pool. 0 disables the shortlist and scores the broad pool.',
       inverseRandomCandidates: 'Extra random candidates mixed with the LLM shortlist before completions are requested.',
       llmPoolScope: 'Full pool matches the paper: compare inverse-design text against every available candidate. Broad random pool first samples Broad pool candidates, then applies MMR/cosine similarity within that subset for speed.',
-      inverseTargetValue: 'Manual target for inverse design. Leave blank to use the current best value times the multiplier.',
+      inverseTargetValue: 'Optional target in original objective units. Blank uses the automatic target; zero is explicit. A manual target is validated against physical bounds and is not multiplied again.',
       inverseTargetMultiplier: 'Mean multiplier used for automatic inverse-design targets when no explicit target is entered. The paper-style default is 1.2.',
-      inverseTargetJitter: 'Standard deviation for the random multiplier used by automatic inverse-design targets. 0.05 means target = current best x Normal(1.2, 0.05); set 0 for deterministic.',
-      inverseTargetFloorValue: 'Optional minimum automatic inverse-design target for sparse-zero maximization campaigns. For alpha phase percent, enter a whole percent such as 5 or 10. Manual inverse target overrides this.',
+      inverseTargetJitter: 'Standard deviation of the automatic improvement multiplier. The target improves from the incumbent in the optimization direction, then respects physical bounds. Zero makes the multiplier deterministic.',
+      inverseTargetFloorValue: 'Optional target lower bound in original units. Shared manual targets must also respect configured target bounds; the legacy manual override retains its saved semantics.',
       inverseDesignCount: 'Number of free-form inverse-design proposals to generate.',
-      iterationsPerTrial: 'Live-mode stopping point after this many active-objective observations. 0 means no cap.',
+      iterationsPerTrial: 'Shared new-measurement budget excludes initialization: blank is unlimited and zero prevents suggestions. The saved legacy iteration cap instead counts observations and retains its historical zero=no-cap meaning.',
       replicatesPerCandidate: 'How many live measurements are allowed for the same candidate before it leaves the available pool.',
-      scoreLimit: 'Candidate scoring cap for GPR. In LLM mode, this is used only when LLM shortlist is 0 or when LLM pool scope is Broad random pool.',
+      scoreLimit: 'Legacy broad-pool LLM control. Shared GP engines score the full eligible pool; default LLM retrieval also searches the full eligible pool before shortlisting.',
       apiPauseSeconds: 'Small delay after provider API calls. Increase this when rate limits appear.',
-      apiRetryAttempts: 'Number of automatic retries for 429/rate-limit or transient provider errors.',
+      apiRetryAttempts: 'Maximum total provider attempts, including the first request. Eight means at most eight attempts; permanent errors are not repeatedly retried.',
       apiRateLimitCooldownSeconds: 'Extra cooldown after a 429/rate-limit error before retrying. Increase this for OpenAI TPM limits; it is separate from the normal API pause after successful calls.',
       nNeighbors: 'GPR embedding neighbor count used by the local GP featurization pipeline.',
-      autoSuggest: 'When checked, adding a live result immediately refreshes suggestions.',
+      autoSuggest: 'After intentional start, saving a measurement can refresh suggestions and issue paid LLM or embedding requests. Opening or importing a shared campaign does not start work.',
       benchmarkName: 'Optional label for this appended offline benchmark curve.',
       benchmarkInitialPoints: 'Number of real random starting experiments before BO model selection starts. Allowed range is 1 to 3; the paper default was 1.',
       benchmarkInitialSeedStrategy: 'Controls how the first initial point is chosen for each benchmark replicate. Random samples uniformly from labeled candidates and is the paper-style/live-realistic setting. Closest nonzero label to dataset mean is a labeled-data diagnostic for sparse offline datasets; it deliberately uses hidden labels and should not be used for live-realistic performance claims. Any extra initial points beyond the first still come from the random shuffle.',
@@ -6161,6 +6161,7 @@ INDEX_HTML = r"""<!doctype html>
       };
       const xIndexes = [
         ...trace.map((item) => Number(item.index)),
+        ...activeObs.map((item, idx) => Number(item.index ?? idx + 1)),
         ...randomTrace.map((item) => Number(item.index)),
         ...liveRandomTrace.map((item) => Number(item.index)),
         ...benchmarkRuns.flatMap((run) => (run.summary || []).map((item) => Number(item.index))),
@@ -6168,6 +6169,13 @@ INDEX_HTML = r"""<!doctype html>
       ].filter((value) => Number.isFinite(value) && value >= (state.plot_x_axis?.min ?? 1));
       const minIndex = state.plot_x_axis?.min ?? 1;
       const maxIndex = Math.max(1, ...xIndexes);
+      const axisLabels = state.plot_x_axis?.labels;
+      const orderedAxis = Array.isArray(axisLabels);
+      const initializationEnd = optionalNumber(state.plot_x_axis?.initialization_end);
+      const domainMax = orderedAxis ? Math.max(maxIndex + 0.5, initializationEnd || 0) : maxIndex;
+      const axisLabel = (index) => orderedAxis
+        ? (axisLabels.find((item) => Number(item.index) === Number(index))?.label ?? index)
+        : index;
       const values = activeObs.flatMap((item) => {
         const unc = Number(item.uncertainty || 0);
         return [clipToObjectiveBounds(item.value - unc), clipToObjectiveBounds(item.value + unc), item.value];
@@ -6224,7 +6232,7 @@ INDEX_HTML = r"""<!doctype html>
           maxY += yMargin;
         }
       }
-      const x = (i) => pad.left + ((i - minIndex) / Math.max(1, maxIndex - minIndex)) * (width - pad.left - pad.right);
+      const x = (i) => pad.left + ((i - minIndex) / Math.max(1, domainMax - minIndex)) * (width - pad.left - pad.right);
       const y = (value) => pad.top + (1 - ((value - minY) / (maxY - minY))) * (height - pad.top - pad.bottom);
       const pathFor = (items, valueKey) => items.length > 1
         ? items.map((item, idx) => `${idx ? 'L' : 'M'} ${x(item.index).toFixed(1)} ${y(item[valueKey]).toFixed(1)}`).join(' ')
@@ -6299,12 +6307,15 @@ INDEX_HTML = r"""<!doctype html>
         return `${err}<path d="M ${cx.toFixed(1)} ${(cy - 5).toFixed(1)} L ${(cx + 5).toFixed(1)} ${cy.toFixed(1)} L ${cx.toFixed(1)} ${(cy + 5).toFixed(1)} L ${(cx - 5).toFixed(1)} ${cy.toFixed(1)} Z" fill="#fff" stroke="#2563eb" stroke-width="1.8"><title>${escapeHtml(item.procedure)} predicted: ${fmt(prediction.mean)}; ${escapeHtml(interval.label)} ${fmt(interval.lower)} to ${fmt(interval.upper)}</title></path>`;
       }).join('');
       const points = activeObs.map((item, idx) => {
-        const cx = x(item.index ?? idx + 1);
+        const index = item.index ?? idx + 1;
+        const label = item.axis_label ?? axisLabel(index);
+        const cx = x(index);
         const cy = y(item.value);
         const unc = Number(item.uncertainty || 0);
         const err = unc ? `<line x1="${cx}" x2="${cx}" y1="${y(clipToObjectiveBounds(item.value - unc))}" y2="${y(clipToObjectiveBounds(item.value + unc))}" stroke="#b45309" stroke-width="1.5" />` : '';
         const countText = item.replicate_count && item.replicate_count > 1 ? `, n=${item.replicate_count}` : '';
-        return `${err}<circle cx="${cx}" cy="${cy}" r="4" fill="#2563eb"><title>${escapeHtml(item.procedure)}: ${fmt(item.value)}${countText}</title></circle>`;
+        const positionText = orderedAxis ? `${label}${item.initialization_index ? ' (initialization)' : ' (new measurement)'}: ` : '';
+        return `${err}<circle data-observation-index="${index}" data-axis-label="${escapeHtml(String(label))}" cx="${cx}" cy="${cy}" r="4" fill="#2563eb"><title>${escapeHtml(positionText)}${escapeHtml(item.procedure)}: ${fmt(item.value)}${countText}</title></circle>`;
       }).join('');
       const ticks = [0, 0.25, 0.5, 0.75, 1].map((t) => {
         const value = minY + (maxY - minY) * t;
@@ -6317,9 +6328,14 @@ INDEX_HTML = r"""<!doctype html>
         : '';
       const xSpan = Math.max(1, maxIndex - minIndex);
       const xStep = xSpan <= 12 ? 1 : (xSpan <= 40 ? 5 : Math.ceil(xSpan / 8));
-      const firstRegularTick = Math.ceil(minIndex / xStep) * xStep;
+      const firstTick = orderedAxis ? Math.ceil(minIndex) : minIndex;
+      const firstRegularTick = Math.ceil(firstTick / xStep) * xStep;
+      const initializationTicks = orderedAxis
+        ? axisLabels.filter((item) => item.initialization).map((item) => Number(item.index))
+        : [];
       const xTickValues = Array.from(new Set([
-        minIndex,
+        firstTick,
+        ...(initializationTicks.length <= 12 ? initializationTicks : [initializationTicks[0], initializationTicks.at(-1)]),
         ...Array.from(
           { length: Math.floor((maxIndex - firstRegularTick) / xStep) + 1 },
           (_, idx) => firstRegularTick + idx * xStep
@@ -6329,8 +6345,13 @@ INDEX_HTML = r"""<!doctype html>
       const xTicks = xTickValues.map((value) => {
         const xx = x(value);
         return `<line x1="${xx}" x2="${xx}" y1="${height - pad.bottom}" y2="${height - pad.bottom + 5}" stroke="#98a2b3" />
-          <text x="${xx}" y="${height - pad.bottom + 20}" text-anchor="middle">${value}</text>`;
+          <text x="${xx}" y="${height - pad.bottom + 20}" text-anchor="middle">${escapeHtml(String(axisLabel(value)))}</text>`;
       }).join('');
+      const initializationRegion = orderedAxis && initializationEnd !== null && initializationEnd > minIndex
+        ? `<rect class="initialization-region" data-initialization-region="true" x="${pad.left}" y="${pad.top}" width="${x(initializationEnd) - pad.left}" height="${height - pad.top - pad.bottom}" fill="#e2e8f0" opacity="0.45"><title>Initialization observations in supplied order; excluded from the new-measurement budget</title></rect>
+          <line class="initialization-divider" data-initialization-divider="true" x1="${x(initializationEnd)}" x2="${x(initializationEnd)}" y1="${pad.top}" y2="${height - pad.bottom}" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4 4" />
+          <text x="${pad.left + 8}" y="${pad.top + 15}" fill="#475569">Initialization</text>`
+        : '';
       const legendItems = [
         bestPath ? { label: 'live best', color: '#0f766e', dash: '' } : null,
         randomPath ? { label: 'random expected', color: '#667085', dash: '5 5' } : null,
@@ -6345,8 +6366,9 @@ INDEX_HTML = r"""<!doctype html>
       }).join('');
       host.innerHTML = `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}" role="img" aria-label="Measured outcomes, best measured trace, and separate model predictions">
         <title>Measured outcomes and separate model predictions</title>
-        <desc>Solid blue dots are confirmed measurements with reported measurement uncertainty. Diamonds are model predictions; their bars show the labeled predictive interval or response spread. Comparison trace bands, when present, describe variation across independent runs.</desc>
+        <desc>Solid blue dots are confirmed measurements with reported measurement uncertainty. ${initializationRegion ? 'The shaded region shows initialization observations labeled i1, i2, and so on in supplied order. Its divider precedes new measurement 1; initialization does not consume the new-measurement budget. ' : ''}Diamonds are model predictions; their bars show the labeled predictive interval or response spread. Comparison trace bands, when present, describe variation across independent runs.</desc>
         ${legend}
+        ${initializationRegion}
         ${ticks}
         ${zeroLine}
         ${statLines}
@@ -6598,12 +6620,13 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function updateSuggestions() {
+      const requestedCampaign = sharedCampaignId;
       const configured = await request('/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payloadConfig())
       });
-      if (configured) await request('/api/suggest', { method: 'POST' });
+      if (configured && requestedCampaign === sharedCampaignId) await request('/api/suggest', { method: 'POST' });
     }
 
     $('saveKey').addEventListener('click', async () => {
@@ -6690,11 +6713,13 @@ INDEX_HTML = r"""<!doctype html>
     });
 
     $('prepareEmbeddings').addEventListener('click', async () => {
-      await request('/api/config', {
+      const requestedCampaign = sharedCampaignId;
+      const configured = await request('/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payloadConfig())
       });
+      if (!configured || requestedCampaign !== sharedCampaignId) return;
       await request('/api/precompute-embeddings', { method: 'POST' });
     });
 
@@ -6780,11 +6805,13 @@ INDEX_HTML = r"""<!doctype html>
       renderWorkflowMode();
     });
     $('inverseDesign').addEventListener('click', async () => {
-      await request('/api/config', {
+      const requestedCampaign = sharedCampaignId;
+      const configured = await request('/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payloadConfig())
       });
+      if (!configured || requestedCampaign !== sharedCampaignId) return;
       await request('/api/inverse-design', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -6796,11 +6823,13 @@ INDEX_HTML = r"""<!doctype html>
     });
     $('resetRun').addEventListener('click', () => request('/api/reset', { method: 'POST' }));
     $('runBenchmark').addEventListener('click', async () => {
-      await request('/api/config', {
+      const requestedCampaign = sharedCampaignId;
+      const configured = await request('/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payloadConfig())
       });
+      if (!configured || requestedCampaign !== sharedCampaignId) return;
       await request('/api/run-benchmark', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -6809,12 +6838,15 @@ INDEX_HTML = r"""<!doctype html>
     });
     $('clearAndRunBenchmark').addEventListener('click', async () => {
       if (!window.confirm('Clear all existing offline benchmark curves, then run the current settings from scratch?')) return;
-      await request('/api/config', {
+      const requestedCampaign = sharedCampaignId;
+      const configured = await request('/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payloadConfig())
       });
-      await request('/api/clear-benchmarks', { method: 'POST' });
+      if (!configured || requestedCampaign !== sharedCampaignId) return;
+      const cleared = await request('/api/clear-benchmarks', { method: 'POST' });
+      if (!cleared || requestedCampaign !== sharedCampaignId) return;
       await request('/api/run-benchmark', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -7454,7 +7486,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
     <p class="muted">Use this local browser tool for Bayesian-optimization active learning over a finite pool of procedures.</p>
 
     <section>
-      <h2>Saving Long-Running Campaigns</h2>
+      <h2>Shared campaigns: both views, one history</h2><p>The main toolkit is the landing page. <code>Load preset</code> creates a new campaign; <code>Load Selected</code> resumes one. <code>Focused campaign view</code> opens the same MoC ID and graph. Generic shared datasets use the main view. Multiple tabs can run independent campaigns.</p><p><code>New-measurement budget</code>: blank is unlimited; zero prevents new suggestions. Seeds are initialization. After intentional start, automatic refresh after a saved measurement can issue paid LLM or embedding requests. <code>Save checkpoint now</code> marks a saved point; <code>Resume selected as independent copy</code> creates a new arm and preserves the source.</p><p><code>GP: synthesis parameters</code> uses mapped features, no embeddings and no provider key. MoC retains its six source synthesis transforms. <code>GP: text embeddings</code> is a separate bare-procedure ada-002 baseline. LLM retrieval uses prefixed 3-large vectors; caches must match model, dimension, exact text and representation.</p><p>Under the LLM advanced controls, a manual inverse target is optional: blank means automatic, zero is explicit. Standalone proposals are separate text records and cannot be reserved or measured as pool candidates. <code>Preview full LLM request (no model calls)</code> shows exact available requests and identifies unresolved inputs. It does not generate embeddings.</p><p>Measurement quality records method, normalization, source/refinement identifiers and uncertainty provenance. Confirming 72.1/83.8/23.4 does not establish the seeds’ quantification method. Historical unspecified methods remain unknown; document a definition decision before combining explicit different definitions. Refinements preserve prior records. Shared bounds affect models and acquisition, not only plotting.</p></section><section><h2>Legacy saved datasets and benchmarks</h2>
       <p>Live experimental campaigns can run for days or weeks. Save the campaign once before you start, then the app autosaves later changes into a local folder under <code>saved_experiments/</code>. That folder is ignored by Git so lab data and API context stay on this computer.</p>
       <ol>
         <li>Enter a <code>Campaign name</code> and click <code>Save</code>.</li>
@@ -7516,7 +7548,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
         <li>Set <code>Initial random points</code>, <code>BO iterations</code>, <code>Workflow replicates</code>, and <code>Seed</code>. <code>Seed</code> is the reproducible random-number seed, not an objective-value starting point. Initial random points are real simulated experiments with labels revealed only after selection. Optionally enable <code>Greedy for final iteration</code> so only the last BO choice in each replicate switches to greedy exploitation.</li>
         <li>Click <code>Run & Append</code>. Change settings and click it again to compare another configuration. If a run stopped after a connection, rate-limit, or model error, clicking <code>Run & Append</code> again with the same label/settings resumes the partial trajectory instead of creating a duplicate curve.</li>
       </ol>
-      <div class="callout">Paper-style numerical defaults are <code>Initial random = 1</code>, <code>Batch size = 1</code>, <code>BO iterations = 30</code>, <code>Workflow replicates = 5</code>, and <code>UCB lambda = 0.1</code>. Current model defaults use supported modern model IDs rather than retired paper-era model names.</div>
+      <div class="callout">Paper-style numerical defaults are <code>Initial random = 1</code>, <code>Batch size = 1</code>, <code>BO iterations = 30</code>, <code>Workflow replicates = 5</code>, and <code>UCB lambda = 0.5</code>. Current model defaults use supported modern model IDs rather than retired paper-era model names.</div>
       <p>For BO-ICL LLM runs on large pools, <code>LLM shortlist</code> retrieves the smaller set that is scored by the LLM. The automatic target improves from the incumbent in raw units, using the optimization direction and a multiplier drawn from <code>Normal(1.2, 0.05)</code>, then applies physical bounds. Zero incumbents require an explicit positive reference scale or manual target. Full-pool mode searches every eligible candidate, keeps the nearest 100, then applies MMR. Broad-pool mode applies that retrieval inside an explicitly sampled subset. The generic runner retains its saved controls; the named MoC preset uses five forward responses, a 16-candidate shortlist and zero random additions. At least two valid responses are required for ranking, and fewer than two observed designs use an explicit initial-design policy without a model call.</p>
       <p>LLM runtime scales with <code>(LLM shortlist + Random add-ons) x LLM samples x BO iterations x Workflow replicates</code> when the shortlist is enabled. If <code>LLM shortlist = 0</code>, runtime falls back to <code>Broad pool x LLM samples</code>. If every scored LLM prediction is flat, for example all candidates score <code>0 +/- 0</code>, the acquisition ranking is treated as uninformative and the app chooses by inverse-design/MMR retrieval rank while recording that the predictor did not provide a useful value ranking. Rate-limit errors are retried automatically; increase <code>429 cooldown (s)</code>, increase <code>API pause (s)</code>, or lower the shortlist/samples if 429s keep appearing. Use the <code>Stop</code> button in the progress panel to cancel after the current API call returns.</p>
       <p>The plot shows the mean best-so-far trajectory and a +/- 1 sample-standard-deviation band across workflow replicates. Model prediction markers show the predicted objective mean and calibrated uncertainty for BO-selected points separately from the measured value. The dashed random baseline is the paper notebook's random-mean quantile expectation. <code>Plot guides</code> defaults to the best labelled value only; switch it to <code>Paper stats</code> to add the mean and percentile guide lines.</p>
@@ -7543,11 +7575,11 @@ USER_GUIDE_HTML = r"""<!doctype html>
       <table>
         <thead><tr><th>Setting</th><th>Meaning</th></tr></thead>
         <tbody>
-          <tr><td>Suggestion engine</td><td><code>GPR with embeddings</code> uses OpenAI embeddings plus a Gaussian process. <code>BO-ICL LLM</code> uses the selected LLM for in-context predictions.</td></tr>
+          <tr><td>Suggestion engine</td><td><code>GP: synthesis parameters</code> uses mapped features without embeddings or keys. <code>GP: text embeddings</code> is a separate GP over cached procedures. <code>BO-ICL LLM</code> uses empirical prediction samples.</td></tr>
           <tr><td>Acquisition</td><td>Rule for ranking the next experiment. UCB balances mean and uncertainty; expected improvement favors likely gains; greedy uses predicted best; random is a control.</td></tr>
           <tr><td>Target scaling</td><td>Off by default. Auto/min-max/z-score can help GPR numerics when bounded labels are not already near unit scale. BO-ICL LLM keeps labels, inverse targets, floors, and predictions in original objective units.</td></tr>
           <tr><td>Objective bounds</td><td>Optional physical bounds in raw units. Automatic inverse targets respect these bounds; out-of-bounds manual targets are errors. Invalid prediction samples are excluded before ranking, never silently clipped into accepted predictions. Display intervals also use these bounds. Custom system messages are preserved verbatim. Percent-like objectives infer 0–100 display bounds when the fields are blank.</td></tr>
-          <tr><td>Broad pool</td><td>Caps candidates scored by GPR. In LLM mode, it is used only when <code>LLM shortlist = 0</code> or when <code>LLM pool scope = Broad random pool</code>.</td></tr>
+          <tr><td>Broad pool</td><td>Legacy LLM control when shortlist is disabled or broad-random mode is selected. Shared GP engines score every eligible candidate; default LLM retrieval also searches the full eligible pool.</td></tr>
           <tr><td>LLM shortlist</td><td>Number of candidates retrieved by inverse-design text plus cached embeddings before LLM scoring. In Full pool mode this matches the paper; in Broad random pool mode it is a faster approximation.</td></tr>
           <tr><td>LLM pool scope</td><td><code>Full pool (paper)</code> compares the inverse-design query against every available candidate. <code>Broad random pool (fast)</code> first samples the Broad pool and then applies MMR/cosine similarity inside that subset.</td></tr>
           <tr><td>LLM uncertainty scalar</td><td>Rescales empirical support about its mean while retaining probability mass. <code>1</code> preserves the distribution and acquisition; <code>0</code> gives a point mass. Expanded support respects explicit physical bounds. Agreement among responses has zero completion spread and does not establish prediction accuracy. This does not scale XRD measurement noise or GP uncertainty.</td></tr>
