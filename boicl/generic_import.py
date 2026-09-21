@@ -5,6 +5,7 @@ import json
 import math
 
 import numpy as np
+from .measurement_quality import quality_metadata, QUALITY_FIELDS as DEFINITION_FIELDS
 
 
 SCHEMA = "generic-campaign-v1"
@@ -21,6 +22,7 @@ QUALITY_FIELDS = {
     "closure_gap_wt_pct",
     "phase_accounting_residual_wt_pct",
 }
+QUALITY_FIELDS.update(DEFINITION_FIELDS | {"measurement_quality"})
 
 
 def _hash(value):
@@ -186,7 +188,11 @@ def generic_measurement(values, *, bounds=None, objective="value"):
     bounds = validate_bounds(bounds)
     if bounds is not None and not bounds[0] <= value <= bounds[1]:
         raise ValueError("Measured objective is outside configured bounds")
-    result = {"value": value, "source_note": str(values.get("source_note", ""))}
+    result = {
+        "value": value,
+        "source_note": str(values.get("source_note", "")),
+        "measurement_quality": quality_metadata(values),
+    }
     for field in ("objective_sigma", "gof", "closure_gap"):
         if values.get(field) not in (None, ""):
             val = number(values[field], field)
@@ -332,6 +338,8 @@ def load_generic_package(
                 "gap",
                 "closure_gap",
                 "closure_gap_origin",
+                "measurement_quality",
+                *sorted(DEFINITION_FIELDS),
             ):
                 if row.get(field) is not None:
                     values[field] = row[field]

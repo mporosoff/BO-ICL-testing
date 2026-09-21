@@ -14,12 +14,9 @@ def expected_improvement(dist, best, xi=0.0, maximize=True):
         )
 
 
-def log_expected_improvement(dist, best):
+def log_expected_improvement(dist, best, xi=0.0, maximize=True):
     """Log Expected improvement for the given discrete distribution"""
-    if isinstance(dist, DiscreteDist):
-        return log_expected_improvement_d(dist.probs, dist.values, best)
-    elif isinstance(dist, GaussDist):
-        return log_expected_improvement_g(dist.mean(), dist.std(), best)
+    return np.log(expected_improvement(dist, best, xi, maximize) + 1e-15)
 
 
 # I think it's just taking the log of the final EI computation. Will test this later
@@ -42,20 +39,24 @@ def probability_of_improvement(dist, best, xi=0.0, maximize=True):
         )
 
 
-def upper_confidence_bound(dist, best, _lambda):
-    """Upper confidence bound for the given discrete distribution"""
+def upper_confidence_bound(dist, best, _lambda, maximize=True):
+    """Optimistic utility; larger scores are preferred in either direction."""
     if isinstance(dist, DiscreteDist):
-        return upper_confidence_bound_d(dist.probs, dist.values, best, _lambda)
+        return upper_confidence_bound_d(
+            dist.probs, dist.values, best, _lambda, maximize
+        )
     elif isinstance(dist, GaussDist):
-        return upper_confidence_bound_g(dist.mean(), dist.std(), best, _lambda)
+        return upper_confidence_bound_g(
+            dist.mean(), dist.std(), best, _lambda, maximize
+        )
 
 
-def greedy(dist, best):
+def greedy(dist, best, maximize=True):
     """Greedy selection (most likely point) for the given discrete distribution"""
     if isinstance(dist, DiscreteDist):
-        return greedy_d(dist.probs, dist.values, best)
+        return greedy_d(dist.probs, dist.values, best, maximize)
     elif isinstance(dist, GaussDist):
-        return greedy_g(dist.mean(), dist.std(), best)
+        return greedy_g(dist.mean(), dist.std(), best, maximize)
 
 
 def expected_improvement_d(probs, values, best, xi=0.0, maximize=True):
@@ -65,11 +66,9 @@ def expected_improvement_d(probs, values, best, xi=0.0, maximize=True):
     return ei
 
 
-def log_expected_improvement_d(probs, values, best):
+def log_expected_improvement_d(probs, values, best, xi=0.0, maximize=True):
     """Log Expected improvement for the given discrete distribution"""
-    # ei = np.sum(np.maximum(values - best, 0) * probs)
-    log_ei = np.log(np.sum(np.maximum(values - best, 0) * probs) + 1e-15)
-    return log_ei
+    return np.log(expected_improvement_d(probs, values, best, xi, maximize) + 1e-15)
 
 
 def probability_of_improvement_d(probs, values, best, xi=0.0, maximize=True):
@@ -79,16 +78,17 @@ def probability_of_improvement_d(probs, values, best, xi=0.0, maximize=True):
     return pi
 
 
-def upper_confidence_bound_d(probs, values, best, _lambda):
+def upper_confidence_bound_d(probs, values, best, _lambda, maximize=True):
     """Upper confidence bound for the given discrete distribution"""
+    values = np.asarray(values)
     mu = np.sum(values * probs)
     sigma = np.sqrt(np.sum((values - mu) ** 2 * probs))
-    return mu + _lambda * sigma
+    return (1 if maximize else -1) * mu + _lambda * sigma
 
 
-def greedy_d(probs, values, best):
+def greedy_d(probs, values, best, maximize=True):
     """Greedy selection (most likely point) for the given discrete distribution"""
-    return values[np.argmax(probs)]
+    return (1 if maximize else -1) * values[np.argmax(probs)]
 
 
 def expected_improvement_g(mean, std, best):
@@ -99,9 +99,12 @@ def expected_improvement_g(mean, std, best):
     return ei
 
 
-def log_expected_improvement_g(mean, std, best):
+def log_expected_improvement_g(mean, std, best, xi=0.0, maximize=True):
     """Log Expected improvement for the given Gaussian distribution"""
-    return np.log(expected_improvement_g(mean, std, best) + 1e-15)
+    direction = 1 if maximize else -1
+    return np.log(
+        expected_improvement_g(direction * mean, std, direction * best + xi) + 1e-15
+    )
 
 
 def probability_of_improvement_g(mean, std, best):
@@ -114,12 +117,11 @@ def probability_of_improvement_g(mean, std, best):
     return pi
 
 
-def upper_confidence_bound_g(mean, std, best, _lambda):
+def upper_confidence_bound_g(mean, std, best, _lambda, maximize=True):
     """Upper confidence bound for the given Gaussian distribution"""
-    eps = 1e-15
-    return mean + _lambda * (std + eps)
+    return (1 if maximize else -1) * mean + _lambda * std
 
 
-def greedy_g(mean, std, best):
+def greedy_g(mean, std, best, maximize=True):
     """Greedy selection (most likely point) for the given Gaussian distribution"""
-    return mean
+    return (1 if maximize else -1) * mean

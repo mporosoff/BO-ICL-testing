@@ -52,20 +52,65 @@ def measurement(cid, value, seed=False, sigma=None, physical=None):
     }
 
 
-def test_seed_cohort_is_initialization_zero_not_three_bo_iterations():
+def test_seed_cohort_has_successive_display_positions_without_spending_bo_steps():
     data = campaign()
+    original = deepcopy(data)
     payload = plot_payload(data)
-    assert [point["index"] for point in payload["live_observation_points"]] == [0, 0, 0]
-    assert [(point["index"], point["best"]) for point in payload["best_trace"]] == [
-        (0, 83.8)
+    assert data == original
+    assert [point["index"] for point in payload["live_observation_points"]] == [1, 2, 3]
+    assert [point["axis_label"] for point in payload["live_observation_points"]] == [
+        "i1",
+        "i2",
+        "i3",
     ]
+    assert [
+        point["optimization_step"] for point in payload["live_observation_points"]
+    ] == [0, 0, 0]
+    assert [(point["index"], point["best"]) for point in payload["best_trace"]] == [
+        (1, 72.1),
+        (2, 83.8),
+        (3, 83.8),
+    ]
+    assert all(point["baseline"] for point in payload["best_trace"])
     assert payload["best_trace"][0]["initialization_count"] == 3
+    assert payload["initialization_count"] == 3
+    assert payload["plot_x_axis"]["initialization_count"] == 3
+    assert payload["plot_x_axis"]["initialization_end"] == 3.5
+    assert payload["plot_x_axis"]["min"] == 0.5
     assert payload["plot_counts"]["new_completed"] == 0
     data["observations"].append(measurement("3", 0))
     data["observations"].append(measurement("4", 90))
     payload = plot_payload(data)
-    assert [point["index"] for point in payload["best_trace"]] == [0, 1, 2]
-    assert [point["best"] for point in payload["best_trace"]] == [83.8, 83.8, 90]
+    assert [point["index"] for point in payload["best_trace"]] == [1, 2, 3, 4, 5]
+    assert [point["best"] for point in payload["best_trace"]] == [
+        72.1,
+        83.8,
+        83.8,
+        83.8,
+        90,
+    ]
+    assert [point["axis_label"] for point in payload["best_trace"]] == [
+        "i1",
+        "i2",
+        "i3",
+        "1",
+        "2",
+    ]
+    assert [point["optimization_step"] for point in payload["best_trace"]] == [
+        0,
+        0,
+        0,
+        1,
+        2,
+    ]
+    assert [tick["label"] for tick in payload["plot_x_axis"]["labels"]] == [
+        "i1",
+        "i2",
+        "i3",
+        "1",
+        "2",
+    ]
+    assert payload["plot_counts"]["new_completed"] == 2
     assert payload["live_observation_points"][3]["value"] == 0
     assert payload["live_observation_points"][3]["uncertainty"] is None
 
@@ -99,8 +144,15 @@ def test_pending_model_prediction_is_not_measurement_or_incumbent():
     assert layer["summary"] == []
     predicted = layer["prediction_summary"][0]
     assert (
-        predicted["index"] == 1 and predicted["mean"] == 99.8 and predicted["std"] == 2
+        predicted["index"] == 4 and predicted["mean"] == 99.8 and predicted["std"] == 2
     )
+    assert predicted["axis_label"] == "1" and predicted["optimization_step"] == 1
+    assert payload["plot_x_axis"]["labels"][-1] == {
+        "index": 4,
+        "label": "1",
+        "initialization": False,
+    }
+    assert payload["plot_counts"]["new_completed"] == 0
     assert (
         predicted["lower"] == 94
         and predicted["upper"] == 100
@@ -131,12 +183,13 @@ def test_refinement_keeps_original_physical_position_and_prediction():
     points = measured_points(data)
     assert [
         (point["candidate_id"], point["index"], point["value"]) for point in points[3:]
-    ] == [("3", 1, 89), ("4", 2, 91)]
+    ] == [("3", 4, 89), ("4", 5, 91)]
     assert points[3]["prediction"]["mean"] == 88
     repeat = measurement("3", 92, physical="actual-second-synthesis")
     repeat["observation_id"] = "repeated-3"
     data["observations"].append(repeat)
-    assert measured_points(data)[-1]["index"] == 3
+    assert measured_points(data)[-1]["index"] == 6
+    assert measured_points(data)[-1]["optimization_step"] == 3
 
 
 def test_comparison_uses_only_independent_matched_histories():
@@ -145,6 +198,9 @@ def test_comparison_uses_only_independent_matched_histories():
     payload = plot_payload(main, comparisons=[gp])
     run = payload["benchmark_runs"][0]
     assert run["summary"][-1]["mean"] == 95
+    assert run["summary"][-1]["index"] == 4
+    assert run["summary"][-1]["axis_label"] == "1"
+    assert run["initialization_count"] == 3
     assert run["summary"][-1]["std"] is None
     assert payload["best_trace"][-1]["best"] == 83.8
     assert len(main["observations"]) == 3
@@ -175,6 +231,8 @@ def test_random_arm_is_separate_and_can_have_smaller_operator_budget():
     payload = plot_payload(main, random_campaign=control)
     assert payload["best_trace"][-1]["best"] == 83.8
     assert payload["live_random_walk_trace"][-1]["best"] == 87
+    assert payload["live_random_walk_trace"][-1]["index"] == 4
+    assert payload["live_random_walk_trace"][-1]["axis_label"] == "1"
     assert payload["live_random_walk"]["training_shared"] is False
     assert payload["plot_counts"]["new_completed"] == 0
     assert comparison_compatibility(main, control)["measurement_budgets"] == [10, 2]
@@ -191,7 +249,24 @@ def test_generic_minimization_and_unknown_sigma_are_preserved():
     ]
     payload = plot_payload(data)
     assert [point["best"] for point in payload["best_trace"]] == [10, -5]
+    assert [point["index"] for point in payload["best_trace"]] == [1, 2]
+    assert [point["axis_label"] for point in payload["best_trace"]] == ["i1", "1"]
     assert payload["plot_objective_bounds"] == {"lower": None, "upper": None}
+
+
+def test_empty_initialization_has_no_shaded_region_and_first_new_position_is_one():
+    data = campaign()
+    data["observations"] = []
+    empty = plot_payload(data)
+    assert empty["initialization_count"] == 0
+    assert empty["plot_x_axis"]["initialization_end"] is None
+    assert empty["plot_x_axis"]["labels"] == []
+    data["observations"].append(measurement("3", 20))
+    payload = plot_payload(data)
+    assert payload["best_trace"][0]["index"] == 1
+    assert payload["best_trace"][0]["axis_label"] == "1"
+    assert payload["best_trace"][0]["optimization_step"] == 1
+    assert payload["best_trace"][0]["baseline"] is False
 
 
 def test_ambiguous_active_refinement_is_rejected():

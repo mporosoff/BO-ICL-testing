@@ -137,6 +137,8 @@ def validate_candidates(rows, require_full_grid=True):
 
 
 def _validate_seeds(seeds, candidates):
+    from .measurement_quality import quality_metadata
+
     expected = {"M7": 72.1, "M12": 83.8, "M13": 23.4}
     if (
         len(seeds) != 3
@@ -147,6 +149,10 @@ def _validate_seeds(seeds, candidates):
     original = _rows((DATA / "seeds.csv").read_text(encoding="utf-8-sig"))
     reference = {r["run_id"]: r for r in original}
     for row in seeds:
+        if quality_metadata(row)["quantification_method"] != "historical_unspecified":
+            raise ValueError(
+                "Confirmed source seeds have unspecified quantification; record a new method through a documented refinement, not an initialization relabel"
+            )
         if (
             row["candidate_id"] not in lookup
             or row["candidate_id"] != reference[row["run_id"]]["candidate_id"]

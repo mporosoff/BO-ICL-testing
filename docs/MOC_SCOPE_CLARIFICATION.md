@@ -16,6 +16,8 @@ Keep method-specific settings contextual and feature mapping/advanced options co
 
 Loading MoC makes no provider calls and initializes 7,776 unique candidates plus three human-guided measurements: M7=72.1, M12=83.8, M13=23.4 wt%. They are initialization observations, not model-selected optimization steps. GP and LLM arms share this initial snapshot but evolve independently.
 
+The user's later graph clarification gives initialization separate consecutive positions labeled i1, i2, i3, … in supplied order. Shade this region and show a divider before subsequent BO steps 1, 2, … . Do not stack initialization at one position. This visual sequence does not change initialization's status, measurement provenance or exclusion from the new-measurement budget; refinements keep their existing experiment position. Both views reuse this same timeline.
+
 ## Completion checks
 
 - From the main interface: initialize, suggest, reserve, measure with quality, update the existing live graph, cancel, save, restart, and resume with IDs, settings, selection stage and history preserved.
@@ -39,3 +41,21 @@ than attempting to serialize a running model call.
 Audit all new-run toolkit defaults against the crystal phase-isolation
 instructions. Preserve explicitly saved settings and generic dataset units,
 directions and bounds; identify intentional compatibility exceptions.
+
+## Remaining audit corrections — 21 September 2026
+
+The user identified seven additional corrections. They extend the existing implementation:
+
+1. Apply optimization direction consistently in the older Python acquisition APIs, including UCB, greedy and log-EI, with maximization/minimization and nonzero-spread checks.
+2. Make `inv_filter=0` score the eligible pool without an inverse call; preserve candidate IDs, failures and exclusions.
+3. Expose an optional manual inverse target and a separate standalone proposal count/action in compact LLM controls in both views. Blank means automatic and zero is explicit; free-form proposals have their own records and never create candidates, reservations or measurements. Ordinary BO keeps one inverse completion.
+4. Provide a full read-only request preview through the same request builder as execution. Include role, effective model, custom system text, observed examples, procedure or target, complete rendered messages and sampling parameters. Identify unresolved selector/future-shortlist inputs honestly. Preview never purchases embeddings, calls a model, reserves an experiment or mutates history; recorded requests remain available after settings changes.
+5. Correct documentation and tooltips for all three engines, shared objective bounds, five-sample defaults, blank/unlimited versus zero/stopped shared budgets, paid automatic refresh, new preset creation versus saved loading, checkpoint copies, distinct cache identities, and the shared main/focused campaign.
+6. Support long Windows checkpoint paths with short adjacent temporary names and extended-length addressing while retaining atomic writes, rollback, checksum verification and ownership checks.
+7. Preserve versioned quantification provenance and require an explicit scientific decision before mixing measurement definitions. Distinguish GSAS-II mass fraction, integrated phase-pattern area fraction, other documented methods and historical unspecified methods; record normalization, source/refinement identifiers and uncertainty provenance.
+
+The existing MoC GP keeps the six numeric synthesis variables and exact transforms from source `810c3f7`. These corrections do not introduce a new one-hot MoC engine or replace its kernel, sampler, quality-noise model or coverage/EI schedule. Generic data retains its configurable representation and objective units.
+
+The confirmed initial values 72.1, 83.8 and 23.4 are not changed, relabeled or renormalized. Confirmation of a value does not resolve its historical quantification method. Unknown methods remain explicitly unspecified until supported documentation and an operator decision are recorded. Incompatible explicit definitions cannot be silently combined for model training or comparison; excluded records remain in history. No re-refinement, mass/area-fraction equivalence, or publication validation is implied.
+
+Validation uses offline fixtures and mocks. Live paid provider access and laboratory/scientific validation remain unverified. Both views must expose these controls through the same campaign service, persistence and graph pipeline; a parallel replacement app is outside this correction scope.

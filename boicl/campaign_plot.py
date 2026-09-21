@@ -6,6 +6,7 @@ oracle columns) never supply plot statistics, measurements or random baselines.
 """
 from copy import deepcopy
 import math
+from .measurement_quality import comparison_definition, quality_metadata
 
 
 COLORS = ("#7c3aed", "#dc2626", "#0891b2", "#db2777", "#65a30d")
@@ -67,10 +68,11 @@ def _prediction(raw):
 
 
 def measured_points(campaign):
-    """One point per active physical measurement; seeds all occupy iteration 0.
+    """One display position per active physical measurement, including seeds.
 
     Refinement replacements retain the original physical measurement position.
     Individual physical repeats retain separate positions and uncertainties.
+    Initialization positions are supplied order, not optimization iterations.
     """
     config = campaign["config"]
     ledger = campaign.get("observations", [])
@@ -106,10 +108,12 @@ def measured_points(campaign):
         active.items(),
         key=lambda pair: (not bool(pair[1].get("is_seed")), order[pair[0]]),
     )
-    points, completed = [], 0
+    points, initialized, completed = [], 0, 0
     for physical, row in ordered:
         seed = bool(row.get("is_seed", False))
-        if not seed:
+        if seed:
+            initialized += 1
+        else:
             completed += 1
         sigma = _number(
             row.get(
@@ -125,7 +129,10 @@ def measured_points(campaign):
         candidate_id = str(row["candidate_id"])
         points.append(
             {
-                "index": 0 if seed else completed,
+                "index": len(points) + 1,
+                "axis_label": f"i{initialized}" if seed else str(completed),
+                "initialization_index": initialized if seed else None,
+                "optimization_step": 0 if seed else completed,
                 "candidate_id": candidate_id,
                 "observation_id": row.get("observation_id"),
                 "physical_measurement_id": physical,
@@ -141,6 +148,7 @@ def measured_points(campaign):
                 "initialization": seed,
                 "measured": True,
                 "refinement_version": row.get("refinement_version"),
+                "measurement_quality": quality_metadata(row),
                 "measured_at": row.get("measured_at"),
                 "recorded_at": row.get("recorded_at"),
                 "chronology_basis": "initialization cohort"
@@ -156,15 +164,17 @@ def best_trace(points, direction="maximize"):
     if direction not in ("maximize", "minimize"):
         raise ValueError("Objective direction must be maximize or minimize")
     seeds = [point for point in points if point.get("is_seed")]
-    subsequent = [point for point in points if not point.get("is_seed")]
     select = min if direction == "minimize" else max
-    incumbent = select(seeds, key=lambda row: row["value"]) if seeds else None
+    incumbent = None
     trace = []
 
     def append(point, initialization=False):
         trace.append(
             {
                 "index": point["index"],
+                "axis_label": point.get("axis_label", str(point["index"])),
+                "initialization_index": point.get("initialization_index"),
+                "optimization_step": point.get("optimization_step"),
                 "value": point["value"],
                 "best": incumbent["value"],
                 "best_uncertainty": incumbent.get("uncertainty"),
@@ -176,19 +186,17 @@ def best_trace(points, direction="maximize"):
             }
         )
 
-    if incumbent is not None:
-        append(incumbent, True)
-    for point in subsequent:
+    for point in points:
         incumbent = (
             point
             if incumbent is None
             else select((incumbent, point), key=lambda row: row["value"])
         )
-        append(point)
+        append(point, bool(point.get("is_seed")))
     return trace
 
 
-def pending_predictions(campaign, completed_count):
+def pending_predictions(campaign, completed_count, initialization_count=0):
     result = []
     for suggestion in campaign.get("suggestions", []):
         if suggestion.get("status") not in {"suggested", "pending"}:
@@ -197,9 +205,14 @@ def pending_predictions(campaign, completed_count):
         if not prediction:
             continue
         spread = prediction["std"]
+        step = completed_count + len(result) + 1
         result.append(
             {
-                "index": completed_count + len(result) + 1,
+                "index": initialization_count + step,
+                "axis_label": str(step),
+                "initialization_index": None,
+                "optimization_step": step,
+                "initialization": False,
                 **prediction,
                 "lower": prediction.get("lower95", prediction["mean"] - (spread or 0)),
                 "upper": prediction.get("upper95", prediction["mean"] + (spread or 0)),
@@ -215,6 +228,11 @@ def pending_predictions(campaign, completed_count):
 
 def comparison_compatibility(reference, other):
     mismatches = []
+    try:
+        if comparison_definition(reference) != comparison_definition(other):
+            mismatches.append("measurement_definition")
+    except ValueError:
+        mismatches.append("measurement_definition")
     for key in ("pool_fingerprint", "initialization_fingerprint"):
         if not reference.get(key) or reference.get(key) != other.get(key):
             mismatches.append(key)
@@ -248,9 +266,13 @@ def comparison_run(reference, other, color=COLORS[0]):
     points = measured_points(other)
     trace = best_trace(points, other["config"].get("direction", "maximize"))
     completed = sum(not point["is_seed"] for point in points)
+    initialization_count = len(points) - completed
     summary = [
         {
             "index": row["index"],
+            "axis_label": row["axis_label"],
+            "initialization_index": row["initialization_index"],
+            "optimization_step": row["optimization_step"],
             "mean": row["best"],
             "lower": row["best"],
             "upper": row["best"],
@@ -270,8 +292,11 @@ def comparison_run(reference, other, color=COLORS[0]):
         "status": "live independent campaign",
         "partial": True,
         "kind": "independent_campaign_comparison",
+        "initialization_count": initialization_count,
         "summary": summary,
-        "prediction_summary": pending_predictions(other, completed),
+        "prediction_summary": pending_predictions(
+            other, completed, initialization_count
+        ),
         "replicate_observations": [points],
         "config": {
             "optimizer": other["config"].get("engine"),
@@ -286,6 +311,7 @@ def plot_payload(campaign, comparisons=(), random_campaign=None):
     """Return existing renderPlot keys; no new plotting implementation required."""
     points = measured_points(campaign)
     completed = sum(not point["is_seed"] for point in points)
+    initialization_count = len(points) - completed
     config = campaign["config"]
     runs, diagnostics = [], []
     for other in comparisons:
@@ -298,7 +324,7 @@ def plot_payload(campaign, comparisons=(), random_campaign=None):
             diagnostics.append(
                 {"campaign_id": other.get("campaign_id"), **compatibility}
             )
-    pending = pending_predictions(campaign, completed)
+    pending = pending_predictions(campaign, completed, initialization_count)
     if pending:
         runs.append(
             {
@@ -308,6 +334,7 @@ def plot_payload(campaign, comparisons=(), random_campaign=None):
                 "status": "prediction only",
                 "partial": True,
                 "kind": "pending_predictions",
+                "initialization_count": initialization_count,
                 "summary": [],
                 "prediction_summary": pending,
                 "replicate_observations": [],
@@ -326,11 +353,18 @@ def plot_payload(campaign, comparisons=(), random_campaign=None):
         random_state = {
             "campaign_id": random_campaign["campaign_id"],
             "observations": random_points,
+            "initialization_count": sum(point["is_seed"] for point in random_points),
             "status": "independent measured random control",
             "training_shared": False,
         }
     bounds = config.get("bounds") or [None, None]
+    axis_points = points + random_points
+    for run in runs:
+        axis_points.extend(run.get("summary", []))
+        axis_points.extend(run.get("prediction_summary", []))
+    last_position = max((point["index"] for point in axis_points), default=0)
     return {
+        "initialization_count": initialization_count,
         "live_observation_points": points,
         "best_trace": best_trace(points, config.get("direction", "maximize")),
         "benchmark_runs": runs,
@@ -340,11 +374,25 @@ def plot_payload(campaign, comparisons=(), random_campaign=None):
         "dataset_stats": [],
         "plot_objective_bounds": {"lower": bounds[0], "upper": bounds[1]},
         "plot_x_axis": {
-            "min": 0,
-            "label": "New completed measurements (initialization at 0)",
+            "min": 0.5,
+            "label": "Initialization and new completed measurements",
+            "initialization_count": initialization_count,
+            "initialization_end": initialization_count + 0.5
+            if initialization_count
+            else None,
+            "labels": [
+                {
+                    "index": index,
+                    "label": f"i{index}"
+                    if index <= initialization_count
+                    else str(index - initialization_count),
+                    "initialization": index <= initialization_count,
+                }
+                for index in range(1, last_position + 1)
+            ],
         },
         "plot_counts": {
-            "initialization": sum(point["is_seed"] for point in points),
+            "initialization": initialization_count,
             "new_completed": completed,
             "pending_predictions": len(pending),
         },

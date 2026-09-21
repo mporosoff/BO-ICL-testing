@@ -77,6 +77,10 @@ The shared dispatcher uses campaign `seed + suggestion_sequence` for LLM and str
 
 ## Concurrency, resume and verification
 
+Manual inverse targets default to `None` (automatic); zero is an explicit validated raw-unit target. The separately persisted `llm.inverse_proposal_count` defaults to one and applies only to standalone proposal records. Ordinary BO retains one inverse completion.
+
+Measurement quantification defaults to historical unspecified when source metadata is absent. This does not infer GSAS-II mass fractions from a confirmed number. Versioned method, normalization and source/uncertainty provenance accompany new records; a documented measurement-definition decision controls historical retention or exclusion and comparison compatibility. Initial values are preserved.
+
 Each shared campaign has its own settings, observations, reservations and job. There is no two-campaign limit. Automatic durable checkpoints record accepted saved-state boundaries; named checkpoints use the same complete format. Restoring a checkpoint creates an independent campaign ID and preserves the source history. It does not resume a provider call or sampler midway through an instruction, and cannot reconstruct unsaved historical states from before checkpoint support.
 
 Use one local application process for a state/cache directory. Multiple campaign threads in that process share a normalized absolute-directory reentrant lock. Cache preparation refreshes disk coverage under that lock before generating misses; three simultaneous LLM cache users are tested to generate each missing vector once. Raw and declared normalized caches retain their representation identity. Projection initialization is likewise serialized around the legacy numerical RNG and restores its previous state. Cross-process/distributed locking is not implemented.

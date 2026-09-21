@@ -1,6 +1,6 @@
 # BO-ICL Local Active-Learning Toolkit
 
-The main local interface supports the complete **MoC continuation** workflow: a new six-variable
+The main local interface supports the complete **MoC continuation** workflow: the source six-variable
 synthesis-parameter GP, a matched GPT-4o BO-ICL campaign, and a separate embedding-GP
 baseline. The included 7,776-design dataset starts from M7=72.1, M12=83.8, and
 M13=23.4 wt%. The structured GP runs entirely offline without credentials.
@@ -57,6 +57,38 @@ Manual launch:
 Open the browser app, paste API keys in the **API Keys** panel, and click
 **Save Locally**. Do not paste real API keys into tracked files.
 
+## Shared campaigns in the main and focused views
+
+The main toolkit is the landing page. **Load preset** creates a new shared campaign;
+**Load Selected** resumes a saved one. The optional **Focused campaign view** opens
+the same MoC campaign ID and graph. Generic shared campaigns use the main view.
+**Resume selected as independent copy** restores a checkpoint as a new arm.
+
+The shared graph gives initialization separate consecutive positions i1, i2,
+i3, … in a shaded region, then a divider before BO steps 1, 2, … . Those initial
+measurements remain supplied initialization, not BO-selected experiments.
+
+A shared **New-measurement budget** is blank for unlimited; zero prevents new
+suggestions. Initial seeds do not consume it. After deliberate start, automatic
+refresh after a measurement may launch paid LLM or embedding work.
+
+New LLM defaults request five predictions per shortlisted candidate. **Advanced
+BO-ICL sampling → Inverse target and standalone proposal count** exposes a manual
+target: blank means automatic, while zero is explicit. Standalone inverse proposals
+are saved text records, never finite-pool candidates or measurements. **Preview full
+LLM request (no model calls)** displays a selected-candidate or recorded-step request
+and marks missing selector inputs or a future shortlist as unresolved.
+
+**Measurement quality and source** records quantification method, normalization,
+source/refinement identifiers and uncertainty provenance. Confirmed MoC seed values
+72.1, 83.8 and 23.4 do not establish their measurement method. Unknown historical
+methods stay unspecified; an explicit definition decision governs whether they can
+train alongside a newly documented method. No numerical relabeling or normalization
+is automatic. See [the operator guide](docs/MOC_OPERATOR_GUIDE.md).
+
+The older dataset/offline runner remains available with its saved settings and
+benchmark semantics. The sections below identify controls specific to that runner.
+
 ## API Keys
 
 Keys are stored in `.env`, which is ignored by Git.
@@ -105,11 +137,10 @@ Typical settings:
 - **Target scaling**: start with `Off` for LLM BO-ICL on bounded percentages.
   The LLM path keeps labels, inverse-design targets, floors, and predictions in
   original objective units; auto/min-max/z-score scaling is used only for GPR.
-- **Objective bounds**: optional display/math limits. For phase percentages,
-  use lower `0` and upper `100`; these bounds are used for plot guide lines and
-  to clip displayed prediction/error-bar endpoints, but they are not sent to
-  LLM prompts and they do not change labels, inverse-design targets, raw
-  predictions, CSV exports, or acquisition ranking.
+- **Objective bounds**: physical limits in original units. Shared campaigns enforce
+  them in the model and acquisition path, including valid LLM samples and inverse
+  targets. The structured GP uses its bounded posterior. Display intervals also
+  respect bounds; original measured values and raw provider responses are retained.
 - **Initial random points**: real starting experiments, usually `1` or `2`,
   capped at `3`.
 - **BO iterations**: number of sequential model-selected experiments.
@@ -270,13 +301,12 @@ the row. If you change model or acquisition settings and save them, old
 suggestions are cleared so they are not mistaken for suggestions from the new
 configuration.
 
-**Objective lower/upper bound** fields are optional physical or measurement
-bounds for display and interval math only. They keep plotted intervals sensible,
-for example clipping the displayed endpoints of a `95 +/- 30` prediction error
-bar to the valid `0-100` percentage range. They are not included in LLM prompts
-and do not clamp stored prediction values, measured observations, CSV exports,
-or acquisition ranking. Percent-like objective names such as `alpha_pct` or
-`alpha phase (%)` infer `0-100` display bounds when the fields are blank.
+**Objective lower/upper bound** fields describe physical limits in original units.
+Shared bounds affect model/acquisition behavior, valid prediction samples and
+inverse targets; they are not merely plot limits. Out-of-bounds manual targets
+are errors. Raw responses and original measurement provenance are retained.
+Generic shared objectives may remain unbounded; a percentage-like name alone
+does not assign MoC bounds or chemistry.
 
 For sparse phase data with many zeros, set an **Auto target floor** such as
 `5` or `10` so the inverse-design query does not stay pinned at zero.
@@ -288,14 +318,17 @@ contain an explicit prediction/estimate/value phrase. Bare ranges such as
 
 ## GPR Notes
 
-GPR mode uses embeddings plus a Gaussian process model. It is useful for
-comparison experiments, but sparse all-zero labels can be hard for GPR early in
-a campaign. BoTorch may warn that outcomes are not standardized or that inputs
+There are two distinct GP engines. **GP: synthesis parameters** uses mapped
+features and needs no embeddings or provider key; the MoC preset retains the
+original six synthesis variables and transforms. **GP: text embeddings** uses
+bare procedures, ada-002 and a fixed Isomap projection. Sparse constant outcomes
+can limit what either model learns early in a campaign. BoTorch may warn that outcomes are not standardized or that inputs
 are not unit-cube scaled. These warnings are not OpenAI API errors; they mean
 the GP has little variation to learn from.
 
-LLM BO-ICL can score after one labeled seed example. GPR still needs at least
-two unique labeled procedures before it can fit a meaningful model.
+LLM campaigns with fewer than two distinct measured designs use an explicit
+initial-design stage without a chat call. Structured MoC GP uses maximin coverage
+until ten distinct designs; generic structured GP defaults to two.
 
 ## Files And Local State
 

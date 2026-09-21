@@ -80,6 +80,280 @@ def wait_job(handler, cid):
     return job
 
 
+def small_shared_llm(request):
+    status, created, _ = request(
+        "/api/toolkit/create-generic",
+        {
+            "records": [
+                {
+                    "candidate_id": f"c{i}",
+                    "procedure": f"Prepare design {i}",
+                    "x": i,
+                    "yield": i + 1 if i < 2 else None,
+                }
+                for i in range(5)
+            ],
+            "feature_spec": [{"column": "x", "transform": "linear", "bounds": [0, 4]}],
+            "objective": "yield",
+            "units": "units",
+            "direction": "maximize",
+            "bounds": [0, 20],
+            "procedure_column": "procedure",
+        },
+    )
+    assert status == 200
+    cid = created["campaign_id"]
+    assert (
+        request(
+            "config", {"id": cid, "changes": {"engine": "llm", "auto_suggest": False}}
+        )[0]
+        == 200
+    )
+    return cid
+
+
+def test_http_manual_target_full_preview_and_separate_inverse_records(http_server):
+    request, handler = http_server()
+    cid = small_shared_llm(request)
+    status, projected, _ = request(
+        "/api/toolkit/action",
+        {
+            "campaign": cid,
+            "action": "config",
+            "values": {
+                "optimizer": "llm",
+                "inverse_target_value": "0",
+                "inverse_design_count": 3,
+                "prediction_system_message": "Exact custom forward system.",
+                "inverse_system_message": "Exact custom inverse system.",
+            },
+        },
+    )
+    assert status == 200
+    assert projected["shared_config"]["llm"]["manual_inverse_target"] == 0
+    assert projected["config"]["inverse_target_value"] == 0
+    assert "shared_prompt_preview" not in projected
+    before = handler.moc_service.export(cid)
+    inverse = request("request-preview", {"id": cid, "role": "inverse"})[1]
+    forward = request(
+        "request-preview", {"id": cid, "role": "forward", "candidate_id": "c2"}
+    )[1]
+    assert inverse["status"] == forward["status"] == "exact"
+    assert inverse["request"]["n"] == 3 and forward["request"]["n"] == 5
+    assert (
+        inverse["request"]["messages"][0]["content"] == "Exact custom inverse system."
+    )
+    assert (
+        forward["request"]["messages"][0]["content"] == "Exact custom forward system."
+    )
+    assert "Prepare design 2" in forward["request"]["messages"][-1]["content"]
+    assert handler.moc_service.export(cid) == before
+    assert not handler.moc_service.jobs
+    status, started, _ = request("inverse-proposal", {"id": cid})
+    assert status == 200
+    assert wait_job(handler, cid)["status"] == "proposed"
+    after = handler.moc_service.export(cid)
+    for key in ("candidates", "observations", "suggestions", "rng_state"):
+        assert after[key] == before[key]
+    proposal = after["inverse_proposals"][-1]
+    assert proposal["returned_count"] == 3
+    assert proposal["target"]["resolved_target"] == 0
+    recorded = request(
+        "request-preview",
+        {"id": cid, "role": "inverse", "suggestion_id": proposal["proposal_id"]},
+    )[1]
+    assert recorded["status"] == "exact" and recorded["source"] == "recorded"
+    assert recorded["request"] == inverse["request"]
+    checkpoint = request(
+        "checkpoint", {"id": cid, "name": "Manual zero and proposals"}
+    )[1]
+    copy_id = request(
+        "restore-checkpoint", {"id": cid, "checkpoint_id": checkpoint["checkpoint_id"]}
+    )[1]["campaign_id"]
+    restored = request("state?id=" + copy_id, method="GET")[1]
+    assert restored["config"]["llm"]["manual_inverse_target"] == 0
+    assert restored["counts"]["inverse_proposals"] == 1
+    assert (
+        request(
+            "/api/toolkit/action",
+            {
+                "campaign": cid,
+                "action": "config",
+                "values": {"inverse_target_value": ""},
+            },
+        )[0]
+        == 200
+    )
+    assert (
+        handler.moc_service.get(cid)["config"]["llm"]["manual_inverse_target"] is None
+    )
+    assert (
+        request(
+            "/api/toolkit/action",
+            {
+                "campaign": cid,
+                "action": "config",
+                "values": {"inverse_target_value": 21},
+            },
+        )[0]
+        == 400
+    )
+
+
+def test_http_quantification_decision_and_refinement_preserve_source_values(
+    http_server,
+):
+    request, handler = http_server()
+    cid = small_shared_llm(request)
+    before = deepcopy(handler.moc_service.get(cid)["observations"])
+    status, result, _ = request(
+        "measurement-definition",
+        {
+            "id": cid,
+            "definition": {
+                "quantification_method": "gsas_ii_mass_fraction",
+                "normalization": "all refined phases",
+            },
+            "historical_policy": "retain_with_justification",
+            "reason": "Offline fixture: operator documents a reviewed comparability decision.",
+        },
+    )
+    assert status == 200, result
+    assert [r["value"] for r in handler.moc_service.get(cid)["observations"]] == [
+        r["value"] for r in before
+    ]
+    assert all(
+        r["measurement_quality"]["quantification_method"] == "historical_unspecified"
+        for r in handler.moc_service.get(cid)["observations"]
+    )
+    request("suggest", {"id": cid})
+    assert wait_job(handler, cid)["status"] == "suggested"
+    suggestion = request("state?id=" + cid, method="GET")[1]["suggestions"][-1]
+    request("reserve", {"id": cid, "suggestion_id": suggestion["suggestion_id"]})
+    values = dict(
+        value=3,
+        quantification_method="gsas_ii_mass_fraction",
+        normalization="all refined phases",
+        source_file="fixture.gpx",
+        source_identifier="sample-c",
+        refinement_id="refinement-v1",
+        uncertainty_method="reported covariance",
+        definition_note="Offline provenance fixture",
+    )
+    status, measured, _ = request(
+        "measure",
+        {"id": cid, "suggestion_id": suggestion["suggestion_id"], "values": values},
+    )
+    assert status == 200, measured
+    observation = measured["observations"][-1]
+    assert observation["measurement_quality"]["schema_version"] == 1
+    assert observation["measurement_quality"]["source_file"] == "fixture.gpx"
+    bad = {**values, "quantification_method": "xrd_area_fraction"}
+    assert (
+        request(
+            "refine",
+            {
+                "id": cid,
+                "observation_id": observation["observation_id"],
+                "values": bad,
+                "reason": "Incompatible method must reject",
+            },
+        )[0]
+        == 400
+    )
+    status, changed, _ = request(
+        "measurement-definition",
+        {
+            "id": cid,
+            "definition": {
+                "quantification_method": "xrd_area_fraction",
+                "normalization": "all refined phases",
+            },
+            "historical_policy": "exclude",
+            "reason": "Offline fixture: exclude incompatible and unknown data explicitly.",
+        },
+    )
+    assert status == 200, changed
+    status, main_state, _ = request("/api/toolkit/state?campaign=" + cid, method="GET")
+    assert status == 200 and len(main_state["observations"]) == 3
+    assert all(r["training_included"] is False for r in main_state["observations"])
+    assert [r["value"] for r in main_state["observations"]] == [1, 2, 3]
+
+
+def test_live_request_preview_reports_missing_selector_without_any_provider_or_write(
+    http_server,
+):
+    request, handler = http_server(demo=False)
+    cid = small_shared_llm(request)
+    before = handler.moc_service.export(cid)
+    root = handler.moc_service.root
+    saved = {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+    status, preview, _ = request(
+        "request-preview", {"id": cid, "role": "forward", "candidate_id": "c2"}
+    )
+    assert status == 200 and preview["status"] == "unresolved"
+    assert (
+        preview["request"] is None
+        and preview["request_parameters"]["model"] == "gpt-4o"
+    )
+    assert preview["reason"] and "Prepare design 2" in preview["query_message"]
+    assert handler.moc_service.export(cid) == before and not handler.moc_service.jobs
+    assert {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    } == saved
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node unavailable")
+def test_request_preview_controls_never_attach_unrelated_candidate_to_recorded_step(
+    tmp_path,
+):
+    from boicl.moc_ui import MOC_HTML
+    import re
+
+    focused_handler = re.search(
+        r"\$\('requestPreview'\)\.onclick=.*?;\n", MOC_HTML
+    ).group()
+    focus_path = tmp_path / "focus-preview.js"
+    focus_path.write_text(focused_handler, encoding="utf-8")
+    main_path = Path(__file__).resolve().parents[1] / "boicl/toolkit_main.js"
+    script = r"""
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+const elements=new Map(),el=id=>{if(!elements.has(id))elements.set(id,{value:'',addEventListener(){}});return elements.get(id);};
+let ready,captured;
+const context={URLSearchParams,TextDecoder,location:{search:'?campaign=arm',pathname:'/'},
+ document:{addEventListener(n,fn){ready=fn;},createElement(){return {};},head:{append(){}}},
+ $:el,state:{},window:{},renderError(m){throw Error(m);}};
+vm.createContext(context);vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),context);ready();
+context.toolkitFetch=async(path,payload)=>{captured=payload;return {status:'exact',source:'recorded'};};
+el('requestPreviewSource').value='recorded';el('requestPreviewRole').value='forward';
+el('requestPreviewCandidate').value='unrelated-current-candidate';el('sharedReplayStep').value='selected-step';
+(async()=>{
+ await el('requestPreview').onclick();
+ assert.equal(captured.candidate_id,null);assert.equal(captured.suggestion_id,'selected-step');
+ el('requestPreviewSource').value='current';await el('requestPreview').onclick();
+ assert.equal(captured.candidate_id,'unrelated-current-candidate');assert.equal(captured.suggestion_id,null);
+ const focus={$:el,current:'arm',guarded:fn=>fn(),api:async(path,payload)=>{captured=payload;return {status:'exact'};}};
+ vm.createContext(focus);vm.runInContext(fs.readFileSync(process.argv[2],'utf8'),focus);
+ el('requestPreviewSource').value='recorded';el('replayStep').value='focused-step';
+ await el('requestPreview').onclick();
+ assert.equal(captured.candidate_id,null);assert.equal(captured.suggestion_id,'focused-step');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+"""
+    result = subprocess.run(
+        [shutil.which("node"), "-e", script, str(main_path), str(focus_path)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("preset", ["moc_gp", "moc_llm", "moc_embedding_gp"])
 def test_http_demo_all_engines_measure_reserve_replay_and_resume(http_server, preset):
     request, handler = http_server()
@@ -507,7 +781,7 @@ const fs=require('fs'),vm=require('vm'),assert=require('assert');
 const elements=new Map();
 const element=id=>{if(!elements.has(id))elements.set(id,{value:'A draft',textContent:'A preview',innerHTML:'A pending',checked:true,dataset:{campaign:'A'},classList:{add(){},remove(){}}});return elements.get(id);};
 const context={$:element,localStorage:{setItem(){}},history:{replaceState(){}},
- api:async()=>({campaign_id:'B'}),render(){}};
+ api:async()=>({campaign_id:'B'}),render(){},fillQualityValues(){}};
 vm.createContext(context);
 vm.runInContext("let current='B', state=null, settings={engine:'llm'}, settingsCampaign='A';"+fs.readFileSync(process.argv[1],'utf8'),context);
 (async()=>{

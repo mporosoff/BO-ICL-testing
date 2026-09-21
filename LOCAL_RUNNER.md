@@ -3,7 +3,9 @@
 Use `run_boicl_local.bat` on Windows to start a local browser app for BO-ICL
 experiments.
 
-The landing page is the MoC continuation workspace. Load the matched LLM or
+The landing page is the main toolkit. **Load preset** creates a new shared
+campaign; **Load Selected** resumes an existing one. The **Focused campaign view**
+opens the same MoC campaign ID, records and graph. Load the matched LLM or
 structured-GP preset, or create their paired campaigns. Both start with M7=72.1,
 M12=83.8, and M13=23.4 wt%, use 7,776 canonical designs, and initially have
 7,773 eligible designs. The five archived BO measurements remain documented;
@@ -21,17 +23,27 @@ Start a suggestion explicitly, reserve its recipe, then record an actual measure
 result with XRD esd, GOF and a stated closure-gap origin. A zero is a measurement;
 an empty field is unknown. Export a campaign bundle to preserve observations,
 refinement provenance, pending reservations, exact requests and replay data.
-The new-measurement budget excludes the three seeds. Settings changes supersede
+The shared new-measurement budget excludes the three seeds: blank is unlimited,
+zero prevents new suggestions. Enabling automatic refresh can trigger paid LLM or
+embedding work after saving a measurement in an intentionally started campaign. Settings changes supersede
 unreserved suggestions. The MoC workspace stores its state under `.moc-campaigns/`.
+
+The shared graph displays supplied initialization in separate consecutive
+positions i1, i2, i3, …, shaded and separated by a divider from BO steps 1, 2, … .
+These initialization measurements are not BO-selected and remain outside the
+new-measurement budget. Refinements retain their existing plot position.
 
 For a no-network walkthrough, run `python -m boicl.local_app --demo` or
 `python -m boicl.moc_cli demo`. Demo state and outcomes are explicitly synthetic
 and are kept separate from live campaigns. See [README.md](README.md) for the
 complete MoC workflow and implementation notes.
 
-The instructions below describe the separate **Generic dataset runner**,
-available from the link at the top of the MoC page. Its saved settings and
-existing campaigns retain their generic-dataset interpretation.
+Generic shared campaigns use the main toolkit with explicit feature/objective
+mapping. The older dataset and offline benchmark runner remains available through
+**Start Fresh**, with its saved settings and historical benchmark semantics.
+The legacy-specific instructions below do not override shared-campaign controls.
+See [the shared operator guide](docs/MOC_OPERATOR_GUIDE.md) for the complete current
+workflow, checkpoint copies, request previews and measurement-definition decisions.
 
 The launcher:
 
@@ -129,7 +141,10 @@ archives, and CSV exports.
 The current BO-ICL `AskTellGPR` implementation does not yet use per-observation
 uncertainty as fixed noise during GP fitting.
 
-The generic browser has two suggestion engines:
+The legacy dataset runner retains two suggestion engines. Shared campaigns also
+provide **GP: synthesis parameters**, which uses explicitly mapped features and no
+embedding calls. Its MoC preset preserves the six original synthesis variables.
+The legacy choices are:
 
 - `GPR with embeddings` uses the selected embedding model plus Gaussian process
   regression.
@@ -209,16 +224,18 @@ The corrected MoC preset uses GPT-4o. This sampling adapter rejects reasoning
 models requiring different temperature or multiple-completion behavior.
 
 The `Inverse Design` panel can generate free-form proposals from the labeled
-examples and the active objective target. Use those proposals directly as manual
+examples and the active objective target. The legacy runner can use those proposals as manual
 procedures, or use `LLM shortlist` to turn inverse-design output into ranked
 candidates from the uploaded pool before LLM completions are requested. With the default
 `Broad pool = 250`, `LLM shortlist = 16`, `Random add-ons = 0`, and `LLM samples
-= 3`, each BO-ICL step scores at most 16 candidates with 48 sampled
+= 5`, each BO-ICL step scores at most 16 candidates with 80 sampled
 completions, not 250 candidates. `LLM pool scope = Full pool (paper)` compares
 the inverse-design query against every available candidate, keeps the nearest
 100, then applies MMR. `Broad random pool (fast)` first samples `Broad pool`
 candidates and applies the same nearest-neighbor/MMR shortlist inside that subset.
-The generic defaults above are separate from the versioned MoC preset.
+Fresh numerical LLM defaults follow the crystal method; explicitly saved legacy
+values remain unchanged. Generic objective units, direction, features and chemistry
+remain specific to their dataset.
 
 LLM benchmark runtime scales with `(LLM shortlist + Random add-ons) x LLM
 samples x BO iterations x Workflow replicates` when the shortlist is enabled.
@@ -229,8 +246,10 @@ shortlist/samples if 429s keep appearing. `API pause` spaces out successful
 calls; `429 cooldown` controls the longer wait after a rate-limit error.
 
 `Batch size` controls how many candidates are suggested per update in live mode.
-`Iteration cap` stops live suggestions after that many active-objective
-observations; `0` means no cap. `Replicates` controls how many live repeats of
+The legacy `Iteration cap` stops suggestions after that many active-objective
+observations; its saved `0` means no cap. In a shared campaign, the separate
+`New-measurement budget` excludes initialization: blank means unlimited and zero
+prevents new suggestions. `Replicates` controls how many live repeats of
 the same candidate are allowed before it is removed from the available pool.
 Replicate observations are averaged by procedure before model training.
 
@@ -285,7 +304,7 @@ acquisition function, model settings, objective, and scaling, then choose:
   exploitation.
 
 The paper-style numerical defaults are `Initial random = 1`, `Batch size = 1`,
-`BO iterations = 30`, `Workflow replicates = 5`, and `UCB lambda = 0.1`. Model
+`BO iterations = 30`, `Workflow replicates = 5`, and `UCB lambda = 0.5`. Model
 names default to currently supported models rather than retired paper-era model
 IDs.
 

@@ -4,13 +4,23 @@ from datetime import datetime, timezone
 import gzip
 import hashlib
 import json
-import os
 from pathlib import Path
 import math
 import re
 import subprocess
 import threading
 import uuid
+from .persistence import atomic_bytes, io_path
+from .measurement_quality import (
+    quality_metadata,
+    quality_status,
+    definition_signature,
+    validate_training_definitions,
+    default_definition,
+    resolve_definition,
+    comparison_definition,
+    QUALITY_FIELDS as DEFINITION_FIELDS,
+)
 
 from .campaign_config import resolve_config, ENGINE_LABELS
 from .moc_import import (
@@ -105,33 +115,37 @@ def atomic_json(path, value):
     )
 
 
-def atomic_bytes(path, value):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + "." + uid() + ".tmp")
-    try:
-        with temp.open("wb") as stream:
-            stream.write(value)
-            stream.flush()
-            os.fsync(stream.fileno())
-        temp.replace(path)
-    finally:
-        if temp.exists():
-            temp.unlink()
-
-
 class CampaignService:
-    def __init__(self, root, runner=None):
-        self.root = Path(root)
+    def __init__(self, root, runner=None, inverse_runner=None):
+        self.root = io_path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.campaigns = {}
         self.jobs = {}
         self.runner = runner
+        self.inverse_runner = inverse_runner
         for path in self.root.glob("campaign-*.json"):
             data = json.loads(path.read_text(encoding="utf-8"))
             self._validate_bundle(data)
             self.campaigns[data["campaign_id"]] = data
+            if self._interrupt_inverse_proposals(data):
+                self._save(
+                    data,
+                    reason="Interrupted inverse proposals restored without workers",
+                )
+
+    @staticmethod
+    def _interrupt_inverse_proposals(data):
+        changed = False
+        for row in data.get("inverse_proposals", []):
+            if row["status"] == "running":
+                row.update(
+                    status="interrupted",
+                    completed_at=now(),
+                    reason="Application stopped before proposal completion; request again explicitly",
+                )
+                changed = True
+        return changed
 
     def _save(self, data, reason="Campaign saved"):
         if not isinstance(data.get("campaign_id"), str) or not re.fullmatch(
@@ -270,6 +284,7 @@ class CampaignService:
                 restored_at=now(),
             )
             self._validate_bundle(data)
+            self._interrupt_inverse_proposals(data)
             self._save(data, reason="Checkpoint resumed as independent campaign")
             return data["campaign_id"]
 
@@ -301,6 +316,9 @@ class CampaignService:
                 deepcopy({k: v for k, v in row.items() if k != "engine_result"})
                 for row in data["suggestions"]
             ]
+            for row in result["observations"] + result["archive"]:
+                row["measurement_quality"] = quality_metadata(row)
+            result["quality_status"] = quality_status(data)
             referenced = {r["candidate_id"] for r in data["observations"]}
             referenced.update(
                 r["candidate_id"] for r in data["suggestions"] if r.get("candidate_id")
@@ -341,13 +359,20 @@ class CampaignService:
         return len(
             {
                 r["physical_measurement_id"]
-                for r in cls.active(data)
+                for r in data["observations"]
+                if r.get("record_status") == "measured"
                 if not r.get("is_seed")
             }
         )
 
     def create(
-        self, preset="moc_llm", package=None, overrides=None, synthetic_demo=False
+        self,
+        preset="moc_llm",
+        package=None,
+        overrides=None,
+        synthetic_demo=False,
+        *,
+        _inherited_measurement_definition=None,
     ):
         config = resolve_config(preset, overrides)
         if config["data_schema"] == "generic" and package is None:
@@ -365,6 +390,7 @@ class CampaignService:
             config=config,
             history_revision=0,
             suggestions=[],
+            inverse_proposals=[],
             excluded_ids=[],
             started=False,
             synthetic_demo=bool(synthetic_demo),
@@ -373,9 +399,29 @@ class CampaignService:
             **package,
         )
         data["initialization_fingerprint"] = fingerprint(data["observations"])
+        data["provenance"].setdefault("measurement_quality_default", quality_metadata())
         data["initial_observations"] = deepcopy(data["observations"])
         data["toolkit_code_revision"] = toolkit_revision()
         self._validate_bundle(data)
+        if _inherited_measurement_definition is not None:
+            definition = resolve_definition(_inherited_measurement_definition)
+            if definition["historical_policy"] == "unresolved":
+                data["config"]["measurement_definition"] = definition
+                self._validate_bundle(data)
+            else:
+                self._apply_measurement_definition(
+                    data,
+                    {
+                        key: definition[key]
+                        for key in (
+                            "quantification_method",
+                            "normalization",
+                            "definition_note",
+                        )
+                    },
+                    definition["historical_policy"],
+                    definition["decision_reason"],
+                )
         with self.lock:
             self._save(data, reason="Campaign created")
             self.campaigns[data["campaign_id"]] = data
@@ -462,8 +508,16 @@ class CampaignService:
                     for r in package["observations"]
                     if r.get("run_id") in {"M7", "M12", "M13"}
                 ]
+            definition = config["measurement_definition"]
+            config["measurement_definition"] = default_definition()
             return self.create(
-                config["preset"], package, config, parent["synthetic_demo"]
+                config["preset"],
+                package,
+                config,
+                parent["synthetic_demo"],
+                _inherited_measurement_definition=definition
+                if definition_signature(definition) is not None
+                else None,
             )
 
     @staticmethod
@@ -494,6 +548,7 @@ class CampaignService:
             a["pool_fingerprint"] != b["pool_fingerprint"]
             or a["initialization_fingerprint"] != b["initialization_fingerprint"]
             or any(a["config"][k] != b["config"][k] for k in keys)
+            or comparison_definition(a) != comparison_definition(b)
         ):
             raise ValueError("Campaigns do not have matched initial conditions")
         return dict(
@@ -532,11 +587,17 @@ class CampaignService:
                     pending=sum(r["status"] == "pending" for r in suggestions),
                     available=len(self.eligible(data)),
                     new_measurements=self.completed(data),
+                    inverse_proposals=len(data.get("inverse_proposals", [])),
                 ),
                 best=(max if data["config"]["direction"] == "maximize" else min)(
                     (r[self.objective_field(data)] for r in active), default=None
                 ),
-                observations=deepcopy(data["observations"]),
+                observations=[
+                    {**deepcopy(row), "measurement_quality": quality_metadata(row)}
+                    for row in data["observations"]
+                ],
+                inverse_proposals=deepcopy(data.get("inverse_proposals", [])),
+                quality_status=quality_status(data),
                 archive=deepcopy(data["archive"]),
                 suggestions=suggestions,
                 provenance=deepcopy(data["provenance"]),
@@ -581,6 +642,13 @@ class CampaignService:
                 else:
                     merged[key] = deepcopy(value)
             config = resolve_config(data["config"]["preset"], merged)
+            if (
+                config["measurement_definition"]
+                != data["config"]["measurement_definition"]
+            ):
+                raise ValueError(
+                    "Use the documented measurement-definition revision to change scientific inclusion decisions"
+                )
             if config == data["config"]:
                 return (
                     self.summary(cid)
@@ -618,6 +686,71 @@ class CampaignService:
             self._save(data, reason="Settings changed")
         return self.summary(cid)
 
+    def revise_measurement_definition(
+        self, cid, definition, historical_policy="exclude", reason=None
+    ):
+        with self.lock:
+            data = self.get(cid)
+            self._apply_measurement_definition(
+                data, definition, historical_policy, reason
+            )
+            self._save(data, reason="Measurement definition revised")
+        return self.summary(cid)
+
+    def _apply_measurement_definition(
+        self, data, definition, historical_policy, reason
+    ):
+        """Prepare one validated inclusion revision before its caller commits it."""
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(
+                "A measurement-definition revision requires a scientific reason"
+            )
+        if historical_policy not in {"exclude", "retain_with_justification"}:
+            raise ValueError(
+                "Choose exclusion or explicit retention with scientific justification"
+            )
+        if not isinstance(definition, dict) or set(definition) - {
+            "quantification_method",
+            "normalization",
+            "definition_note",
+        }:
+            raise ValueError(
+                "Definition contains quantification_method, normalization and optional definition_note"
+            )
+        revised = resolve_definition(
+            {
+                **default_definition(),
+                **definition,
+                "historical_policy": historical_policy,
+                "decision_reason": reason.strip(),
+            }
+        )
+        wanted = definition_signature(revised)
+        if wanted is None:
+            raise ValueError(
+                "Choose an explicit scientific measurement definition; historical values remain unspecified"
+            )
+        retained = []
+        for row in self.active(data):
+            signature = definition_signature(row)
+            if signature is None and historical_policy == "retain_with_justification":
+                retained.append(row["observation_id"])
+            elif signature != wanted:
+                row["training_included"] = False
+                row["training_exclusion"] = {
+                    "schema_version": 1,
+                    "reason": reason.strip(),
+                    "at": now(),
+                    "measurement_definition": list(wanted),
+                }
+        revised["historical_observation_ids"] = retained
+        data["config"]["measurement_definition"] = revised
+        self._invalidate(
+            data,
+            "Measurement definition revised; original values and provenance preserved, scientific inclusion decision recorded",
+        )
+        self._validate_bundle(data)
+
     def _invalidate(self, data, reason):
         data["history_revision"] += 1
         for suggestion in data["suggestions"]:
@@ -628,9 +761,221 @@ class CampaignService:
             job["cancel"].set()
         data["events"].append({"at": now(), "message": reason})
 
+    def request_preview(
+        self, cid, role="forward", candidate_id=None, suggestion_id=None
+    ):
+        from .llm_engine import preview_request
+
+        data = self.get(cid)
+        recorded = None
+        if suggestion_id is not None:
+            record = next(
+                (
+                    row
+                    for row in data["suggestions"]
+                    if row["suggestion_id"] == suggestion_id
+                ),
+                None,
+            )
+            if record is None:
+                record = next(
+                    (
+                        row
+                        for row in data["inverse_proposals"]
+                        if row["proposal_id"] == suggestion_id
+                    ),
+                    None,
+                )
+            if record is None:
+                raise ValueError("Unknown recorded suggestion or inverse proposal")
+            recorded = record["engine_result"]
+            if candidate_id is None:
+                candidate_id = record.get("candidate_id")
+        observations = [] if recorded is not None else llm_observations(data)
+        vectors = None
+        if recorded is None:
+            if data["synthetic_demo"]:
+                from .moc_demo import demo_vectors
+
+                vectors = {
+                    row["candidate_id"]: vector
+                    for row, vector in zip(data["candidates"], demo_vectors(data))
+                }
+            else:
+                vectors = cached_selector_vectors(data, self.root, candidate_id)
+        seed_offset = (
+            1000000 + len(data["inverse_proposals"])
+            if role == "inverse"
+            else data["rng_state"]["suggestion_sequence"]
+        )
+        settings = llm_settings(data, data["config"]["seed"] + seed_offset)
+        result = preview_request(
+            settings,
+            data["candidates"],
+            observations,
+            role=role,
+            candidate_id=candidate_id,
+            recorded_result=recorded,
+            candidate_vectors=vectors,
+            selector_candidate_vectors=vectors,
+            count=data["config"]["llm"]["inverse_proposal_count"]
+            if role == "inverse"
+            else None,
+        )
+        result.update(
+            campaign_id=cid, synthetic_demo=data["synthetic_demo"], preview_only=True
+        )
+        return result
+
+    def start_inverse_proposals(self, cid, count=None, background=True):
+        with self.lock:
+            data = self.get(cid)
+            if (
+                data["config"]["engine"] != "llm"
+                or data["config"].get("selection_policy") != "engine"
+            ):
+                raise ValueError(
+                    "Standalone inverse proposals require the BO-ICL LLM engine"
+                )
+            validate_training_definitions(data)
+            count = (
+                data["config"]["llm"]["inverse_proposal_count"]
+                if count is None
+                else count
+            )
+            if (
+                isinstance(count, bool)
+                or not isinstance(count, int)
+                or not 1 <= count <= 20
+            ):
+                raise ValueError(
+                    "Standalone inverse proposal count must be an integer from 1 to 20"
+                )
+            job = self.jobs.get(cid)
+            if job and job["status"] == "running":
+                return {"job_id": job["job_id"], "coalesced": True}
+            job = {
+                "job_id": uid(),
+                "kind": "inverse_proposal",
+                "status": "running",
+                "detail": "Preparing standalone inverse proposals",
+                "cancel": threading.Event(),
+                "started_at": now(),
+            }
+            proposal = dict(
+                proposal_id=uid(),
+                job_id=job["job_id"],
+                status="running",
+                created_at=now(),
+                history_revision=data["history_revision"],
+                config_hash=fingerprint(data["config"]),
+                requested_count=count,
+                returned_count=0,
+                procedures=[],
+                target=None,
+                engine_result={},
+            )
+            data["inverse_proposals"].append(proposal)
+            snapshot = deepcopy(data)
+            snapshot["step_seed"] = (
+                data["config"]["seed"] + 1000000 + len(data["inverse_proposals"]) - 1
+            )
+            self._save(data, reason="Standalone inverse proposals started")
+            self.jobs[cid] = job
+        if background:
+            thread = threading.Thread(
+                target=self._compute_inverse_proposal,
+                args=(cid, snapshot, proposal["proposal_id"], count, job),
+                daemon=True,
+            )
+            job["thread"] = thread
+            thread.start()
+        else:
+            self._compute_inverse_proposal(
+                cid, snapshot, proposal["proposal_id"], count, job
+            )
+        return {
+            "job_id": job["job_id"],
+            "proposal_id": proposal["proposal_id"],
+            "status": job["status"],
+        }
+
+    start_inverse_proposal = start_inverse_proposals
+
+    def _compute_inverse_proposal(self, cid, snapshot, proposal_id, count, job):
+        def progress(*args, **kwargs):
+            job["detail"] = " ".join(str(a) for a in args) if args else str(kwargs)
+
+        try:
+            result = (
+                self.inverse_runner(snapshot, count, job["cancel"], progress)
+                if self.inverse_runner
+                else run_inverse_proposal(
+                    snapshot, count, self.root, job["cancel"], progress
+                )
+            )
+        except InterruptedError as exc:
+            result = dict(
+                status="cancelled", reason=str(exc), procedures=[], returned_count=0
+            )
+        except Exception as exc:
+            result = dict(
+                status="failed", reason=str(exc), procedures=[], returned_count=0
+            )
+        with self.lock:
+            data = self.get(cid)
+            stale = data["history_revision"] != snapshot[
+                "history_revision"
+            ] or fingerprint(data["config"]) != fingerprint(snapshot["config"])
+            status = (
+                "cancelled"
+                if job["cancel"].is_set()
+                else "superseded"
+                if stale
+                else result.get("status", "failed")
+            )
+            procedures = result.get("procedures", [])
+            if status == "proposed" and (
+                not isinstance(procedures, list)
+                or len(procedures) != count
+                or any(not isinstance(v, str) or not v.strip() for v in procedures)
+            ):
+                status = "failed"
+                result[
+                    "reason"
+                ] = "Inverse result did not contain the requested number of procedure proposals"
+            row = next(
+                r for r in data["inverse_proposals"] if r["proposal_id"] == proposal_id
+            )
+            row.update(
+                status=status,
+                completed_at=now(),
+                procedures=procedures if status == "proposed" else [],
+                returned_count=result.get("returned_count", len(procedures)),
+                target=result.get("target"),
+                reason=result.get("reason"),
+                engine_result=result,
+            )
+            try:
+                self._save(data, reason="Standalone inverse proposals " + status)
+            except (OSError, ValueError, TypeError) as exc:
+                job.update(
+                    status="failed",
+                    detail=f"Inverse proposal could not be saved: {exc}",
+                    completed_at=now(),
+                )
+                return
+            job.update(
+                status=status,
+                detail=result.get("reason")
+                or f"{len(row['procedures'])} standalone procedure proposals; no experiment selected or reserved",
+                completed_at=now(),
+            )
+
     def start_suggestion(self, cid, background=True):
         with self.lock:
             data = self.get(cid)
+            validate_training_definitions(data)
             from .moc_demo import demo_runner
 
             if self.runner is demo_runner and not data["synthetic_demo"]:
@@ -903,6 +1248,7 @@ class CampaignService:
                 planned_quality_repeat=row["planned_quality_repeat"],
             )
             data["observations"].append(measurement)
+            validate_training_definitions(data)
             row["status"] = "measured"
             row["observation_id"] = measurement["observation_id"]
             self._invalidate(data, "Confirmed measurement saved; model must refit")
@@ -948,8 +1294,9 @@ class CampaignService:
                 "source_note": normalized["source_note"],
                 "phase_accounting_complete": False,
                 "phase_accounting_residual_wt_pct": None,
+                "measurement_quality": quality_metadata(values),
             }
-        result = {}
+        result = {"measurement_quality": quality_metadata(values)}
         for key in ["moc_wt_pct", "moc_wt_pct_sigma", "gof", "closure_gap_wt_pct"]:
             value = values.get(key)
             if value is None or value == "":
@@ -1002,7 +1349,7 @@ class CampaignService:
         return result
 
     def refine(self, cid, observation_id, values, reason):
-        if not reason:
+        if not isinstance(reason, str) or not reason.strip():
             raise ValueError("A refinement revision requires a reason")
         with self.lock:
             data = self.get(cid)
@@ -1018,17 +1365,35 @@ class CampaignService:
                 raise ValueError("Unknown observation")
             if old["record_status"] != "measured":
                 raise ValueError("Only the active refinement can be revised")
+            merged_values = {**old, **values}
+            if "measurement_quality" not in values and set(values) & DEFINITION_FIELDS:
+                merged_values.pop("measurement_quality", None)
             updated = {
                 **old,
-                **self._measurement(values, data["config"]),
+                **self._measurement(merged_values, data["config"]),
                 "observation_id": uid(),
                 "supersedes": observation_id,
                 "refinement_version": uid(),
                 "revision_reason": reason,
                 "recorded_at": now(),
             }
+            if (
+                ("measurement_quality" in values or set(values) & DEFINITION_FIELDS)
+                and definition_signature(updated) is not None
+                and definition_signature(updated)
+                == definition_signature(data["config"]["measurement_definition"])
+            ):
+                updated["training_included"] = True
+                updated.pop("training_exclusion", None)
             old.update(training_included=False, record_status="superseded_refinement")
             data["observations"].append(updated)
+            decision = data["config"]["measurement_definition"]
+            if (
+                observation_id in decision["historical_observation_ids"]
+                and definition_signature(updated) is None
+            ):
+                decision["historical_observation_ids"].append(updated["observation_id"])
+            validate_training_definitions(data)
             self._invalidate(data, "Refinement revision saved; predictions invalidated")
             self._save(data, reason="Refinement revised")
         return self.summary(cid)
@@ -1050,6 +1415,7 @@ class CampaignService:
             "synthetic_demo",
             "rng_state",
             "events",
+            "inverse_proposals",
             "candidates",
             "observations",
             "archive",
@@ -1070,6 +1436,7 @@ class CampaignService:
             "toolkit_code_revision",
             "imported_from_campaign_id",
             "restored_from_checkpoint",
+            "inverse_proposals",
         }
         if required - set(data):
             raise ValueError(
@@ -1103,7 +1470,17 @@ class CampaignService:
             raise ValueError("Campaign bundle must contain finite JSON data") from exc
         if not isinstance(data["config"], dict) or "preset" not in data["config"]:
             raise ValueError("Campaign configuration is missing")
+        original_config_hash = fingerprint(data["config"])
         data["config"] = resolve_config(data["config"]["preset"], data["config"])
+        resolved_hash = fingerprint(data["config"])
+        if original_config_hash != resolved_hash:
+            for row in data["suggestions"]:
+                if (
+                    isinstance(row, dict)
+                    and row.get("config_hash") == original_config_hash
+                ):
+                    row["config_hash"] = resolved_hash
+        data.setdefault("inverse_proposals", [])
         generic = data["config"].get("data_schema") == "generic"
         objective = "value" if generic else "moc_wt_pct"
         for field in (
@@ -1113,9 +1490,107 @@ class CampaignService:
             "suggestions",
             "excluded_ids",
             "events",
+            "inverse_proposals",
         ):
             if not isinstance(data[field], list):
                 raise ValueError(f"Campaign {field} must be an array")
+        proposal_ids = set()
+        for row in data["inverse_proposals"]:
+            if (
+                not isinstance(row, dict)
+                or not isinstance(row.get("proposal_id"), str)
+                or not re.fullmatch("[a-f0-9]{32}", row["proposal_id"])
+                or row["proposal_id"] in proposal_ids
+            ):
+                raise ValueError("Invalid or duplicate standalone inverse proposal ID")
+            proposal_ids.add(row["proposal_id"])
+            if row.get("status") not in {
+                "running",
+                "proposed",
+                "failed",
+                "cancelled",
+                "superseded",
+                "interrupted",
+            }:
+                raise ValueError("Invalid standalone inverse proposal status")
+            if any(
+                key in row
+                for key in ("candidate_id", "suggestion_id", "observation_id")
+            ):
+                raise ValueError(
+                    "Standalone proposals cannot own experiment or measurement IDs"
+                )
+            if (
+                not isinstance(row.get("job_id"), str)
+                or not re.fullmatch("[a-f0-9]{32}", row["job_id"])
+                or not isinstance(row.get("config_hash"), str)
+                or not re.fullmatch("[a-f0-9]{64}", row["config_hash"])
+            ):
+                raise ValueError(
+                    "Invalid inverse proposal job ownership or settings identity"
+                )
+            if (
+                isinstance(row.get("history_revision"), bool)
+                or not isinstance(row.get("history_revision"), int)
+                or row["history_revision"] < 0
+                or row["history_revision"] > data["history_revision"]
+            ):
+                raise ValueError("Invalid inverse proposal history revision")
+            if (
+                not isinstance(row.get("engine_result"), dict)
+                or not isinstance(row.get("procedures"), list)
+                or any(not isinstance(p, str) for p in row["procedures"])
+            ):
+                raise ValueError("Invalid recorded inverse proposal result")
+            if (
+                isinstance(row.get("requested_count"), bool)
+                or not isinstance(row.get("requested_count"), int)
+                or not 1 <= row["requested_count"] <= 20
+            ):
+                raise ValueError("Invalid inverse proposal count")
+            if row["status"] == "proposed" and (
+                len(row["procedures"]) != row["requested_count"]
+                or any(not p.strip() for p in row["procedures"])
+                or row.get("returned_count") != row["requested_count"]
+            ):
+                raise ValueError("Incomplete standalone inverse proposal result")
+            if (
+                isinstance(row.get("returned_count"), bool)
+                or not isinstance(row.get("returned_count"), int)
+                or row["returned_count"] < 0
+            ):
+                raise ValueError("Invalid inverse proposal returned count")
+            recorded = row["engine_result"]
+            if set(recorded) & {
+                "candidate_id",
+                "selected_candidate_id",
+                "predictions",
+                "retrieval",
+            }:
+                raise ValueError(
+                    "Standalone inverse records cannot contain candidate selection results"
+                )
+            logs = recorded.get("request_log", [])
+            if not isinstance(logs, list):
+                raise ValueError("Invalid inverse request log")
+            for log in logs:
+                if not isinstance(log, dict) or log.get("role") not in {
+                    "inverse",
+                    "embedding",
+                }:
+                    raise ValueError(
+                        "Standalone proposal log contains a non-inverse request"
+                    )
+                if log["role"] == "inverse":
+                    request = log.get("request")
+                    if (
+                        not isinstance(request, dict)
+                        or request.get("n") != row["requested_count"]
+                        or not isinstance(request.get("messages"), list)
+                    ):
+                        raise ValueError(
+                            "Inverse request log does not match its proposal count"
+                        )
         for field in ("started", "synthetic_demo"):
             if not isinstance(data[field], bool):
                 raise ValueError(f"Campaign {field} must be boolean")
@@ -1159,9 +1634,24 @@ class CampaignService:
             raise ValueError("Invalid excluded candidate IDs")
         observation_ids = set()
         active_physical = set()
+        legacy_initial_source = (
+            deepcopy(data["observations"])
+            if "initial_observations" not in data
+            else None
+        )
         for row in data["observations"] + data["archive"]:
             if not isinstance(row, dict) or row.get("candidate_id") not in ids:
                 raise ValueError("Unknown observation candidate")
+            row["measurement_quality"] = quality_metadata(row)
+            if (
+                not generic
+                and row.get("is_seed")
+                and not row.get("supersedes")
+                and definition_signature(row) is not None
+            ):
+                raise ValueError(
+                    "Original historical seeds cannot be relabeled with an explicit method; use a documented refinement"
+                )
             value = row.get(objective)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError("Missing or invalid measured objective")
@@ -1221,9 +1711,44 @@ class CampaignService:
                         "Multiple active refinements of one physical measurement"
                     )
                 active_physical.add(physical)
+        observations_by_id = {
+            row["observation_id"]: row for row in data["observations"]
+        }
+        refined_ids = set()
         for row in data["observations"]:
-            if row.get("supersedes") and row["supersedes"] not in observation_ids:
+            prior_id = row.get("supersedes")
+            if prior_id is None:
+                continue
+            if not isinstance(prior_id, str) or prior_id not in observations_by_id:
                 raise ValueError("Refinement references an unknown prior record")
+            if prior_id == row["observation_id"] or prior_id in refined_ids:
+                raise ValueError("Refinement lineage cannot refer to itself or branch")
+            prior = observations_by_id[prior_id]
+            if any(
+                row[key] != prior[key]
+                for key in ("candidate_id", "physical_measurement_id", "is_seed")
+            ):
+                raise ValueError(
+                    "Refinement must retain its physical measurement ownership"
+                )
+            if (
+                prior["record_status"] != "superseded_refinement"
+                or prior["training_included"]
+                or not isinstance(row.get("revision_reason"), str)
+                or not row["revision_reason"].strip()
+            ):
+                raise ValueError(
+                    "Refinement requires a documented reason and a superseded prior record"
+                )
+            refined_ids.add(prior_id)
+        for row in data["observations"]:
+            visited = {row["observation_id"]}
+            prior_id = row.get("supersedes")
+            while prior_id is not None:
+                if prior_id in visited:
+                    raise ValueError("Refinement lineage cannot contain a cycle")
+                visited.add(prior_id)
+                prior_id = observations_by_id[prior_id].get("supersedes")
         suggestion_ids = set()
         pending = set()
         for row in data["suggestions"]:
@@ -1295,7 +1820,7 @@ class CampaignService:
             initial = deepcopy(
                 [
                     r
-                    for r in data["observations"]
+                    for r in legacy_initial_source
                     if r.get("is_seed") and not r.get("supersedes")
                 ]
             )
@@ -1310,6 +1835,10 @@ class CampaignService:
             != data["initialization_fingerprint"]
         ):
             raise ValueError("Initialization fingerprint mismatch")
+        for row in data["initial_observations"]:
+            if not isinstance(row, dict):
+                raise ValueError("Invalid initialization observation")
+            quality_metadata(row)
         if generic:
             if data["provenance"].get("schema") != "generic-campaign-v1":
                 raise ValueError("Generic input provenance is required")
@@ -1346,6 +1875,27 @@ class CampaignService:
                 ),
                 data["candidates"],
             )
+            for initial in data["initial_observations"]:
+                original = observations_by_id.get(initial.get("observation_id"))
+                if (
+                    original is None
+                    or original.get("supersedes") is not None
+                    or any(
+                        original.get(key) != value
+                        for key, value in initial.items()
+                        if key
+                        not in {
+                            "record_status",
+                            "training_included",
+                            "training_exclusion",
+                            "measurement_quality",
+                        }
+                    )
+                    or quality_metadata(original) != quality_metadata(initial)
+                ):
+                    raise ValueError(
+                        "Original confirmed initialization values and provenance must remain unchanged; use a documented refinement"
+                    )
             _validate_archive(data["archive"], data["candidates"])
             if (
                 not isinstance(data["provenance"], dict)
@@ -1361,6 +1911,8 @@ class CampaignService:
                 "note": "Imported legacy bundle did not record code revision",
             },
         )
+        data["provenance"].setdefault("measurement_quality_default", quality_metadata())
+        validate_training_definitions(data)
 
     def export(self, cid):
         with self.lock:
@@ -1371,6 +1923,7 @@ class CampaignService:
     def import_bundle(self, data):
         data = deepcopy(data)
         self._validate_bundle(data)
+        self._interrupt_inverse_proposals(data)
         with self.lock:
             cid = data["campaign_id"]
             if cid in self.campaigns and fingerprint(data) != fingerprint(
@@ -1482,6 +2035,134 @@ def embedding_cache_directory(root, config):
         / config["engine"]
         / embedding_spec(config).fingerprint
     )
+
+
+def llm_settings(snapshot, seed=None):
+    config = snapshot["config"]
+    return {
+        **config["llm"],
+        "seed": config["seed"] if seed is None else seed,
+        "objective_name": config["objective"],
+        "objective_units": config["units"],
+        "prompt_style": config.get("data_schema", "moc"),
+    }
+
+
+def llm_observations(snapshot):
+    lookup = {r["candidate_id"]: r for r in snapshot["candidates"]}
+    return [
+        {
+            **row,
+            "value": row[CampaignService.objective_field(snapshot)],
+            "procedure": lookup[row["candidate_id"]]["procedure"],
+            "phase_context": json.dumps(
+                {
+                    k: v
+                    for k, v in row.items()
+                    if (k.endswith("_wt_pct") or k.endswith("_sigma"))
+                    and k != "moc_wt_pct"
+                },
+                ensure_ascii=False,
+            ),
+        }
+        for row in CampaignService.active(snapshot)
+    ]
+
+
+def selector_cache(snapshot, root):
+    from .embedding_cache import create_embedding_cache
+
+    config = deepcopy(snapshot["config"])
+    config["engine"] = "llm"
+    config["llm"]["embedding_model"] = config["llm"]["selector_embedding_model"]
+    return create_embedding_cache(
+        embedding_cache_directory(root, config), embedding_spec(config)
+    )
+
+
+def cached_selector_vectors(snapshot, root, candidate_id=None):
+    """Read only already-validated vectors needed for one request preview."""
+    if snapshot["config"]["llm"]["selector_mode"] == "all":
+        return None
+    ids = {row["candidate_id"] for row in CampaignService.active(snapshot)}
+    if candidate_id is not None:
+        ids.add(candidate_id)
+    rows = [row for row in snapshot["candidates"] if row["candidate_id"] in ids]
+    cache = selector_cache(snapshot, root)
+    missing = set(cache.coverage(rows)["missing_ids"])
+    available = [row for row in rows if row["candidate_id"] not in missing]
+    if not available:
+        return {}
+    return {
+        row["candidate_id"]: vector
+        for row, vector in zip(available, cache.matrix(available))
+    }
+
+
+def run_inverse_proposal(snapshot, count, root, cancel, progress):
+    from .llm_engine import LLMEngine
+
+    observations = llm_observations(snapshot)
+    settings = llm_settings(snapshot, snapshot["step_seed"])
+    if snapshot["synthetic_demo"]:
+        from .moc_demo import DemoChat, demo_vectors
+
+        vectors = demo_vectors(snapshot)
+        lookup = {
+            r["candidate_id"]: vectors[i] for i, r in enumerate(snapshot["candidates"])
+        }
+        observed_vectors = [lookup[row["candidate_id"]] for row in observations]
+        engine = LLMEngine(
+            settings,
+            client=DemoChat(
+                snapshot["candidates"][0]["procedure"],
+                snapshot["config"]["bounds"],
+                inverse_only=True,
+            ),
+        )
+        result = engine.propose_inverse(
+            snapshot["candidates"],
+            observations,
+            count=count,
+            observation_vectors=observed_vectors,
+            cancel=cancel.is_set,
+        )
+        result.update(
+            synthetic_demo=True,
+            provider_attempts=[],
+            embedding_provenance="Synthetic demo vectors; no production embeddings or provider requests",
+        )
+        return result
+    from .request_policy import RequestPolicy, ReliableClient
+    from openai import OpenAI
+
+    log = []
+    policy = RequestPolicy(snapshot["config"]["api"], cancel, log)
+    client = ReliableClient(OpenAI(max_retries=0), policy)
+    observed_vectors = None
+    if settings["selector_mode"] != "all":
+        cache = selector_cache(snapshot, root)
+        lookup = {r["candidate_id"]: r for r in snapshot["candidates"]}
+        rows = [lookup[row["candidate_id"]] for row in observations]
+        progress(
+            "Preparing only observed-procedure selector embeddings for standalone inverse proposals"
+        )
+        cache.prepare(
+            rows,
+            lambda texts: client.embeddings.create(model=cache.spec.model, input=texts),
+            cancelled=cancel.is_set,
+        )
+        observed_vectors = cache.matrix(rows)
+    engine = LLMEngine(settings, client=client)
+    result = engine.propose_inverse(
+        snapshot["candidates"],
+        observations,
+        count=count,
+        observation_vectors=observed_vectors,
+        cancel=cancel.is_set,
+    )
+    result["provider_attempts"] = log
+    return result
 
 
 def run_text_engine(snapshot, eligible, root, cancel, progress):

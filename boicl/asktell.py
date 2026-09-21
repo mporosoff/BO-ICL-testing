@@ -370,11 +370,13 @@ class AskTellFewShot:
         elif aq_fxn == "expected_improvement":
             aq_fxn = partial(expected_improvement, maximize=self.maximize)
         elif aq_fxn == "log_expected_improvement":
-            aq_fxn = log_expected_improvement
+            aq_fxn = partial(log_expected_improvement, maximize=self.maximize)
         elif aq_fxn == "upper_confidence_bound":
-            aq_fxn = partial(upper_confidence_bound, _lambda=_lambda)
+            aq_fxn = partial(
+                upper_confidence_bound, _lambda=_lambda, maximize=self.maximize
+            )
         elif aq_fxn == "greedy":
-            aq_fxn = greedy
+            aq_fxn = partial(greedy, maximize=self.maximize)
         elif aq_fxn == "random":
             return (
                 possible_x.sample(k),
@@ -389,7 +391,7 @@ class AskTellFewShot:
         else:
             best = np.max(self._ys) if self.maximize else np.min(self._ys)
 
-        if inv_filter + aug_random_filter < len(possible_x):
+        if inv_filter > 0 and inv_filter + aug_random_filter < len(possible_x):
             possible_x_l = []
             if inv_filter:
                 from .llm_engine import resolve_inverse_target
@@ -411,7 +413,16 @@ class AskTellFewShot:
                 )
 
             if aug_random_filter:
-                possible_x_l.extend(possible_x.sample(aug_random_filter))
+                retrieved = {self.format_x(x): x for x in possible_x_l}
+                possible_x_l = list(retrieved.values())
+                remaining = Pool(
+                    [x for x in possible_x if self.format_x(x) not in retrieved],
+                    self.format_x,
+                    embedding_model=self.embedding_model,
+                )
+                possible_x_l.extend(
+                    remaining.sample(min(aug_random_filter, len(remaining)))
+                )
         else:
             possible_x_l = list(possible_x)
 

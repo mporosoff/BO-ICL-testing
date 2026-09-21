@@ -1,6 +1,7 @@
 """Versioned, validated configuration shared by MoC library, browser and CLI."""
 from copy import deepcopy
 import math
+from .measurement_quality import default_definition, resolve_definition
 
 SCHEMA_VERSION = 1
 ENGINE_LABELS = {
@@ -58,6 +59,7 @@ def resolve_config(preset="moc_llm", overrides=None):
         independent_campaign_replicates=1,
         repeat_policy="source_reset_quality_repeats",
         auto_suggest=True,
+        measurement_definition=default_definition(),
         api=dict(maximum_attempts=8, request_spacing_s=0.5, base_cooldown_s=10.0),
         llm=dict(
             forward_model="gpt-4o",
@@ -69,6 +71,8 @@ def resolve_config(preset="moc_llm", overrides=None):
             n_samples=5,
             min_samples=2,
             inverse_n=1,
+            inverse_proposal_count=1,
+            manual_inverse_target=None,
             uncertainty_scalar=1.0,
             selector_k=5,
             selector_mode="nearest",
@@ -273,6 +277,12 @@ def resolve_config(preset="moc_llm", overrides=None):
         result["api"]["maximum_attempts"], "Maximum attempts (including first request)"
     )
     llm = result["llm"]
+    result["measurement_definition"] = resolve_definition(
+        result["measurement_definition"]
+    )
+    integer(llm["inverse_proposal_count"], "llm.inverse_proposal_count")
+    if llm["inverse_proposal_count"] > 20:
+        raise ValueError("Standalone inverse proposal count must be at most 20")
     for field in (
         "n_samples",
         "min_samples",
@@ -318,7 +328,7 @@ def resolve_config(preset="moc_llm", overrides=None):
         "upper_confidence_bound",
     }:
         raise ValueError("Unknown LLM acquisition")
-    for field in ("target_floor", "target_ceiling"):
+    for field in ("target_floor", "target_ceiling", "manual_inverse_target"):
         if llm[field] is not None:
             value = llm[field]
             if (
@@ -338,6 +348,14 @@ def resolve_config(preset="moc_llm", overrides=None):
         and llm["target_floor"] > llm["target_ceiling"]
     ):
         raise ValueError("Target floor cannot exceed ceiling")
+    manual = llm["manual_inverse_target"]
+    if manual is not None and (
+        (llm["target_floor"] is not None and manual < llm["target_floor"])
+        or (llm["target_ceiling"] is not None and manual > llm["target_ceiling"])
+    ):
+        raise ValueError(
+            "Manual inverse target must be within configured target bounds"
+        )
     if not 2 <= llm["min_samples"] <= llm["n_samples"] or llm["inverse_n"] != 1:
         raise ValueError(
             "Require at least two accepted predictions and one inverse completion"

@@ -175,6 +175,15 @@ def post(handler, parsed):
         )
     elif action == "suggest":
         result = svc.start_suggestion(cid)
+    elif action == "inverse-proposal":
+        result = svc.start_inverse_proposals(cid)
+    elif action == "request-preview":
+        result = svc.request_preview(
+            cid,
+            role=p.get("role", "forward"),
+            candidate_id=p.get("candidate_id"),
+            suggestion_id=p.get("suggestion_id"),
+        )
     elif action == "checkpoint":
         result = svc.save_checkpoint(cid, p.get("name"))
     elif action == "restore-checkpoint":
@@ -193,6 +202,13 @@ def post(handler, parsed):
         result = svc.measure(cid, p["suggestion_id"], p["values"], p.get("request_id"))
     elif action == "refine":
         result = svc.refine(cid, p["observation_id"], p["values"], p["reason"])
+    elif action == "measurement-definition":
+        result = svc.revise_measurement_definition(
+            cid,
+            definition=p["definition"],
+            historical_policy=p["historical_policy"],
+            reason=p["reason"],
+        )
     elif action in {"config", "config-preview"}:
         result = svc.update_config(cid, p["changes"], apply=action == "config")
     elif action == "import":

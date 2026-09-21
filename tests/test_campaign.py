@@ -216,6 +216,7 @@ def test_initial_counts_source_repeat_policy_and_eight_history(tmp_path, package
         "pending": 0,
         "available": 7773,
         "new_measurements": 0,
+        "inverse_proposals": 0,
     }
     assert state["best"] == 83.8 and not state["suggestions"]
     archive_ids = {r["candidate_id"] for r in package["archive"]}
@@ -335,13 +336,14 @@ def test_three_simultaneous_campaign_jobs_remain_independent_after_restart(
         for i, preset in enumerate(("moc_gp", "moc_llm", "moc_gp"))
     ]
     entered.update({cid: threading.Event() for cid in ids})
+    initial_training = {cid: service.get(cid)["observations"] for cid in ids}
     try:
         for cid in ids:
             service.start_suggestion(cid)
         assert all(event.wait(5) for event in entered.values())
         assert all(service.jobs[cid]["status"] == "running" for cid in ids)
         assert len({service.jobs[cid]["job_id"] for cid in ids}) == 3
-        assert all(received[cid] == [package["observations"]] for cid in ids)
+        assert all(received[cid] == [initial_training[cid]] for cid in ids)
     finally:
         release.set()
         for job in service.jobs.values():
@@ -369,7 +371,7 @@ def test_three_simultaneous_campaign_jobs_remain_independent_after_restart(
         suggest(restarted, cid)
     assert [r["moc_wt_pct"] for r in received[ids[0]][-1]][-1] == 91
     assert [r["moc_wt_pct"] for r in received[ids[1]][-1]][-1] == 92
-    assert received[ids[2]][-1] == package["observations"]
+    assert received[ids[2]][-1] == initial_training[ids[2]]
     assert all(received[cid][-1] == saved[cid]["observations"] for cid in ids)
 
 

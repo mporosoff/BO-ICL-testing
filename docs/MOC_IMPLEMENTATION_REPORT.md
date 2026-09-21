@@ -11,8 +11,10 @@ into the mutable legacy runner. Opening another view does not create an arm.
 
 `campaign_plot.py` projects shared records into the existing `renderPlot`
 component. The focused view embeds that same component. Initialization appears
-at iteration zero; only confirmed new physical measurements advance the measured
-trace. Pending predictions remain separate diamonds. GP intervals use the
+at consecutive positions i1, i2, i3, … in supplied order, with a shaded region
+and a divider before BO step 1. These remain initialization measurements,
+excluded from the new-measurement budget. Confirmed new physical measurements
+advance the subsequent BO steps. Pending predictions remain separate diamonds. GP intervals use the
 posterior quantiles, including asymmetric bounded intervals. Measurement esd,
 predictive spread, and variation across independent benchmark runs have separate
 meanings. Independent live arms are not presented as a multi-replicate estimate.
