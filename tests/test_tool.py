@@ -1,12 +1,13 @@
 import os
 
-from boicl import BOICLTool, Pool
+from boicl import AskTellFewShotTopk, BOICLTool, Pool
 
 
 def test_tell_tools(tmp_path):
     pool_list = ["red", "green", "blue"]
     pool = Pool(pool_list)
-    tool = BOICLTool(pool)
+    # CSV parsing uses all examples without requesting selector embeddings.
+    tool = BOICLTool(pool, asktell=AskTellFewShotTopk(selector_k=None))
     test_csv = tmp_path / "test.csv"
     with open(test_csv, "w") as f:
         f.write("yellow, 1\n")
