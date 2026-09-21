@@ -19,6 +19,9 @@ from .measurement_quality import (
     default_definition,
     resolve_definition,
     comparison_definition,
+    latest_physical_records,
+    definition_exclusion,
+    effective_initial_cohort,
     QUALITY_FIELDS as DEFINITION_FIELDS,
 )
 
@@ -549,6 +552,7 @@ class CampaignService:
             or a["initialization_fingerprint"] != b["initialization_fingerprint"]
             or any(a["config"][k] != b["config"][k] for k in keys)
             or comparison_definition(a) != comparison_definition(b)
+            or effective_initial_cohort(a) != effective_initial_cohort(b)
         ):
             raise ValueError("Campaigns do not have matched initial conditions")
         return dict(
@@ -731,18 +735,51 @@ class CampaignService:
                 "Choose an explicit scientific measurement definition; historical values remain unspecified"
             )
         retained = []
-        for row in self.active(data):
+        for row in latest_physical_records(data):
+            was_included = row.get("training_included", True)
+            if not was_included and not definition_exclusion(row):
+                continue
             signature = definition_signature(row)
-            if signature is None and historical_policy == "retain_with_justification":
+            include = signature == wanted or (
+                signature is None and historical_policy == "retain_with_justification"
+            )
+            if include and signature is None:
                 retained.append(row["observation_id"])
-            elif signature != wanted:
+            if include and not was_included:
+                previous = row.pop("training_exclusion")
+                row["training_included"] = True
+                row.setdefault("training_inclusion_history", []).append(
+                    {
+                        "schema_version": 1,
+                        "action": "restored",
+                        "at": now(),
+                        "reason": reason.strip(),
+                        "measurement_definition": list(wanted),
+                        "historical_policy": historical_policy,
+                        "previous_exclusion": previous,
+                    }
+                )
+            elif not include:
+                previous = deepcopy(row.get("training_exclusion"))
                 row["training_included"] = False
                 row["training_exclusion"] = {
                     "schema_version": 1,
+                    "source": "measurement_definition_revision",
                     "reason": reason.strip(),
                     "at": now(),
                     "measurement_definition": list(wanted),
                 }
+                row.setdefault("training_inclusion_history", []).append(
+                    {
+                        "schema_version": 1,
+                        "action": "excluded",
+                        "at": row["training_exclusion"]["at"],
+                        "reason": reason.strip(),
+                        "measurement_definition": list(wanted),
+                        "historical_policy": historical_policy,
+                        "previous_exclusion": previous,
+                    }
+                )
         revised["historical_observation_ids"] = retained
         data["config"]["measurement_definition"] = revised
         self._invalidate(
@@ -766,6 +803,17 @@ class CampaignService:
     ):
         from .llm_engine import preview_request
 
+        # Keep the former inverse role as an explicit compatibility alias for
+        # standalone proposals; ordinary BO always has its own seed and n=1.
+        kind = "standalone_inverse" if role == "inverse" else role
+        labels = {
+            "forward": "Forward prediction",
+            "bo_inverse": "Next BO inverse request",
+            "standalone_inverse": "Standalone inverse proposal",
+        }
+        if kind not in labels:
+            raise ValueError("Unknown request preview role")
+        provider_role = "forward" if kind == "forward" else "inverse"
         data = self.get(cid)
         recorded = None
         if suggestion_id is not None:
@@ -792,8 +840,34 @@ class CampaignService:
             if candidate_id is None:
                 candidate_id = record.get("candidate_id")
         observations = [] if recorded is not None else llm_observations(data)
+        unavailable = None
+        if recorded is None and kind == "standalone_inverse":
+            if (
+                data["config"]["engine"] != "llm"
+                or data["config"].get("selection_policy") != "engine"
+            ):
+                unavailable = (
+                    "Standalone inverse proposals require the BO-ICL LLM engine"
+                )
+        if recorded is None and kind == "bo_inverse":
+            if (
+                data["config"]["engine"] != "llm"
+                or data["config"].get("selection_policy") != "engine"
+            ):
+                unavailable = (
+                    "The active selection engine does not make a BO inverse request"
+                )
+            elif len(observations) < 2:
+                unavailable = "The next BO step uses an initial design, not an inverse request, until two distinct active observations are available"
+            elif not self.eligible(data):
+                unavailable = "No eligible candidate remains for a BO inverse request"
+            else:
+                budget = data["config"]["new_measurement_budget"]
+                pending = sum(row["status"] == "pending" for row in data["suggestions"])
+                if budget is not None and self.completed(data) + pending >= budget:
+                    unavailable = "The measurement budget is filled; no next BO inverse request can start"
         vectors = None
-        if recorded is None:
+        if recorded is None and unavailable is None:
             if data["synthetic_demo"]:
                 from .moc_demo import demo_vectors
 
@@ -803,27 +877,31 @@ class CampaignService:
                 }
             else:
                 vectors = cached_selector_vectors(data, self.root, candidate_id)
-        seed_offset = (
-            1000000 + len(data["inverse_proposals"])
-            if role == "inverse"
-            else data["rng_state"]["suggestion_sequence"]
-        )
-        settings = llm_settings(data, data["config"]["seed"] + seed_offset)
+        schedule = llm_request_schedule(data, standalone=kind == "standalone_inverse")
+        settings = llm_settings(data, schedule["seed"])
         result = preview_request(
             settings,
             data["candidates"],
             observations,
-            role=role,
+            role=provider_role,
             candidate_id=candidate_id,
             recorded_result=recorded,
             candidate_vectors=vectors,
             selector_candidate_vectors=vectors,
-            count=data["config"]["llm"]["inverse_proposal_count"]
-            if role == "inverse"
-            else None,
+            count=schedule["inverse_count"] if provider_role == "inverse" else None,
         )
+        if unavailable is not None:
+            result.update(status="unresolved", request=None, reason=unavailable)
+            result.pop("request_sha256", None)
         result.update(
-            campaign_id=cid, synthetic_demo=data["synthetic_demo"], preview_only=True
+            campaign_id=cid,
+            synthetic_demo=data["synthetic_demo"],
+            preview_only=True,
+            preview_kind=kind,
+            preview_label=("Recorded " + provider_role + " request")
+            if recorded is not None
+            else labels[kind],
+            request_schedule=None if recorded is not None else schedule,
         )
         return result
 
@@ -875,11 +953,10 @@ class CampaignService:
                 target=None,
                 engine_result={},
             )
+            schedule = llm_request_schedule(data, standalone=True)
             data["inverse_proposals"].append(proposal)
             snapshot = deepcopy(data)
-            snapshot["step_seed"] = (
-                data["config"]["seed"] + 1000000 + len(data["inverse_proposals"]) - 1
-            )
+            snapshot["step_seed"] = schedule["seed"]
             self._save(data, reason="Standalone inverse proposals started")
             self.jobs[cid] = job
         if background:
@@ -992,10 +1069,10 @@ class CampaignService:
                     "New-measurement budget is filled by completed and reserved measurements"
                 )
             data["started"] = True
-            sequence = data["rng_state"]["suggestion_sequence"]
+            schedule = llm_request_schedule(data)
             data["rng_state"]["suggestion_sequence"] += 1
             snapshot = deepcopy(data)
-            snapshot["step_seed"] = data["config"]["seed"] + sequence
+            snapshot["step_seed"] = schedule["seed"]
             job = {
                 "job_id": uid(),
                 "status": "running",
@@ -1369,7 +1446,7 @@ class CampaignService:
             if "measurement_quality" not in values and set(values) & DEFINITION_FIELDS:
                 merged_values.pop("measurement_quality", None)
             updated = {
-                **old,
+                **deepcopy(old),
                 **self._measurement(merged_values, data["config"]),
                 "observation_id": uid(),
                 "supersedes": observation_id,
@@ -1749,6 +1826,8 @@ class CampaignService:
                     raise ValueError("Refinement lineage cannot contain a cycle")
                 visited.add(prior_id)
                 prior_id = observations_by_id[prior_id].get("supersedes")
+        # Exclusion from training does not create a second physical experiment.
+        latest_physical_records(data)
         suggestion_ids = set()
         pending = set()
         for row in data["suggestions"]:
@@ -2035,6 +2114,23 @@ def embedding_cache_directory(root, config):
         / config["engine"]
         / embedding_spec(config).fingerprint
     )
+
+
+def llm_request_schedule(snapshot, *, standalone=False):
+    """Pure schedule shared by request previews and the job launchers."""
+    sequence = (
+        len(snapshot["inverse_proposals"])
+        if standalone
+        else snapshot["rng_state"]["suggestion_sequence"]
+    )
+    return {
+        "sequence_kind": "standalone_inverse" if standalone else "bo_suggestion",
+        "sequence": sequence,
+        "seed": snapshot["config"]["seed"] + (1000000 if standalone else 0) + sequence,
+        "inverse_count": snapshot["config"]["llm"]["inverse_proposal_count"]
+        if standalone
+        else 1,
+    }
 
 
 def llm_settings(snapshot, seed=None):

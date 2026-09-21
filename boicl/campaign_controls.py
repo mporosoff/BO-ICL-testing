@@ -39,8 +39,8 @@ def comparison_campaigns(service, parent_cid):
     ]
 
 
-def random_control_state(service, parent_cid):
-    data = random_control_campaign(service, parent_cid)
+def random_control_state(service, parent_cid, *, data=None):
+    data = data if data is not None else random_control_campaign(service, parent_cid)
     if data is None:
         return {}
     points = measured_points(data)
@@ -63,11 +63,12 @@ def random_control_state(service, parent_cid):
             "procedure": candidate["procedure"],
         }
     budget = data["config"].get("new_measurement_budget")
+    completed = service.completed(data)
     status = (
         "waiting_for_result"
         if current
         else "complete"
-        if budget is not None and len(new_points) >= budget
+        if budget is not None and completed >= budget
         else "idle"
     )
     return {
@@ -75,6 +76,7 @@ def random_control_state(service, parent_cid):
         "comparison_parent_id": parent_cid,
         "status": status,
         "target_count": budget,
+        "completed_count": completed,
         "seed": data["config"]["seed"],
         "observations": new_points,
         "initialization_observations": [point for point in points if point["is_seed"]],

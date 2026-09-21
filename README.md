@@ -137,10 +137,11 @@ Typical settings:
 - **Target scaling**: start with `Off` for LLM BO-ICL on bounded percentages.
   The LLM path keeps labels, inverse-design targets, floors, and predictions in
   original objective units; auto/min-max/z-score scaling is used only for GPR.
-- **Objective bounds**: physical limits in original units. Shared campaigns enforce
-  them in the model and acquisition path, including valid LLM samples and inverse
-  targets. The structured GP uses its bounded posterior. Display intervals also
-  respect bounds; original measured values and raw provider responses are retained.
+- **Objective bounds**: physical limits in original units. The shared structured
+  GP uses a bounded transform and posterior; LLM samples and inverse targets
+  enforce the limits. The separate embedding GP keeps an ordinary Gaussian
+  posterior and EI in raw objective units: its display limits do not bound its
+  model or acquisition. Original measurements and raw responses are retained.
 - **Initial random points**: real starting experiments, usually `1` or `2`,
   capped at `3`.
 - **BO iterations**: number of sequential model-selected experiments.
@@ -302,9 +303,11 @@ suggestions are cleared so they are not mistaken for suggestions from the new
 configuration.
 
 **Objective lower/upper bound** fields describe physical limits in original units.
-Shared bounds affect model/acquisition behavior, valid prediction samples and
-inverse targets; they are not merely plot limits. Out-of-bounds manual targets
-are errors. Raw responses and original measurement provenance are retained.
+The shared structured GP uses a bounded transform; LLM predictions are filtered
+against the limits and inverse targets respect them. Out-of-bounds manual LLM
+targets are errors. The embedding-GP baseline keeps an ordinary Gaussian posterior
+and EI in raw objective units; configured display limits do not bound either.
+Raw responses and original measurement provenance are retained.
 Generic shared objectives may remain unbounded; a percentage-like name alone
 does not assign MoC bounds or chemistry.
 

@@ -128,6 +128,98 @@ def active_records(data):
     ]
 
 
+def latest_physical_records(data):
+    """Latest ledger record per physical experiment; never consult the archive."""
+    replaced = {row.get("supersedes") for row in data["observations"]}
+    latest = {}
+    for row in data["observations"]:
+        if (
+            row.get("record_status") != "measured"
+            or row.get("observation_id") in replaced
+        ):
+            continue
+        physical = row.get("physical_measurement_id") or row.get("observation_id")
+        if not physical:
+            raise ValueError("Physical measurement identity is required")
+        if physical in latest:
+            raise ValueError("Multiple latest records for one physical measurement")
+        latest[physical] = row
+    return list(latest.values())
+
+
+def definition_exclusion(row):
+    """Recognize this service's current or legacy definition-only exclusion."""
+    exclusion = row.get("training_exclusion")
+    if not isinstance(exclusion, dict) or exclusion.get("schema_version") != 1:
+        return False
+    source = exclusion.get("source")
+    if source is not None and source != "measurement_definition_revision":
+        return False
+    legacy_fields = {"schema_version", "reason", "at", "measurement_definition"}
+    if source is None and set(exclusion) != legacy_fields:
+        return False
+    signature = exclusion.get("measurement_definition")
+    return (
+        isinstance(signature, list)
+        and len(signature) == 3
+        and signature[0] in METHODS - {"historical_unspecified"}
+        and isinstance(exclusion.get("reason"), str)
+        and bool(exclusion["reason"].strip())
+        and isinstance(exclusion.get("at"), str)
+    )
+
+
+def effective_initial_cohort(data):
+    """Comparable initial model inputs, independent of later acquired outcomes."""
+    initial = data.get("initial_observations")
+    if initial is None:
+        initial = [
+            row
+            for row in data["observations"]
+            if row.get("is_seed") and not row.get("supersedes")
+        ]
+    physical_ids = {
+        row.get("physical_measurement_id") or row.get("observation_id")
+        for row in initial
+    }
+    objective = data["config"].get("objective", "moc_wt_pct")
+    cohort = []
+    for row in latest_physical_records(data):
+        physical = row.get("physical_measurement_id") or row.get("observation_id")
+        if physical not in physical_ids or not row.get("training_included", True):
+            continue
+        cohort.append(
+            {
+                "physical_measurement_id": physical,
+                "candidate_id": row["candidate_id"],
+                "refinement_version": row.get("refinement_version"),
+                "value": row.get(objective, row.get("value", row.get("moc_wt_pct"))),
+                "uncertainty": row.get(
+                    objective + "_sigma",
+                    row.get(
+                        "objective_sigma",
+                        row.get("uncertainty", row.get("moc_wt_pct_sigma")),
+                    ),
+                ),
+                "gof": row.get("gof"),
+                "closure_gap": row.get("closure_gap", row.get("closure_gap_wt_pct")),
+                "quantification": definition_signature(row),
+                "phase_context": {
+                    key: row.get(key)
+                    for key in (
+                        "mo_wt_pct",
+                        "mo2c_wt_pct",
+                        "moo2_wt_pct",
+                        "mo_wt_pct_sigma",
+                        "mo2c_wt_pct_sigma",
+                        "moo2_wt_pct_sigma",
+                    )
+                },
+            }
+        )
+    return sorted(cohort, key=lambda row: row["physical_measurement_id"])
+
+
 def validate_training_definitions(data):
     records = active_records(data)
     signatures = {definition_signature(row) for row in records}

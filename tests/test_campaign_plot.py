@@ -288,7 +288,8 @@ def test_undeclared_campaigns_do_not_compare_different_reported_explicit_bases()
                 "normalization": "all phases",
             }
     assert comparison_compatibility(main, other)["mismatches"] == [
-        "measurement_definition"
+        "measurement_definition",
+        "effective_initialization",
     ]
 
 
@@ -328,3 +329,79 @@ def test_ambiguous_active_refinement_is_rejected():
     data["observations"].append(deepcopy(data["observations"][0]))
     with pytest.raises(ValueError, match="Multiple active refinements"):
         measured_points(data)
+
+
+@pytest.mark.parametrize("direction", ["maximize", "minimize"])
+def test_excluded_experiments_keep_effort_positions_and_pending_offset(direction):
+    data = campaign()
+    data["config"]["direction"] = direction
+    excluded = measurement("3", 99 if direction == "maximize" else -99)
+    excluded.update(
+        training_included=False,
+        training_exclusion={"reason": "Different reported measurement definition"},
+    )
+    data["observations"].extend([excluded, measurement("4", 50)])
+    data["suggestions"] = [
+        dict(status="pending", candidate_id="5", prediction={"mean": 60, "std": 1})
+    ]
+    payload = plot_payload(data)
+    assert payload["plot_counts"]["new_completed"] == 2
+    assert payload["plot_counts"]["excluded_from_training"] == 1
+    assert payload["live_observation_points"][-1]["index"] == 5
+    assert payload["live_observation_points"][-1]["axis_label"] == "2"
+    assert payload["best_trace"][-1]["best"] == (
+        83.8 if direction == "maximize" else 23.4
+    )
+    gap = payload["excluded_measurement_points"][0]
+    assert gap["index"] == 4 and gap["axis_label"] == "1"
+    assert "value" not in gap
+    pending = payload["benchmark_runs"][0]["prediction_summary"][0]
+    assert pending["index"] == 6 and pending["axis_label"] == "3"
+    # The most recent physical result can itself be excluded without shrinking the axis.
+    data["observations"][-1]["training_included"] = False
+    payload = plot_payload(data)
+    assert payload["plot_x_axis"]["labels"][-1]["label"] == "3"
+    assert payload["plot_counts"]["new_completed"] == 2
+
+
+def test_excluded_initialization_comparison_and_random_effort_use_full_ledger():
+    main, other, random = campaign(), campaign("other"), campaign("random")
+    for data in (main, other, random):
+        for row in data["observations"]:
+            row["training_included"] = False
+    random["config"]["selection_policy"] = "random_control"
+    for data in (other, random):
+        data["observations"].extend(
+            [dict(measurement("3", 99), training_included=False), measurement("4", 50)]
+        )
+    payload = plot_payload(main, comparisons=[other], random_campaign=random)
+    assert payload["plot_counts"]["initialization"] == 3
+    assert payload["plot_x_axis"]["initialization_end"] == 3.5
+    assert len(payload["excluded_measurement_points"]) == 3
+    comparison = payload["benchmark_runs"][0]
+    assert comparison["completed_count"] == 2
+    assert comparison["summary"][-1]["index"] == 5
+    assert comparison["summary"][-1]["axis_label"] == "2"
+    assert payload["live_random_walk"]["completed_count"] == 2
+    assert payload["live_random_walk_trace"][-1]["index"] == 5
+    assert payload["live_random_walk_trace"][-1]["best"] == 50
+
+
+def test_refining_excluded_result_retains_position_without_extra_effort():
+    data = campaign()
+    original = measurement("3", 99)
+    original.update(record_status="superseded_refinement", training_included=False)
+    replacement = deepcopy(original)
+    replacement.update(
+        observation_id="refined-excluded", record_status="measured", moc_wt_pct=98
+    )
+    data["observations"].extend([original, measurement("4", 50), replacement])
+    data["archive"] = [measurement("7", 100)]
+    payload = plot_payload(data)
+    assert payload["plot_counts"]["new_completed"] == 2
+    assert payload["excluded_measurement_points"][0]["index"] == 4
+    assert (
+        payload["excluded_measurement_points"][0]["observation_id"]
+        == "refined-excluded"
+    )
+    assert payload["live_observation_points"][-1]["index"] == 5

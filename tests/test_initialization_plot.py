@@ -213,3 +213,56 @@ def test_legacy_plot_without_initialization_metadata_keeps_regular_axis(render_s
     assert len(circles) == 2
     assert float(circles[0].attrib["cx"]) < float(circles[1].attrib["cx"])
     assert not any((node.text or "").startswith("i1") for node in svg.iter("text"))
+
+
+def test_excluded_measurement_is_a_marked_gap_and_later_step_is_not_renumbered(
+    render_svg,
+):
+    data = shared_campaign(pending=True)
+    data["observations"][-1].update(
+        training_included=False,
+        training_exclusion={"reason": "Incompatible quantification"},
+    )
+    later = deepcopy(data["observations"][-1])
+    later.update(
+        candidate_id="4",
+        observation_id="later",
+        physical_measurement_id="later",
+        training_included=True,
+        moc_wt_pct=80,
+    )
+    data["observations"].append(later)
+    payload = plot_payload(data)
+    svg = render_svg(payload)
+    gaps = [
+        node
+        for node in svg.iter("path")
+        if "data-excluded-measurement-index" in node.attrib
+    ]
+    assert len(gaps) == 1
+    assert gaps[0].attrib["data-excluded-measurement-index"] == "4"
+    assert gaps[0].attrib["data-axis-label"] == "1"
+    assert "outcome not plotted" in title(gaps[0])
+    assert "Incompatible quantification" in title(gaps[0])
+    circles = measured_circles(svg)
+    assert not any("recipe 3" in title(node) for node in circles)
+    second = next(node for node in circles if "recipe 4" in title(node))
+    assert second.attrib["data-axis-label"] == "2"
+    assert float(second.attrib["cx"]) == pytest.approx(ticks(svg)["2"], abs=0.1)
+    assert payload["plot_counts"]["new_completed"] == 2
+
+
+def test_all_excluded_initialization_still_renders_occupied_positions(render_svg):
+    data = shared_campaign(new_measurement=False, pending=False)
+    data["config"]["bounds"] = [None, None]
+    for row in data["observations"]:
+        row["training_included"] = False
+    svg = render_svg(plot_payload(data))
+    assert not measured_circles(svg)
+    assert [
+        node.attrib["data-axis-label"]
+        for node in svg.iter("path")
+        if "data-excluded-measurement-index" in node.attrib
+    ] == ["i1", "i2", "i3"]
+    assert {"i1", "i2", "i3"}.issubset(ticks(svg))
+    by_marker(svg, "initialization-divider")

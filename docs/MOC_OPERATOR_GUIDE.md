@@ -41,9 +41,13 @@ Under **Advanced BO-ICL sampling → Inverse target and standalone proposal coun
 
 Open **Preview full LLM request (no model calls)**, choose the role and current saved settings or a recorded suggestion, and press **Preview request**. Use **Find candidates** to select a forward procedure. The response includes effective model, settings, system/user messages and selected observed examples when they can be resolved without generating embeddings. Missing cached selector inputs and an unknown future shortlist are reported as unresolved; preview does not guess an exact request. Recorded requests retain the prompts and parameters actually used, even after settings change. Preview makes no provider calls and does not reserve or change campaign history.
 
+Choose **Next BO inverse request** to preview the next ordinary BO step's single inverse completion. **Standalone inverse proposal** uses the separate saved proposal count and sequence. Their automatic target draws can differ. Recorded requests always show the original request, regardless of later settings.
+
 ## Optional embedding GP and eight-observation history
 
 **Embedding GP baseline** is separate from the synthesis-parameter GP. It uses bare procedures, `text-embedding-ada-002`, a fixed full-corpus Isomap projection (32 dimensions, five neighbors by default), and learned homoskedastic noise. It needs embeddings when missing but no chat or inverse calls. Projection construction over the full grid is more expensive than the structured GP; small/disconnected spaces disclose deterministic adjustments.
+
+Bounds have method-specific effects. The synthesis-parameter GP uses its bounded transform and posterior; LLM accepted samples and inverse targets respect the configured limits. The embedding GP retains an ordinary Gaussian posterior and EI in raw objective units. Its configured display limits do not bound its posterior or acquisition, and Gaussian predictions may extend beyond physical limits.
 
 **Eight-observation LLM history** is a separate initialization, containing the confirmed three seeds plus five historical outcomes. It is not the matched three-seed comparison. Unknown closure metadata remains unknown; selecting a method that requires it produces an explicit validation error until a justified metadata policy is supplied.
 
@@ -65,6 +69,8 @@ Under **Measurement quality and source** (focused: **Measurement quality**), rec
 
 Use **Measurement definition and historical training → Record definition decision** to declare a documented definition. Choose whether unknown historical records are excluded from model training or retained with a scientific justification, and give the reason. Explicit incompatible definitions are excluded from training rather than silently mixed; measurements remain visible with that status and retain their original values. Comparison compatibility also includes measurement definitions. This software decision records an operator's scientific judgment; it does not perform re-refinement or establish publication validity.
 
+**Unknown historical records** shows the saved policy after reload, campaign switching or a successful decision. **Unresolved — choose a policy** means no retention/exclusion decision is saved yet. Polling preserves a policy or reason being edited; submitting the decision is what changes the saved policy. Check the status record before revising an existing decision.
+
 For a documented refinement, load the observation's existing quality fields before editing. In the focused view use **Load observation into measurement fields**, then **Save refinement revision** with a reason. Prior provenance remains in history; never relabel unknown historical quantification merely to make a new method compatible.
 
 The MoC preset retains its historical `moc_wt_pct` objective name and wt% display.
@@ -85,6 +91,8 @@ See [the defaults audit](MOC_DEFAULTS_AUDIT.md) for the effective crystal settin
 ## Read the graph and collect an independent control
 
 The original toolkit graph displays shared campaigns. Initialization measurements have separate consecutive positions labeled i1, i2, i3, … in their supplied order, within a shaded initialization region. A divider separates them from BO steps 1, 2, … for completed new physical experiments. Initialization is not BO-selected and does not consume the new-measurement budget. Re-refinement updates the same experiment rather than adding a position. Measured values and their best-so-far curve are separate from prediction markers and intervals. A pending prediction never raises the measured incumbent. Sparse live campaigns have no invented full-pool statistics or hidden-label random expectation.
+
+Graph positions and completed counts follow physical experiments, including measurements later excluded from training. An excluded measurement is a grey cross at the bottom of the graph; its incompatible outcome is not plotted and does not enter the compatible best-so-far curve. Its original position remains occupied, so later experiments keep their numbers. Excluded initialization keeps its i-position, and pending, comparison and random-control positions use the same physical-effort accounting.
 
 Compatible saved campaigns appear as comparison traces when their pool, initialization, objective, units, bounds, direction, repeat policy, seed, budget, and measurement definition agree. Each is an independent history. Arms can have different numbers of completed measurements and remain comparable as results arrive. A single arm's posterior interval is not a variation band across replicate campaigns. Changing comparison settings can make an arm ineligible for the overlay without deleting it.
 
