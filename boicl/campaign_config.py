@@ -1,6 +1,7 @@
 """Versioned, validated configuration shared by MoC library, browser and CLI."""
 from copy import deepcopy
 import math
+import re
 from .measurement_quality import default_definition, resolve_definition
 
 SCHEMA_VERSION = 1
@@ -10,6 +11,16 @@ ENGINE_LABELS = {
     "gpr_embeddings": "GP: text embeddings",
 }
 PRESETS = {
+    "moc_five_gp": (
+        "MoC five-point comparison — six-variable GP",
+        "gpr_features",
+        "confirmed_three",
+    ),
+    "moc_five_llm": (
+        "MoC five-point comparison — BO-ICL LLM",
+        "llm",
+        "confirmed_three",
+    ),
     "moc_gp": (
         "MoC 810c3f7 — structured GP continuation",
         "gpr_features",
@@ -31,6 +42,81 @@ PRESETS = {
     "generic_embedding_gp": ("Text-embedding GP", "gpr_embeddings", "user_mapped"),
 }
 
+PRESET_VERSIONS = {preset: "1.0.0" for preset in PRESETS}
+STUDY_SETTINGS = {
+    "moc_five_gp": {
+        "new_measurement_budget": 5,
+        "auto_suggest": False,
+        "structured_gp": {"ei_after_unique_measured_designs": 3},
+    },
+    "moc_five_llm": {"new_measurement_budget": 5, "auto_suggest": False},
+}
+
+# Reusable numerical/model defaults contain no MoC objective, bounds or seed data.
+ENGINE_DEFAULTS = {
+    "llm": dict(
+        forward_model="gpt-4o",
+        inverse_model="gpt-4o",
+        forward_temperature=0.7,
+        inverse_temperature=0.7,
+        forward_max_tokens=256,
+        inverse_max_tokens=576,
+        n_samples=5,
+        min_samples=2,
+        inverse_n=1,
+        inverse_proposal_count=1,
+        manual_inverse_target=None,
+        uncertainty_scalar=1.0,
+        selector_k=5,
+        selector_mode="nearest",
+        shortlist_size=16,
+        fetch_k=100,
+        mmr_lambda=0.5,
+        embedding_model="text-embedding-3-large",
+        selector_embedding_model="text-embedding-3-large",
+        seed=616,
+        acquisition="expected_improvement",
+        xi=0.0,
+        maximize=True,
+        objective_bounds=None,
+        inverse_multiplier=1.2,
+        inverse_jitter=0.05,
+        reference_scale=1.0,
+        target_floor=None,
+        ucb_lambda=0.5,
+        random_addons=0,
+        target_ceiling=None,
+        forward_system_message=None,
+        inverse_system_message=None,
+        include_phase_context=False,
+    ),
+    "structured_gp": dict(
+        burn_in=1000,
+        retained_draws=4000,
+        predict_thin=20,
+        proposal_step=0.3,
+        seed=616,
+        gof_power=1.0,
+        sigma_floor_pp=0.5,
+        logit_delta_pp=0.65,
+        ei_after_unique_measured_designs=2,
+        ei_xi_standardized_logit=0.01,
+        missing_metadata_policy="error",
+        metadata_fallbacks={},
+        chunk_size=512,
+        quadrature_nodes=96,
+        feature_spec=[],
+        noise_policy="reported_or_fixed",
+        default_observation_sigma=1.0,
+    ),
+    "embedding_gp": dict(
+        embedding_model="text-embedding-ada-002",
+        dimensions=32,
+        neighbors=5,
+        seed=616,
+    ),
+}
+
 
 def resolve_config(preset="moc_llm", overrides=None):
     if preset not in PRESETS:
@@ -41,6 +127,13 @@ def resolve_config(preset="moc_llm", overrides=None):
         schema_version=SCHEMA_VERSION,
         profile_version="moc-corrected-v1",
         preset=preset,
+        preset_version=PRESET_VERSIONS[preset],
+        preset_provenance=dict(
+            preset_id=preset,
+            version=PRESET_VERSIONS[preset],
+            display_name=name,
+            origin="builtin",
+        ),
         name=name,
         engine=engine,
         initialization=initialization,
@@ -61,68 +154,21 @@ def resolve_config(preset="moc_llm", overrides=None):
         auto_suggest=True,
         measurement_definition=default_definition(),
         api=dict(maximum_attempts=8, request_spacing_s=0.5, base_cooldown_s=10.0),
-        llm=dict(
-            forward_model="gpt-4o",
-            inverse_model="gpt-4o",
-            forward_temperature=0.7,
-            inverse_temperature=0.7,
-            forward_max_tokens=256,
-            inverse_max_tokens=576,
-            n_samples=5,
-            min_samples=2,
-            inverse_n=1,
-            inverse_proposal_count=1,
-            manual_inverse_target=None,
-            uncertainty_scalar=1.0,
-            selector_k=5,
-            selector_mode="nearest",
-            shortlist_size=16,
-            fetch_k=100,
-            mmr_lambda=0.5,
-            embedding_model="text-embedding-3-large",
-            selector_embedding_model="text-embedding-3-large",
-            seed=616,
-            acquisition="expected_improvement",
-            xi=0.0,
-            maximize=True,
-            objective_bounds=[0.0, 100.0],
-            inverse_multiplier=1.2,
-            inverse_jitter=0.05,
-            reference_scale=100.0,
-            target_floor=None,
-            ucb_lambda=0.5,
-            random_addons=0,
-            target_ceiling=None,
-            forward_system_message=None,
-            inverse_system_message=None,
+        llm=deepcopy(ENGINE_DEFAULTS["llm"]),
+        structured_gp=deepcopy(ENGINE_DEFAULTS["structured_gp"]),
+        embedding_gp=deepcopy(ENGINE_DEFAULTS["embedding_gp"]),
+    )
+    if not generic:
+        result["llm"].update(
             include_phase_context=True,
-        ),
-        structured_gp=dict(
-            burn_in=1000,
-            retained_draws=4000,
-            predict_thin=20,
-            proposal_step=0.3,
-            seed=616,
-            gof_power=1.0,
-            sigma_floor_pp=0.5,
-            logit_delta_pp=0.65,
-            ei_after_unique_measured_designs=10,
-            ei_xi_standardized_logit=0.01,
-            missing_metadata_policy="error",
-            metadata_fallbacks={},
-            chunk_size=512,
-            quadrature_nodes=96,
+            reference_scale=100.0,
+            objective_bounds=[0.0, 100.0],
+        )
+        result["structured_gp"].update(
             feature_spec=None,
             noise_policy="moc_quality",
-            default_observation_sigma=1.0,
-        ),
-        embedding_gp=dict(
-            embedding_model="text-embedding-ada-002",
-            dimensions=32,
-            neighbors=5,
-            seed=616,
-        ),
-    )
+            ei_after_unique_measured_designs=10,
+        )
     if generic:
         result.update(
             profile_version="generic-shared-v1",
@@ -137,8 +183,21 @@ def resolve_config(preset="moc_llm", overrides=None):
             ei_after_unique_measured_designs=2,
         )
         result["llm"].update(include_phase_context=False, reference_scale=1.0)
+    for key, value in STUDY_SETTINGS.get(preset, {}).items():
+        if isinstance(value, dict):
+            result[key].update(deepcopy(value))
+        else:
+            result[key] = deepcopy(value)
     if overrides is not None and not isinstance(overrides, dict):
         raise ValueError("Configuration overrides must be an object")
+    if overrides and "schema_version" in overrides and "preset" in overrides:
+        # Older complete saved configurations have no identifiable factory version.
+        # Preserve their effective settings without claiming the current preset.
+        if "preset_version" not in overrides:
+            result["preset_version"] = "legacy-unversioned"
+            result["preset_provenance"].update(
+                version="legacy-unversioned", origin="legacy_saved_configuration"
+            )
     if overrides:
         unknown = set(overrides) - set(result)
         if unknown:
@@ -169,6 +228,20 @@ def resolve_config(preset="moc_llm", overrides=None):
         raise ValueError(
             "Preset and profile version must match the resolved configuration"
         )
+    version = result["preset_version"]
+    provenance = result["preset_provenance"]
+    if (
+        not isinstance(version, str)
+        or not (
+            re.fullmatch(r"\d+\.\d+\.\d+", version) or version == "legacy-unversioned"
+        )
+        or provenance["preset_id"] != preset
+        or provenance["version"] != version
+        or provenance["origin"] not in {"builtin", "legacy_saved_configuration"}
+        or not isinstance(provenance["display_name"], str)
+        or not provenance["display_name"].strip()
+    ):
+        raise ValueError("Invalid saved preset provenance or version")
     if result["initialization"] not in (
         {"user_mapped"} if generic else {"confirmed_three", "eight_observations"}
     ):
@@ -413,6 +486,37 @@ def resolve_config(preset="moc_llm", overrides=None):
     ):
         raise ValueError("Embedding model must be nonempty text")
     return result
+
+
+def preset_catalog():
+    """Read-only built-in choices; saved campaigns retain their own version/settings."""
+    return [
+        {
+            "preset": preset,
+            "name": name,
+            "version": PRESET_VERSIONS[preset],
+            "engine": engine,
+            "data_schema": "generic" if preset.startswith("generic_") else "moc",
+            "description": "Three confirmed seeds; five new physical syntheses per arm"
+            if preset.startswith("moc_five_")
+            else "Reusable mapped-dataset engine"
+            if preset.startswith("generic_")
+            else "Source-compatible MoC continuation",
+        }
+        for preset, (name, engine, _) in PRESETS.items()
+    ]
+
+
+def preview_preset(preset, overrides=None):
+    """Resolve a complete fresh configuration without a campaign or model request."""
+    config = resolve_config(preset, overrides)
+    return {
+        "preset": preset,
+        "name": config["preset_provenance"]["display_name"],
+        "version": config["preset_version"],
+        "config": config,
+        "provenance": deepcopy(config["preset_provenance"]),
+    }
 
 
 def migrate_legacy_settings(config):

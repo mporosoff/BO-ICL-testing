@@ -59,3 +59,38 @@ The existing MoC GP keeps the six numeric synthesis variables and exact transfor
 The confirmed initial values 72.1, 83.8 and 23.4 are not changed, relabeled or renormalized. Confirmation of a value does not resolve its historical quantification method. Unknown methods remain explicitly unspecified until supported documentation and an operator decision are recorded. Incompatible explicit definitions cannot be silently combined for model training or comparison; excluded records remain in history. No re-refinement, mass/area-fraction equivalence, or publication validation is implied.
 
 Validation uses offline fixtures and mocks. Live paid provider access and laboratory/scientific validation remain unverified. Both views must expose these controls through the same campaign service, persistence and graph pipeline; a parallel replacement app is outside this correction scope.
+
+## Built-in five-point comparison presets — 21 September 2026
+
+The latest request adds versioned five-point study presets to the shared toolkit.
+It preserves the verified 0.3.2 provenance, inclusion, comparison, graph and
+request-preview repairs. Manuscript consistency corrections and historical
+measurements are outside this implementation and are not reopened.
+
+Provide **MoC five-point comparison — six-variable GP** and **MoC five-point
+comparison — BO-ICL LLM**, plus a matched-pair action. Both initialize the same
+7,776 recipes and confirmed three seeds, allow five new physical syntheses per
+arm, use batch size one, and start with automatic suggestions disabled. The GP
+study preset switches to EI at three distinct measured designs. Preserve its
+source kernel, six transforms, noise policy, production sampler and transformed
+EI with xi 0.01. The source-compatible continuation preset retains threshold ten.
+Cooling remains a fixed laboratory step of approximately four hours, not an
+additional synthesis feature.
+
+Factory preset identity/version and complete effective settings must be visible
+before creation and persisted in campaigns, exports and checkpoints. Loading a
+saved campaign preserves its settings and deliberate overrides. Future factory
+updates do not migrate saved settings; applying/resetting a preset is explicit
+and preserves the physical measurement ledger. Generic workflows retain their
+dataset mappings, objectives, directions, units, bounds and custom prompts.
+
+Comparison metadata describes the actual saved settings and acquisition units,
+separately from a preserved creation snapshot. Focused-view background polling
+must preserve all unsaved method/settings drafts and reject stale responses.
+
+Readiness checks inspect exact-input vector identity and cache coverage without
+provider calls. Resume an intended live comparison pair if present; otherwise
+prepare one pair. No paid embedding generation, model request or experiment
+reservation starts until the operator deliberately starts it. Historical
+measurement definitions remain unspecified; only an operator can document a
+scientific compatibility decision using the existing measurement-quality controls.

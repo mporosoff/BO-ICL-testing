@@ -774,8 +774,13 @@ def test_focused_campaign_switch_discards_another_arms_preview_and_drafts(tmp_pa
     load_source = re.search(
         r"async function load\(\).*?(?=\nfunction render\()", MOC_HTML, re.S
     ).group()
+    invalidate_source = next(
+        line
+        for line in MOC_HTML.splitlines()
+        if line.startswith("function invalidateSettingsPreview()")
+    )
     source = tmp_path / "focused-load.js"
-    source.write_text(load_source, encoding="utf-8")
+    source.write_text(load_source + "\n" + invalidate_source, encoding="utf-8")
     script = r"""
 const fs=require('fs'),vm=require('vm'),assert=require('assert');
 const elements=new Map();
@@ -783,7 +788,7 @@ const element=id=>{if(!elements.has(id))elements.set(id,{value:'A draft',textCon
 const context={$:element,localStorage:{setItem(){}},history:{replaceState(){}},
  api:async()=>({campaign_id:'B'}),render(){},fillQualityValues(){}};
 vm.createContext(context);
-vm.runInContext("let current='B', state=null, settings={engine:'llm'}, settingsCampaign='A';"+fs.readFileSync(process.argv[1],'utf8'),context);
+vm.runInContext("let current='B', state=null, settings={engine:'llm'}, settingsCampaign='A', settingsSnapshot='A preview', settingsPreset='moc_llm', settingsReviewSequence=0, campaignEpoch=1, loadSequence=0;"+fs.readFileSync(process.argv[1],'utf8'),context);
 (async()=>{
  await context.load();
  assert.equal(vm.runInContext('settings',context),null);

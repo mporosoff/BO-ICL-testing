@@ -3,13 +3,28 @@
 Use `run_boicl_local.bat` on Windows to start a local browser app for BO-ICL
 experiments.
 
-The landing page is the main toolkit. **Load preset** creates a new shared
+The landing page is the main toolkit. **Built-in presets → Create campaign from preset** creates a new shared
 campaign; **Load Selected** resumes an existing one. The **Focused campaign view**
 opens the same MoC campaign ID, records and graph. Load the matched LLM or
 structured-GP preset, or create their paired campaigns. Both start with M7=72.1,
 M12=83.8, and M13=23.4 wt%, use 7,776 canonical designs, and initially have
 7,773 eligible designs. The five archived BO measurements remain documented;
 the source-reset policy permits their recipes as marked quality repeats.
+
+For this study, choose **MoC five-point comparison — six-variable GP** or
+**MoC five-point comparison — BO-ICL LLM**, both v1.0.0. **Review matched GP + LLM
+pair → Create reviewed matched pair** prepares both independent arms with five
+new syntheses each and automatic suggestions off. Review **Effective preset
+settings and provenance** before creation. The GP study threshold is three, so
+its first new selection uses transformed-space EI. The source-compatible GP
+continuation preset keeps its original threshold ten. The study does not impose
+its five-measurement budget or chemistry on generic datasets.
+
+Saved settings, deliberate overrides and preset provenance persist. Factory
+updates do not modify saved campaigns. An intentional reset is available under
+**Preset action → Apply/reset current shared campaign**; preview it before
+**Apply reviewed preset (preserve history)**. See [the five-point study guide](docs/MOC_FIVE_POINT_STUDY.md)
+for exact settings and cache/measurement readiness.
 
 Structured GP uses six synthesis parameters and requires no model API key.
 The LLM preset requests five GPT-4o predictions per shortlisted candidate,

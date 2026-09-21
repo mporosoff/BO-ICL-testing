@@ -6,6 +6,10 @@ let featureUpload = null;
 let refinementId = null;
 let sharedConfigDirty = false;
 let sharedStateEpoch = 0;
+let mainPresetPreview = null;
+let mainPresetPreviewEpoch = 0;
+let mainPresetCatalogLoaded = false;
+let mainPresetSubmitting = false;
 const graphOnly = location.pathname === "/campaign-graph";
 const quantificationFields = [
   "quantification_method",
@@ -72,6 +76,149 @@ async function toolkitFetch(path, body, method = "POST") {
   if (!response.ok) throw Error(payload.error || "Request failed");
   return payload;
 }
+function mainPresetIdentity() {
+  const action = $("presetAction").value;
+  return JSON.stringify([
+    action,
+    action === "pair" ? null : $("mocPreset").value,
+    action === "apply" ? sharedCampaignId : null,
+  ]);
+}
+function syncMainPresetActionState() {
+  const preview = mainPresetPreview;
+  $("loadMocPreset").disabled =
+    mainPresetSubmitting ||
+    (typeof busy !== "undefined" && busy) ||
+    !preview ||
+    preview.identity !== mainPresetIdentity() ||
+    (preview.action === "create" &&
+      preview.previews[0].config.data_schema === "generic");
+}
+async function previewMainPreset() {
+  const identity = mainPresetIdentity();
+  const epoch = ++mainPresetPreviewEpoch;
+  const action = $("presetAction").value;
+  const preset = $("mocPreset").value;
+  const campaign = sharedCampaignId;
+  mainPresetPreview = null;
+  $("loadMocPreset").disabled = true;
+  $("presetPreviewSummary").textContent =
+    "Validating complete preset settings…";
+  try {
+    if (action === "apply" && !campaign)
+      throw Error("Load a shared campaign before reviewing a preset reset.");
+    const presets =
+      action === "pair" ? ["moc_five_gp", "moc_five_llm"] : [preset];
+    const previews = await Promise.all(
+      presets.map((selected) =>
+        toolkitFetch("/api/moc/preset-preview", {
+          preset: selected,
+          ...(action === "apply" ? { id: campaign } : {}),
+        }),
+      ),
+    );
+    if (epoch !== mainPresetPreviewEpoch || identity !== mainPresetIdentity())
+      return;
+    mainPresetPreview = { identity, action, preset, campaign, previews };
+    $("presetPreviewSummary").textContent = previews
+      .map(
+        (p) =>
+          `${p.name} · v${p.version} · new-measurement budget ${p.config.new_measurement_budget ?? "unlimited"}`,
+      )
+      .join(" | ");
+    $("presetPreviewConfig").textContent = JSON.stringify(
+      action === "pair" ? previews : previews[0],
+      null,
+      2,
+    );
+    const needsMappedData =
+      action === "create" && previews[0].config.data_schema === "generic";
+    if (needsMappedData)
+      $("presetPreviewSummary").textContent +=
+        ". For a new generic campaign, map your dataset below first; this preset can then be applied explicitly.";
+    $("loadMocPreset").textContent =
+      action === "apply"
+        ? "Apply reviewed preset (preserve history)"
+        : action === "pair"
+          ? "Create reviewed matched pair"
+          : "Create campaign from preset";
+    syncMainPresetActionState();
+  } catch (error) {
+    if (epoch === mainPresetPreviewEpoch && identity === mainPresetIdentity()) {
+      $("presetPreviewSummary").textContent = error.message;
+      $("presetPreviewConfig").textContent = "";
+    }
+  }
+}
+async function loadMainPresetCatalog() {
+  const result = await toolkitFetch("/api/moc/presets", null, "GET");
+  const selected = $("mocPreset").value;
+  $("mocPreset").innerHTML = result.presets
+    .map(
+      (p) =>
+        `<option value="${escapeHtml(p.preset)}">${escapeHtml(p.name)} · v${escapeHtml(p.version)}</option>`,
+    )
+    .join("");
+  $("mocPreset").value = result.presets.some((p) => p.preset === selected)
+    ? selected
+    : "moc_five_gp";
+  mainPresetCatalogLoaded = true;
+  await previewMainPreset();
+}
+async function loadMainPreset() {
+  if (mainPresetSubmitting || (typeof busy !== "undefined" && busy)) return;
+  const preview = mainPresetPreview;
+  if (!preview || preview.identity !== mainPresetIdentity()) {
+    await previewMainPreset();
+    return;
+  }
+  if (
+    preview.action === "create" &&
+    preview.previews[0].config.data_schema === "generic"
+  )
+    return;
+  const requestedCampaign = sharedCampaignId;
+  let destinationCampaign = requestedCampaign;
+  try {
+    mainPresetSubmitting = true;
+    setBusy(true);
+    const result = await toolkitFetch(
+      "/api/moc/" +
+        (preview.action === "pair"
+          ? "pair"
+          : preview.action === "apply"
+            ? "preset-apply"
+            : "create"),
+      preview.action === "pair"
+        ? { study: "five_point" }
+        : preview.action === "apply"
+          ? { id: preview.campaign, preset: preview.preset }
+          : { preset: preview.preset },
+    );
+    if (requestedCampaign !== sharedCampaignId) return;
+    sharedConfigDirty = false;
+    destinationCampaign =
+      preview.action === "pair"
+        ? result.gp
+        : preview.action === "apply"
+          ? preview.campaign
+          : result.campaign_id;
+    await chooseSharedCampaign(destinationCampaign);
+    if (destinationCampaign !== sharedCampaignId) return;
+    mainPresetPreview = null;
+  } catch (error) {
+    renderError(error.message);
+  } finally {
+    mainPresetSubmitting = false;
+    setBusy(false);
+    if (
+      destinationCampaign === sharedCampaignId &&
+      state?.shared_campaign?.campaign_id === sharedCampaignId
+    )
+      renderShared();
+    syncMainPresetActionState();
+  }
+}
 async function chooseSharedCampaign(id) {
   if (!id) {
     localStorage.removeItem("boicl_shared_campaign_id");
@@ -120,6 +267,7 @@ async function chooseSharedCampaign(id) {
   }
   history.replaceState({}, "", url);
   await refresh();
+  if ($("presetAction").value === "apply") await previewMainPreset();
 }
 async function toolkitAction(action, extra = {}) {
   const requestedCampaign = sharedCampaignId;
@@ -256,6 +404,7 @@ async function toolkitRequest(path, options = {}) {
           burn_in: Number($("gpBurnIn").value),
           retained_draws: Number($("gpDraws").value),
           predict_thin: Number($("gpThin").value),
+          ei_after_unique_measured_designs: Number($("gpEIThreshold").value),
         };
       return await toolkitAction("config", { values: p });
     }
@@ -419,6 +568,7 @@ function renderSharedComparisons() {
 function renderShared() {
   const enabled = Boolean(state?.shared_campaign),
     config = state?.shared_config;
+  syncMainPresetActionState();
   $("sharedQuality").classList.toggle("hidden", !enabled);
   $("sharedPending").classList.toggle("hidden", !enabled);
   $("sharedGPSettings").classList.toggle(
@@ -433,6 +583,7 @@ function renderShared() {
   $("sharedComparisons").classList.toggle("hidden", !enabled);
   $("sharedCheckpoints").classList.toggle("hidden", !enabled);
   $("sharedCampaignIdentity").classList.toggle("hidden", !enabled);
+  $("savedPresetDetails").classList.toggle("hidden", !enabled);
   $("focusedView").href =
     "/moc" +
     (sharedCampaignId
@@ -448,6 +599,19 @@ function renderShared() {
     if (o.value === "gpr") o.hidden = enabled;
   });
   if (!enabled) return;
+  $("savedPresetSummary").textContent = config.preset_version
+    ? `Saved preset: ${config.preset_provenance?.display_name || config.preset} · v${config.preset_version}. Saved overrides are retained.`
+    : "Saved configuration: original unversioned settings are retained.";
+  $("savedPresetConfig").textContent = JSON.stringify(
+    {
+      preset: config.preset,
+      version: config.preset_version || null,
+      provenance: config.preset_provenance || null,
+      effective_config: config,
+    },
+    null,
+    2,
+  );
   $("sharedCampaignIdentity").textContent =
     "Active campaign: " + config.name + " · " + sharedCampaignId;
   $("engineStatus").textContent = state.shared_campaign.engine_label;
@@ -544,6 +708,8 @@ function renderShared() {
   $("gpBurnIn").value = config.structured_gp.burn_in;
   $("gpDraws").value = config.structured_gp.retained_draws;
   $("gpThin").value = config.structured_gp.predict_thin;
+  $("gpEIThreshold").value =
+    config.structured_gp.ei_after_unique_measured_designs;
   $("sharedSelectorMode").value = config.llm.selector_mode;
   $("predictionSystemMessage").placeholder =
     config.llm.forward_system_message === null
@@ -894,22 +1060,20 @@ document.addEventListener("DOMContentLoaded", () => {
     refinementId = null;
     renderShared();
   };
-  $("loadMocPreset").onclick = () => loadPreset(false);
-  $("loadMocPair").onclick = () => loadPreset(true);
-  async function loadPreset(pair) {
-    try {
-      setBusy(true);
-      const r = await toolkitFetch("/api/moc/" + (pair ? "pair" : "create"), {
-        preset: $("mocPreset").value,
-      });
-      await chooseSharedCampaign(pair ? r.gp : r.campaign_id);
-    } catch (e) {
-      renderError(e.message);
-    } finally {
-      setBusy(false);
-      if (state?.shared_campaign) renderShared();
-    }
-  }
+  $("loadMocPreset").onclick = loadMainPreset;
+  $("loadMocPair").onclick = () => {
+    $("presetAction").value = "pair";
+    return previewMainPreset();
+  };
+  $("mocPreset").onchange = () => {
+    if ($("presetAction").value === "pair") $("presetAction").value = "create";
+    return previewMainPreset();
+  };
+  $("presetAction").onchange = previewMainPreset;
+  $("builtinPresets").addEventListener("toggle", () => {
+    if ($("builtinPresets").open && !mainPresetCatalogLoaded)
+      loadMainPresetCatalog().catch((error) => renderError(error.message));
+  });
   $("embeddingModel").addEventListener("change", () => {
     $("embeddingModel").dataset.edited = "true";
   });

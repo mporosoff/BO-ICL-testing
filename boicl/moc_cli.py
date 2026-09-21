@@ -84,6 +84,12 @@ def main(argv=None):
     init = subs.add_parser("init")
     init.add_argument("--preset", default="moc_gp")
     init.add_argument("--pair", action="store_true")
+    init.add_argument(
+        "--study",
+        choices=("source", "five_point"),
+        default="source",
+        help="Matched-pair study; five_point requires --pair (default: source)",
+    )
     suggest = subs.add_parser("suggest")
     suggest.add_argument("campaign_id")
     snapshot = subs.add_parser("snapshot")
@@ -95,6 +101,8 @@ def main(argv=None):
     replay.add_argument("campaign_id")
     replay.add_argument("suggestion_id")
     args = parser.parse_args(argv)
+    if args.command == "init" and args.study != "source" and not args.pair:
+        parser.error("--study five_point requires --pair")
     if args.command == "demo":
         original = socket.socket.connect
 
@@ -109,11 +117,14 @@ def main(argv=None):
     else:
         svc = CampaignService(args.state_dir)
         if args.command == "init":
-            result = (
-                svc.create_pair()
-                if args.pair
-                else {"campaign_id": svc.create(args.preset)}
-            )
+            if args.pair:
+                result = (
+                    svc.create_pair(study="five_point")
+                    if args.study == "five_point"
+                    else svc.create_pair()
+                )
+            else:
+                result = {"campaign_id": svc.create(args.preset)}
         elif args.command == "suggest":
             svc.start_suggestion(args.campaign_id, background=False)
             result = svc.summary(args.campaign_id)

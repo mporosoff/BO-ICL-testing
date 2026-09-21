@@ -4,12 +4,21 @@ The local working checkout is `BO-ICL-work`. Launch `run_boicl_local.bat` to ope
 
 ## Start the matched campaigns
 
-1. In **Campaign**, open **Load a MoC continuation preset** and choose **Create matched GP + LLM pair**. The bundled implementation data preserves the exact 7,776 source procedures. Each press creates new campaigns; use **Saved campaigns → Load Selected** to resume an existing one.
+1. In **Campaign**, open **Built-in presets** and choose **Review matched GP + LLM pair**. Review both v1.0.0 five-point configurations under **Effective preset settings and provenance**, then press **Create reviewed matched pair**. The bundled data preserves the exact 7,776 source procedures. Creation makes new campaigns; use **Saved campaigns → Load Selected** to resume an existing one.
 2. The structured GP arm opens first. The independent arms share candidate IDs, confirmed initial refinements, objective, repeat policy, seed, and their initial budget. Later results are not copied between them. The paired manifest is saved alongside their state files.
-3. Before starting either arm, set **New-measurement budget (blank = unlimited)** in Settings and apply it. Use the same budget in both arms for a matched comparison. Zero is valid and prevents suggestions. Seeds do not consume the budget; reservations do. Main-view pair creation initially uses an unlimited budget. The focused view also permits setting the budget when creating the pair.
+3. The five-point presets save **New-measurement budget (blank = unlimited)** as five and automatic suggestions as off. Both arms therefore allow five new physical syntheses each, ten total. Seeds do not consume this budget; reservations do. Deliberate overrides remain possible through Settings and must agree across matched arms. Blank means unlimited and zero prevents suggestions. The source-compatible continuation presets retain their own unlimited default.
 4. Check three measured observations, zero pending, and 7,773 available. The seeds are M7=72.1, M12=83.8, and M13=23.4 wt%. Use **Update Suggestions** to start the selected arm intentionally; opening or resuming it does not start model work.
 
-To create one arm, select the relevant **MoC · …** preset and press **Load preset**. The focused view additionally accepts `MoC_handoff_inputs.xlsx`; its named importer reads `Design_space` and `Seed_observations`, not the first sheet. Use that importer for the MoC workbook rather than the generic feature mapper below.
+To create one study arm, select **MoC five-point comparison — six-variable GP** or **MoC five-point comparison — BO-ICL LLM**, review the complete configuration, and press **Create campaign from preset**. Each is version 1.0.0. The focused view additionally accepts `MoC_handoff_inputs.xlsx`; its named importer reads `Design_space` and `Seed_observations`, not the first sheet. Use that importer for the MoC workbook rather than the generic feature mapper below.
+
+**Saved preset** displays the campaign's saved version, provenance and effective settings, including overrides. Reloading or importing never reapplies today's factory defaults. For an intentional reset, choose **Preset action → Apply/reset current shared campaign**, review the preview and press **Apply reviewed preset (preserve history)**. The focused view provides **Explicitly apply or reset a preset**. Measurement history and compatible dataset/provenance decisions are preserved; an incompatible dataset or initialization swap requires a new campaign. See [the five-point study guide](MOC_FIVE_POINT_STUDY.md).
+
+In the focused view, background polling preserves unsaved targets, prompts,
+models and method controls. Use **Preview settings changes → Apply reviewed
+settings**, or **Discard settings draft**, before starting suggestions,
+standalone proposals or embedding actions. Clearing the manual target restores
+automatic targeting only after that explicit save. Switching campaigns loads
+the selected campaign's saved configuration.
 
 M12=83.8 was confirmed on 20 September 2026. Its older 81.7 refinement is superseded provenance, not a second experiment. The notebook's esd/GOF and explicit zero gap overrides are retained. M12's related phase fractions total 100.3%, so the accounting residual is −0.3 percentage points; that does not silently replace the source's gap override.
 
@@ -17,15 +26,15 @@ The five older BO measurements remain archived and excluded from matched-model t
 
 ## GP: synthesis parameters
 
-Choose the **MoC · structured GP** preset, or the shared campaign's **GP: synthesis parameters** engine, then **Update Suggestions** (**Start suggestion** in the focused view). This engine needs neither an API key nor text embeddings. It uses the six fixed synthesis features, full design-space scaling, Matérn 5/2 ARD, quality-dependent noise, and the source random-walk Metropolis sampler.
+Choose **MoC five-point comparison — six-variable GP**, or the source-compatible **MoC 810c3f7 — structured GP continuation** preset, then **Update Suggestions** (**Start suggestion** in the focused view). This engine needs neither an API key nor text embeddings. It uses the six fixed synthesis features, full design-space scaling, Matérn 5/2 ARD, quality-dependent noise, and the source random-walk Metropolis sampler. Cooling is a fixed laboratory step of approximately four hours, not an input feature.
 
-Before ten distinct measured designs it selects the largest minimum feature-space distance to observations. At three seeds the expected first recipe is 550 °C, ramp 5 °C/min, N2 at 100 sccm, hold 10 h, sucrose:AMT 2. This is a coverage choice, not a claim of highest yield. At ten designs it scores the full eligible space with bounded-posterior EI.
+The five-point study preset uses EI immediately from the three confirmed seeds. It retains xi 0.01 in standardized padded-logit units. **Structured GP advanced settings → Start EI after distinct measured designs** exposes the saved threshold. The source-compatible preset retains threshold ten: before ten distinct measured designs it selects the largest minimum feature-space distance to observations. For that source preset, the expected first recipe is 550 °C, ramp 5 °C/min, N2 at 100 sccm, hold 10 h, sucrose:AMT 2. This is a coverage choice, not a claim of highest yield. At its threshold it scores the full eligible space with bounded transformed-space EI.
 
 The displayed interval describes the latent response. It is not a future XRD measurement interval. The padded-logit posterior is clamped before both acquisition and inverse transformation; diagnostic endpoint masses disclose that approximation. Sampler acceptance and effective-sample estimates are diagnostics, not proof of convergence. Original notebook predictions need not be reproduced after these corrections.
 
 ## BO-ICL: LLM
 
-Choose **MoC · matched LLM**, or the shared **BO-ICL LLM** engine. Defaults are GPT-4o for both roles, five forward predictions per candidate, one inverse completion, nearest 100 → MMR 16, empirical EI, and full 3,072-dimensional `text-embedding-3-large` vectors of exactly `experimental procedure: {original procedure}`. Model aliases may change availability; no automatic model replacement is performed.
+Choose **MoC five-point comparison — BO-ICL LLM**, or the source-compatible matched LLM preset. Defaults are GPT-4o for both roles, five forward predictions per candidate, one inverse completion, nearest 100 → MMR 16, empirical EI, and full 3,072-dimensional `text-embedding-3-large` vectors of exactly `experimental procedure: {original procedure}`. Model aliases may change availability; no automatic model replacement is performed. The study preset initially disables automatic refresh after measurements.
 
 Supply credentials privately through the runtime environment or the existing local **Secrets → Save Locally** controls. Do not put keys in campaign files or prompts. **Update Suggestions** is an intentional live operation: it prepares missing embeddings and issues model calls. The app does not purchase or generate embeddings during import. A compatible cache saves embedding calls, not the forward/inverse chat calls.
 
@@ -120,8 +129,13 @@ For an unbounded generic LLM objective, review **Advanced BO-ICL sampling → Ze
 ```powershell
 .venv/Scripts/python.exe -m pytest -q
 .venv/Scripts/python.exe -m boicl.moc_cli demo --output .moc-demo/offline-export
-.venv/Scripts/python.exe -m boicl.moc_cli init --pair
+.venv/Scripts/python.exe -m boicl.moc_cli init --pair --study five_point
 ```
+
+The explicit `--study five_point` creates the two versioned five-point study
+presets. Omitting it retains the source-compatible pair and ten-design GP
+coverage threshold. Creation is not resumption; use **Load Selected** for an
+existing campaign.
 
 The default test suite blocks external network connections and does not load local credentials. Historical provider tests are skipped unless explicitly enabled with `RUN_LIVE_API_TESTS=1`; they are not part of ordinary validation.
 
