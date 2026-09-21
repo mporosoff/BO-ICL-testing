@@ -3,6 +3,36 @@
 Use `run_boicl_local.bat` on Windows to start a local browser app for BO-ICL
 experiments.
 
+The landing page is the MoC continuation workspace. Load the matched LLM or
+structured-GP preset, or create their paired campaigns. Both start with M7=72.1,
+M12=83.8, and M13=23.4 wt%, use 7,776 canonical designs, and initially have
+7,773 eligible designs. The five archived BO measurements remain documented;
+the source-reset policy permits their recipes as marked quality repeats.
+
+Structured GP uses six synthesis parameters and requires no model API key.
+The LLM preset requests five GPT-4o predictions per shortlisted candidate,
+requires two accepted numeric responses, and uses empirical EI. It retrieves
+nearest 100 eligible procedures before MMR selects 16. LLM embeddings use the
+exact `experimental procedure: ` prefix with `text-embedding-3-large`; the
+separate embedding-GP baseline uses bare procedures with `text-embedding-ada-002`.
+Cache transfer validates model, dimensions, exact input hashes, and representation.
+
+Start a suggestion explicitly, reserve its recipe, then record an actual measured
+result with XRD esd, GOF and a stated closure-gap origin. A zero is a measurement;
+an empty field is unknown. Export a campaign bundle to preserve observations,
+refinement provenance, pending reservations, exact requests and replay data.
+The new-measurement budget excludes the three seeds. Settings changes supersede
+unreserved suggestions. The MoC workspace stores its state under `.moc-campaigns/`.
+
+For a no-network walkthrough, run `python -m boicl.local_app --demo` or
+`python -m boicl.moc_cli demo`. Demo state and outcomes are explicitly synthetic
+and are kept separate from live campaigns. See [README.md](README.md) for the
+complete MoC workflow and implementation notes.
+
+The instructions below describe the separate **Generic dataset runner**,
+available from the link at the top of the MoC page. Its saved settings and
+existing campaigns retain their generic-dataset interpretation.
+
 The launcher:
 
 - creates `.env` from `.env.example` when needed;
@@ -51,7 +81,7 @@ The `Workflow mode` selector separates the two main use cases:
 
 - `Automatic benchmark: full labeled dataset` is for fully labeled pools. Use
   `Offline Benchmark > Run & Append`; do not use `Add Result`, `Update
-  Suggestions`, or `Generate Proposals` for this mode.
+Suggestions`, or `Generate Proposals` for this mode.
 - `Live campaign: add results manually` is for real experiments where labels
   arrive over time. Use `Update Suggestions`, run the experiment, then enter the
   measured result with `Add Observation`.
@@ -79,17 +109,19 @@ Or run manually:
 
 ## Notes
 
-The current objective model is maximization-first, with a minimization option in
-the local runner that internally negates the entered objective values before
-training. `Target scaling` is off by default. `Auto range`, `Min-max`, and
-`Z-score` scale the model target while plots and exports stay in the original
-objective units. Entered uncertainty is stored, exported, and plotted as an
-error bar.
+The generic runner supports maximization and minimization. Its LLM labels,
+predictions and inverse targets always use raw objective units; the acquisition
+applies the optimization direction once. `Target scaling` is off by default;
+the optional `Auto range`, `Min-max`, and `Z-score` modes affect GP fitting while
+plots and exports retain original units. Entered uncertainty is stored,
+exported, and plotted as an error bar.
 `Objective lower bound` and `Objective upper bound` are optional physical or
 measurement bounds in original units. For phase percentages, use `0` and `100`.
-These bounds are included in the LLM system-message context and used to clip the
-displayed prediction/error bars on the plot. They do not clamp stored raw
-predictions, measured values, exports, or acquisition ranking.
+Automatic inverse targets respect these bounds. Out-of-bounds manual targets
+are errors. Out-of-range numeric predictions are rejected before acquisition,
+with at least two accepted completions required for ranking. Raw responses are
+never silently converted into boundary predictions. Plot interval endpoints
+also respect configured display bounds. Custom prompts are kept verbatim.
 For model-selected points, the runner also stores the model prediction that was
 used for ranking. Those prediction means and uncertainties are plotted as
 separate prediction markers with error bars and are included in saved campaigns,
@@ -97,13 +129,13 @@ archives, and CSV exports.
 The current BO-ICL `AskTellGPR` implementation does not yet use per-observation
 uncertainty as fixed noise during GP fitting.
 
-The browser has two suggestion engines:
+The generic browser has two suggestion engines:
 
 - `GPR with embeddings` uses the selected embedding model plus Gaussian process
   regression.
 - `BO-ICL LLM` uses `Prediction LLM` for candidate prediction and acquisition
   scoring. If `Inverse filter` is greater than zero, it also uses `Inverse
-  design LLM` to propose a target procedure, then searches the uploaded pool for
+design LLM` to propose a target procedure, then searches the uploaded pool for
   similar candidates before scoring them.
 
 The embedding model is selectable in the browser settings and uses a separate
@@ -171,11 +203,10 @@ or hand-edited prompt with a fresh dataset-specific version. Edit those messages
 in the browser if a campaign needs a more specific instruction, such as
 explicitly maximizing alpha phase (%) from Im-3m or beta phase (%) from Pm-3n.
 
-The model dropdowns are presets, not a hard limit. You can type another provider
-model string if the installed SDK and your API account support it. Avoid older
-legacy presets such as GPT-3.5 or GPT-4 Turbo Preview for new runs; use GPT-5.1,
-GPT-5 mini/nano, GPT-4.1, GPT-4o/mini, or current Claude 4/3.7/3.5 Haiku models
-instead.
+The model dropdowns accept an explicit provider model alias. The adapter validates
+its sampling capabilities; it does not silently change the requested model.
+The corrected MoC preset uses GPT-4o. This sampling adapter rejects reasoning
+models requiring different temperature or multiple-completion behavior.
 
 The `Inverse Design` panel can generate free-form proposals from the labeled
 examples and the active objective target. Use those proposals directly as manual
@@ -184,9 +215,10 @@ candidates from the uploaded pool before LLM completions are requested. With the
 `Broad pool = 250`, `LLM shortlist = 16`, `Random add-ons = 0`, and `LLM samples
 = 3`, each BO-ICL step scores at most 16 candidates with 48 sampled
 completions, not 250 candidates. `LLM pool scope = Full pool (paper)` compares
-the inverse-design query against every available candidate, which matches the
-paper notebook. `Broad random pool (fast)` first samples `Broad pool` candidates
-and then applies the same MMR/cosine shortlist step inside that subset.
+the inverse-design query against every available candidate, keeps the nearest
+100, then applies MMR. `Broad random pool (fast)` first samples `Broad pool`
+candidates and applies the same nearest-neighbor/MMR shortlist inside that subset.
+The generic defaults above are separate from the versioned MoC preset.
 
 LLM benchmark runtime scales with `(LLM shortlist + Random add-ons) x LLM
 samples x BO iterations x Workflow replicates` when the shortlist is enabled.
@@ -261,10 +293,10 @@ For BO-ICL LLM runs on large pools, keep `Score limit` moderate at first
 (`100-250`) for GPR baselines, LLM runs where `LLM shortlist = 0`, or LLM runs
 using `LLM pool scope = Broad random pool`.
 In the normal LLM workflow, `LLM shortlist` first generates an inverse-design
-query from the current replicate history. With the default automatic target
-settings, that target is `current best x Normal(1.2, 0.05)`, which matches the
-paper-style stochastic inverse-filter target. Set `Auto target jitter = 0` if
-you want a deterministic `current best x multiplier` target instead. In Full
+query from the current replicate history. The corrected automatic target is
+`best + direction * max(0, multiplier_draw - 1) * abs(best)`, followed by
+configured physical bounds. Direction is +1 for maximizing and −1 for minimizing.
+Set `Auto target jitter = 0` for a deterministic draw of 1.2. In Full
 pool mode, the app compares that query against the full available pool using
 cached embeddings and MMR/cosine similarity. In Broad random pool mode, it first
 samples the Broad pool and does the same comparison inside that subset. Only the
@@ -276,11 +308,18 @@ the prediction samples. The inverse-design target is the retrieval query that
 creates the shortlist; it is not a promise that each shortlisted candidate's
 predicted mean will be close to that target.
 
-For sparse-zero campaigns, `current best x multiplier` can stay pinned at zero.
-Use `Auto target floor` to set a minimum automatic inverse-design target without
-creating a fake observation. For phase percentages, enter whole percent units
-such as `5` or `10`. A manual `Inverse target` still overrides both the
-multiplier and floor.
+At a zero incumbent, a positive reference scale is required. The MoC preset uses
+100 percentage points. An unbounded generic objective needs a manual target or
+an explicitly configured scale/floor; it does not invent an improvement scale.
+Manual targets must lie within valid physical bounds and target constraints.
+
+LLM uncertainty means spread among accepted numeric completions. Five equal
+responses have zero completion spread; that is agreement, not validated
+scientific certainty. An uncertainty scalar rescales empirical support about
+its mean: 1 preserves the distribution and acquisition exactly; 0 is a point
+mass. It does not substitute the spread of previous measurements or scale XRD
+measurement error. With fewer than two distinct observed designs, the generic
+runner uses an explicit initial-design selection without an LLM call.
 
 Click `Run & Append` to add the current configuration to the plot. Change the
 model or acquisition settings and click `Run & Append` again to compare another

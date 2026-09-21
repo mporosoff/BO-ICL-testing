@@ -1,5 +1,16 @@
 # BO-ICL Local Active-Learning Toolkit
 
+The main local interface supports the complete **MoC continuation** workflow: a new six-variable
+synthesis-parameter GP, a matched GPT-4o BO-ICL campaign, and a separate embedding-GP
+baseline. The included 7,776-design dataset starts from M7=72.1, M12=83.8, and
+M13=23.4 wt%. The structured GP runs entirely offline without credentials.
+
+Start with [the MoC operator guide](docs/MOC_OPERATOR_GUIDE.md),
+[migration and audit notes](docs/MOC_MIGRATION_AND_AUDIT.md), and
+[implementation verification](docs/MOC_IMPLEMENTATION_REPORT.md).
+Use `run_boicl_local.bat` for real campaigns or `run_moc_demo.bat` for the isolated
+synthetic walkthrough. An optional focused MoC view uses the same campaign IDs and state. The main interface also retains generic datasets, comparisons, random controls, and offline benchmarks.
+
 This repository contains a local browser app for running Bayesian optimization
 with in-context learning (BO-ICL) over a finite pool of experimental
 procedures. The current working focus is the active-learning BO workflow from
@@ -14,7 +25,7 @@ Paper: [Bayesian Optimization of Catalysts With In-context Learning](https://arx
 - Imports experiment pools from CSV, TXT, XLS, XLSX, or NPY files.
 - Supports fully labeled offline benchmark runs and live campaigns where labels
   are added as experiments finish.
-- Uses either BO-ICL LLM scoring or GPR over cached embeddings.
+- Uses BO-ICL LLM scoring, the MoC synthesis-parameter GP, or a distinct GP over cached embeddings.
 - Lets you choose embedding, prediction LLM, inverse-design LLM, acquisition
   function, replicate count, BO iteration count, and rate-limit controls.
 - Plots selected-model predictions with uncertainty separately from measured

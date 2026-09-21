@@ -9,6 +9,7 @@ from .llm_model import (
     get_llm,
     DiscreteDist,
     GaussDist,
+    scale_distribution,
 )
 from .aqfxns import (
     probability_of_improvement,
@@ -64,7 +65,7 @@ class LabelSimilarityExampleSelector(SemanticSimilarityExampleSelector):
         examples: List[Dict],
         embeddings: Embeddings,
         vectorstore_cls: type[VectorStore],
-        k: int = 4,
+        k: int = 5,
         input_keys: Union[List[str], None] = None,
         *,
         example_keys: Union[List[str], None] = None,
@@ -99,20 +100,26 @@ class AskTellFewShot:
         prompt_template: PromptTemplate = None,
         suffix: Optional[str] = None,
         prefix: Optional[str] = None,
-        model: str = "gpt-3.5-turbo",
+        model: str = "gpt-4o",
         inverse_model: Optional[str] = None,
         temperature: Optional[float] = None,
+        inverse_temperature: Optional[float] = None,
         x_formatter: Callable[[str], str] = lambda x: x,
         y_formatter: Callable[[float], str] = lambda y: f"{y:0.2f}",
         y_name: str = "output",
         x_name: str = "input",
-        selector_k: Optional[int] = None,
+        selector_k: Optional[int] = 5,
         k: int = 5,
         use_quantiles: bool = False,
         n_quantiles: int = 100,
         verbose: bool = False,
         cos_sim: bool = True,
         use_logprobs: bool = False,
+        embedding_model: str = "text-embedding-3-large",
+        objective_bounds: Optional[Tuple[float, float]] = None,
+        maximize: bool = True,
+        reference_scale: Optional[float] = None,
+        min_samples: int = 2,
     ) -> None:
         """Initialize Ask-Tell optimizer.
 
@@ -124,7 +131,8 @@ class AskTellFewShot:
             suffix: Matching suffix for first part of prompt template - for actual completion.
             prefix: Prefix to add before all examples (e.g., some context for the model).
             model: OpenAI base model to use for training and inference.
-            temperature: Temperature to use for inference. If None, will use model default.
+            temperature: Temperature to use for prediction inference. If None, will use model default.
+            inverse_temperature: Temperature to use for inverse-design inference. If None, uses temperature.
             x_formatter: Function to format x for prompting.
             y_formatter: Function to format y for prompting.
             y_name: Name of y variable in prompt template (e.g., density, value of function, etc.)
@@ -134,6 +142,17 @@ class AskTellFewShot:
             verbose: Whether to print out debug information.
         """
         self._selector_k = selector_k
+        if selector_k is not None and selector_k < 1:
+            raise ValueError(
+                "selector_k must be positive, or None for all observed examples"
+            )
+        self.embedding_model = embedding_model
+        self.objective_bounds = objective_bounds
+        self.maximize = maximize
+        self.reference_scale = reference_scale
+        self.min_samples = min_samples
+        self._observed_x = set()
+        self.last_prediction_records = []
         self._ready = False
         self._ys = []
         self.format_x = x_formatter
@@ -147,6 +166,9 @@ class AskTellFewShot:
         self._inverse_model = inverse_model or model
         self._example_count = 0
         self._temperature = temperature
+        self._inverse_temperature = (
+            temperature if inverse_temperature is None else inverse_temperature
+        )
         self._k = k
         self.use_quantiles = use_quantiles
         self.n_quantiles = n_quantiles
@@ -194,6 +216,10 @@ class AskTellFewShot:
         raise NotImplementedError
 
     def set_calibration_factor(self, calibration_factor):
+        if calibration_factor is not None and (
+            not np.isfinite(calibration_factor) or calibration_factor < 0
+        ):
+            raise ValueError("Uncertainty multiplier must be finite and nonnegative")
         self._calibration_factor = calibration_factor
 
     def inv_predict(self, y: float, system_message: Optional[str] = "") -> str:
@@ -207,8 +233,11 @@ class AskTellFewShot:
             y=self.format_y(y), y_name=self._y_name, x_name=self._x_name
         )
         if self.inv_llm is None:
-            self.inv_llm = self._setup_inv_llm(self._inverse_model, self._temperature)
+            self.inv_llm = self._setup_inv_llm(
+                self._inverse_model, self._inverse_temperature
+            )
         x, tokens = self._inv_predict(query, system_message=system_message)
+        self.tokens_used += tokens
 
         return x[0]
 
@@ -258,15 +287,13 @@ class AskTellFewShot:
             if isinstance(result, GaussDist) and result.std() is None:
                 results[i].set_std(0.0)
 
-        if self._calibration_factor:
-            for i, result in enumerate(results):
-                if isinstance(result, GaussDist):
-                    results[i].set_std(result.std() * self._calibration_factor)
-                elif isinstance(result, DiscreteDist):
-                    results[i] = GaussDist(
-                        results[i].mean(),
-                        results[i].std() * self._calibration_factor,
-                    )
+        if self._calibration_factor is not None:
+            results = [
+                scale_distribution(
+                    result, self._calibration_factor, self.objective_bounds
+                )
+                for result in results
+            ]
 
         # compute mean and standard deviation
         if len(x) == 1:
@@ -276,6 +303,7 @@ class AskTellFewShot:
     def tell(self, x: str, y: float, alt_ys: Optional[List[float]] = None) -> None:
         """Tell the optimizer about a new example."""
         example_dict, inv_example = self._tell(x, y, alt_ys)
+        self._observed_x.add(self.format_x(x))
         # we want to have example
         # to initialize prompts, so send it
         if not self._ready:
@@ -297,7 +325,7 @@ class AskTellFewShot:
     def ask(
         self,
         possible_x: Union[Pool, List[str]],
-        aq_fxn: str = "upper_confidence_bound",
+        aq_fxn: str = "expected_improvement",
         k: int = 1,
         inv_filter: int = 16,
         aug_random_filter: int = 0,
@@ -320,22 +348,27 @@ class AskTellFewShot:
             The selected x values, their acquisition function values, and the predicted y modes.
             Sorted by acquisition function value (descending)
         """
-        if type(possible_x) == type([]):
-            possible_x = Pool(possible_x, self.format_x)
+        possible_x = Pool(
+            [x for x in possible_x if self.format_x(x) not in self._observed_x],
+            self.format_x,
+            embedding_model=self.embedding_model,
+        )
+        if len(possible_x) == 0:
+            return [], [], []
 
         # if we have less than 2 examples, just return random
-        if self._example_count < 2:
-            init_pnt = possible_x.sample(k)
+        if len(self._observed_x) < 2:
+            init_pnt = possible_x.sample(min(k, len(possible_x)))
             return (
                 init_pnt,
-                [0] * k,
-                [0] * k,
+                [0] * len(init_pnt),
+                [0] * len(init_pnt),
             )
 
         if aq_fxn == "probability_of_improvement":
-            aq_fxn = probability_of_improvement
+            aq_fxn = partial(probability_of_improvement, maximize=self.maximize)
         elif aq_fxn == "expected_improvement":
-            aq_fxn = expected_improvement
+            aq_fxn = partial(expected_improvement, maximize=self.maximize)
         elif aq_fxn == "log_expected_improvement":
             aq_fxn = log_expected_improvement
         elif aq_fxn == "upper_confidence_bound":
@@ -354,13 +387,21 @@ class AskTellFewShot:
         if len(self._ys) == 0:
             best = 0
         else:
-            best = np.max(self._ys)
+            best = np.max(self._ys) if self.maximize else np.min(self._ys)
 
         if inv_filter + aug_random_filter < len(possible_x):
             possible_x_l = []
             if inv_filter:
+                from .llm_engine import resolve_inverse_target
+
+                self.last_target = resolve_inverse_target(
+                    best,
+                    maximize=self.maximize,
+                    bounds=self.objective_bounds,
+                    reference_scale=self.reference_scale,
+                )
                 approx_x = self.inv_predict(
-                    best * np.random.normal(1.2, 0.05),
+                    self.last_target["resolved_target"],
                     system_message=inv_system_message,
                 )
                 possible_x_l.extend(
@@ -377,13 +418,6 @@ class AskTellFewShot:
         results = self._ask(
             possible_x_l, best, aq_fxn, k, system_message=system_message
         )
-        if len(results[0]) == 0 and len(possible_x_l) != 0:
-            # if we have nothing, just return random one
-            return (
-                possible_x.sample(k),
-                [0] * k,
-                [0] * k,
-            )
         return results
 
 
@@ -392,10 +426,8 @@ class AskTellFewShotTopk(AskTellFewShot):
         # nucleus sampling seems to get more diversity
         return get_llm(
             n=self._k,
-            best_of=self._k,
-            temperature=0.1 if temperature is None else temperature,
+            temperature=0.7 if temperature is None else temperature,
             model_name=model,
-            top_p=0.5,
             # stop=["\n", "###", "#", "##"],
             # logit_bias={
             #     "198": -100,  # new line,
@@ -408,6 +440,7 @@ class AskTellFewShotTopk(AskTellFewShot):
 
     def _setup_inv_llm(self, model: str, temperature: Optional[float] = None):
         return get_llm(
+            n=1,
             model_name=model,
             # stop=[
             #     self.prompt.suffix.split()[0],
@@ -415,7 +448,7 @@ class AskTellFewShotTopk(AskTellFewShot):
             #     "\n",
             # ],
             max_tokens=576,
-            temperature=0.05 if temperature is None else temperature,
+            temperature=0.7 if temperature is None else temperature,
         )
 
     def _setup_prompt(
@@ -460,9 +493,10 @@ class AskTellFewShotTopk(AskTellFewShot):
             )
             example_selector = sim_selector.from_examples(
                 [example],
-                OpenAIEmbeddings(),
+                OpenAIEmbeddings(model=self.embedding_model),
                 FAISS,
                 k=self._selector_k,
+                input_keys=["x"],
             )
         return FewShotPromptTemplate(
             examples=examples if example_selector is None else None,
@@ -495,7 +529,7 @@ class AskTellFewShotTopk(AskTellFewShot):
             )  # LabelSimilarityExampleSelector
             example_selector = sim_selector.from_examples(
                 [example],
-                OpenAIEmbeddings(),
+                OpenAIEmbeddings(model=self.embedding_model),
                 FAISS,
                 k=self._selector_k,
             )
@@ -564,15 +598,37 @@ class AskTellFewShotTopk(AskTellFewShot):
         system_message: str,
     ) -> Tuple[List[str], List[float], List[float]]:
         results = self.predict(possible_x, system_message=system_message)
-        # drop empties
-        if type(results) != type([]):
+        if not isinstance(results, list):
             results = [results]
-        results = [r for r in results if len(r) > 0]
-        aq_vals = [aq_fxn(r, best) for r in results]
-        selected = np.argsort(aq_vals)[::-1][:k]
-        means = [r.mean() for r in results]
+        if len(results) != len(possible_x):
+            raise ValueError("Prediction count does not match candidate count")
+        records = []
+        for rank, (candidate, dist) in enumerate(zip(possible_x, results)):
+            samples = dist.raw_samples()
+            valid = len(samples) >= self.min_samples and np.all(np.isfinite(samples))
+            if self.objective_bounds is not None:
+                lower, upper = self.objective_bounds
+                valid = valid and all(
+                    (lower is None or lower <= value)
+                    and (upper is None or value <= upper)
+                    for value in samples
+                )
+            records.append(
+                dict(
+                    candidate=candidate,
+                    rank=rank,
+                    distribution=dist,
+                    status="scored" if valid else "insufficient_or_invalid_samples",
+                    acquisition=float(aq_fxn(dist, best)) if valid else None,
+                )
+            )
+        self.last_prediction_records = records
+        selected = sorted(
+            (r for r in records if r["status"] == "scored"),
+            key=lambda r: (-r["acquisition"], r["rank"]),
+        )[:k]
         return (
-            [possible_x[i] for i in selected],
-            [aq_vals[i] for i in selected],
-            [means[i] for i in selected],
+            [r["candidate"] for r in selected],
+            [r["acquisition"] for r in selected],
+            [r["distribution"].mean() for r in selected],
         )

@@ -5,7 +5,9 @@ repos:
     rev: v5.0.0
     hooks:
       - id: check-added-large-files
+        exclude: ^examples/moc_offline/.*\.gz$
       - id: fix-byte-order-marker
+        exclude: ^boicl/(prompts/.*\.txt|data/moc/.*\.csv)$
       - id: check-case-conflict
       - id: check-merge-conflict
       - id: check-shebang-scripts-are-executable
@@ -15,8 +17,11 @@ repos:
       - id: debug-statements
       - id: detect-private-key
       - id: end-of-file-fixer
+        exclude: ^boicl/(prompts/.*\.txt|data/moc/.*\.csv)$
       - id: mixed-line-ending
+        exclude: ^boicl/(prompts/.*\.txt|data/moc/.*\.csv)$
       - id: trailing-whitespace
+        exclude: ^boicl/(prompts/.*\.txt|data/moc/.*\.csv)$
   - repo: https://github.com/psf/black
     rev: "22.3.0"
     hooks:
@@ -36,4 +41,4 @@ repos:
       - id: codespell
         additional_dependencies: [".[toml]"]
         exclude_types: [jupyter]
-        args: ["-L formate,Nd"]
+        args: ["-L formate,Nd,unparseable"]

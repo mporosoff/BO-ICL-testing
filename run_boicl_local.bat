@@ -32,14 +32,17 @@ if not exist ".venv\Scripts\python.exe" (
     )
 )
 
-echo Checking Python packages...
-".venv\Scripts\python.exe" -m pip install --upgrade pip
-if errorlevel 1 goto :pip_failed
-
+echo Checking local Python packages...
+if "%~1"=="--setup" goto :install_packages
+".venv\Scripts\python.exe" -c "import boicl, scipy, pandas, openpyxl, dotenv, torch, botorch, gpytorch, sklearn" >nul 2>&1
+if not errorlevel 1 goto :start_app
+:install_packages
 ".venv\Scripts\python.exe" -m pip install -e ".[gpr]" -r dev-requirements.txt
 if errorlevel 1 goto :pip_failed
 
+:start_app
 echo API keys are entered only inside the browser app and saved to the local .env file.
+echo The synthesis-parameter GP does not need any API key or embeddings.
 
 echo.
 echo Starting browser app...

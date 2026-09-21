@@ -32,6 +32,25 @@ def test_extract_numeric_prediction_accepts_numeric_only_percentage():
     assert llm_model.extract_numeric_prediction("3.5%") == pytest.approx(3.5)
 
 
+def test_make_distribution_preserves_raw_llm_samples_when_collapsed():
+    dist = llm_model.make_dd(np.array([0.0, 0.0, 0.0]), np.array([1 / 3, 1 / 3, 1 / 3]))
+
+    assert dist.mean() == pytest.approx(0.0)
+    assert dist.raw_samples() == [0.0, 0.0, 0.0]
+
+
+def test_chat_adapter_omits_unused_generation_parameters(monkeypatch):
+    recorded = []
+    monkeypatch.setattr(
+        llm_model, "ChatOpenAI", lambda **kwargs: recorded.append(kwargs)
+    )
+    llm_model.get_llm(model_name="gpt-4o", n=5)
+    assert recorded[0]["n"] == 5
+    assert not {"top_p", "best_of", "logprobs", "top_logprobs"} & set(recorded[0])
+    with pytest.raises(ValueError, match="best_of"):
+        llm_model.get_llm(model_name="gpt-4o", best_of=5)
+
+
 def pytest_generate_tests(metafunc):
     if "model_name" in metafunc.fixturenames:
         models = metafunc.cls.models_to_test()

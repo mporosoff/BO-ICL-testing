@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from functools import reduce
-from typing import Union
+from typing import List, Optional, Union
 import warnings
 
 # langchain.llm_cache = InMemoryCache()
@@ -38,10 +38,16 @@ def extract_numeric_prediction(text):
         text = text.split("###", 1)[0].strip()
     bare = _BARE_NUMERIC_RE.match(text)
     if bare:
-        return float(bare.group(1))
+        value = float(bare.group(1))
+        if not np.isfinite(value):
+            raise ValueError("Prediction must be finite")
+        return value
     keyed_matches = list(_KEYED_NUMERIC_RE.finditer(text))
     if keyed_matches:
-        return float(keyed_matches[-1].group(1))
+        value = float(keyed_matches[-1].group(1))
+        if not np.isfinite(value):
+            raise ValueError("Prediction must be finite")
+        return value
     raise ValueError(f"Could not parse a numeric-only prediction from: {text!r}")
 
 
@@ -54,11 +60,14 @@ def truncate(s):
 class DiscreteDist:
     values: np.ndarray
     probs: np.ndarray
+    _samples: Optional[List[float]] = None
 
     def __post_init__(self):
         # make sure np arrays
         self.values = np.array(self.values)
         self.probs = np.array(self.probs)
+        if self._samples is None:
+            self._samples = [float(value) for value in self.values]
         uniq_values = np.unique(self.values)
         if len(uniq_values) < len(self.values):
             # need to mergefg
@@ -88,11 +97,15 @@ class DiscreteDist:
     def __len__(self):
         return len(self.values)
 
+    def raw_samples(self):
+        return list(self._samples or [])
+
 
 @dataclass
 class GaussDist:
     _mean: float
     _std: float
+    _samples: Optional[List[float]] = None
 
     def sample(self):
         return np.random.normal(self._mean, self._std)
@@ -115,20 +128,39 @@ class GaussDist:
     def __len__(self):
         return 1
 
+    def raw_samples(self):
+        return list(self._samples or [float(self._mean)])
+
 
 def make_dd(values, probs):
-    dd = DiscreteDist(values, probs)
-    if len(dd) == 1:
-        return GaussDist(dd.mean(), None)
+    samples = [float(value) for value in np.array(values, dtype=float).tolist()]
+    return DiscreteDist(values, probs, samples)
 
-    return dd
+
+def scale_distribution(dist, factor, bounds=None):
+    """Scale support around its mean without changing the distribution family.
+
+    Bounds, when explicitly provided, clip expanded support; callers must log
+    this policy. Accepted original responses remain available as raw_samples.
+    """
+    factor = float(factor)
+    if not np.isfinite(factor) or factor < 0:
+        raise ValueError("Uncertainty multiplier must be finite and nonnegative")
+    if factor == 1:
+        return dist
+    if isinstance(dist, DiscreteDist):
+        values = dist.mean() + factor * (dist.values - dist.mean())
+        if bounds is not None and factor > 1:
+            values = np.clip(values, *bounds)
+        return DiscreteDist(values, dist.probs.copy(), dist.raw_samples())
+    return GaussDist(dist.mean(), (dist.std() or 0.0) * factor, dist.raw_samples())
 
 
 def get_llm(
     model_name: str = "gpt-4o",
     temperature: float = 0.7,
     n: int = 5,
-    top_p: int = 1,
+    top_p: Optional[float] = None,
     best_of: int = 1,
     max_tokens: int = 128,
     logit_bias: dict = {},
@@ -201,7 +233,7 @@ class LLM:
         model_name: str = "gpt-4o",
         temperature: float = 0.7,
         n: int = 1,
-        top_p: int = 1,
+        top_p: Optional[float] = None,
         best_of: int = 1,
         max_tokens: int = 128,
         logit_bias: dict = {},
@@ -216,8 +248,8 @@ class LLM:
         self.max_tokens = max_tokens
         self.logit_bias = logit_bias
         self.kwargs = kwargs
-        self.llm = self.create_llm()
         self.use_logprobs = use_logprobs
+        self.llm = self.create_llm()
 
     def create_llm(self):
         raise NotImplementedError("Must be implemented in subclasses")
@@ -234,22 +266,19 @@ class LLM:
 
 class OpenAILLM(LLM):
     def create_llm(self):
-        self.kwargs.update(
-            {
-                "logprobs": 5,
-            }
-        )
+        options = dict(self.kwargs)
+        if self.top_p is not None:
+            options["top_p"] = self.top_p
+        if self.use_logprobs:
+            options["logprobs"] = 5
         return OpenAI(
             model_name=self.model_name,
             temperature=self.temperature,
             n=self.n,
-            top_p=self.top_p,
             best_of=self.best_of,
             max_tokens=self.max_tokens,
             logit_bias=self.logit_bias,
-            logprobs=5,
-            # top_logprobs= True,
-            # model_kwargs=self.kwargs
+            **options,
         )
 
     def predict(self, query_list, inv_pred=False, verbose=False, *args, **kwargs):
@@ -315,13 +344,23 @@ class OpenAILLM(LLM):
 
 class ChatOpenAILLM(LLM):
     def create_llm(self):
+        if self.best_of != 1:
+            raise ValueError("Chat models do not support best_of; request n samples")
+        if self.model_name.startswith(("gpt-5", "o1", "o3", "o4")):
+            raise ValueError(
+                "This sampling adapter requires a model supporting temperature and n; use gpt-4o or configure a supported adapter"
+            )
+        options = dict(self.kwargs)
+        if self.top_p is not None:
+            options["top_p"] = self.top_p
+        if self.use_logprobs:
+            options.update(logprobs=True, top_logprobs=5)
         return ChatOpenAI(
             model_name=self.model_name,
             temperature=self.temperature,
             n=self.n,
             max_tokens=self.max_tokens,
-            logprobs=True,
-            top_logprobs=5,
+            **options,
         )
 
     def predict(self, query_list, inv_pred=False, verbose=False, *args, **kwargs):
@@ -468,20 +507,20 @@ class AnthropicLLM(LLM):
     def create_llm(self):
         import anthropic
 
-        self.kwargs.update(
-            {
-                # "logprobs": True,
-                # "top_logprobs": 5,
-                "n": self.n,
-                "best_of": self.best_of,
-            }
-        )
-
+        if self.use_logprobs:
+            raise ValueError(
+                "This Anthropic adapter does not support logprob weighting"
+            )
+        if self.best_of != 1:
+            raise ValueError("This Anthropic adapter does not support best_of")
+        options = dict(self.kwargs)
+        if self.top_p is not None:
+            options["top_p"] = self.top_p
         return ChatAnthropic(
             model=self.model_name,
             temperature=self.temperature,
-            top_p=self.top_p,
             max_tokens=self.max_tokens,
+            **options,
         )
 
     def predict(self, query_list, inv_pred=False, verbose=False, *args, **kwargs):

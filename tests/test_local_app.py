@@ -4,6 +4,7 @@ import random
 from io import BytesIO, StringIO
 
 import numpy as np
+import pytest
 
 from boicl import AskTellFewShotTopk, Pool
 from boicl.llm_model import GaussDist
@@ -61,8 +62,8 @@ def test_pool_builder_import_shape_is_unlabelled_live_pool(tmp_path):
     state = LocalBOState(tmp_path)
     raw = (
         "procedure,alpha phase (%)\n"
-        "\"Reduction experiment of WO3/SiO2: ramp to 400 C at 10 C/min, "
-        "soak for 4 h.\",\n"
+        '"Reduction experiment of WO3/SiO2: ramp to 400 C at 10 C/min, '
+        'soak for 4 h.",\n'
     ).encode("utf-8")
 
     payload = state.import_dataset(
@@ -78,7 +79,9 @@ def test_pool_builder_import_shape_is_unlabelled_live_pool(tmp_path):
 
 def test_pool_builder_page_contains_import_controls():
     assert "WO3/SiO2 reduction template" in POOL_BUILDER_HTML
-    assert "/api/import-dataset?filename=wo3_sio2_reduction_pool.csv" in POOL_BUILDER_HTML
+    assert (
+        "/api/import-dataset?filename=wo3_sio2_reduction_pool.csv" in POOL_BUILDER_HTML
+    )
     assert "Pool size" in POOL_BUILDER_HTML
     assert "Pool cap" not in POOL_BUILDER_HTML
     assert "Alpha phase (%) - Im-3m" in POOL_BUILDER_HTML
@@ -86,6 +89,17 @@ def test_pool_builder_page_contains_import_controls():
     assert "Minimum" in POOL_BUILDER_HTML
     assert "Maximum" in POOL_BUILDER_HTML
     assert "Step" in POOL_BUILDER_HTML
+    assert 'id="flowMin"' in POOL_BUILDER_HTML
+    assert 'id="flowMax"' in POOL_BUILDER_HTML
+    assert 'id="flowStep"' in POOL_BUILDER_HTML
+    assert 'id="coolingMin"' in POOL_BUILDER_HTML
+    assert 'id="coolingMax"' in POOL_BUILDER_HTML
+    assert 'id="coolingStep"' in POOL_BUILDER_HTML
+    assert "cool to ambient temperature at" in POOL_BUILDER_HTML
+    assert (
+        "flow-rate, ramp-rate, temperature, dwell-time, and cooling-rate combinations"
+        in POOL_BUILDER_HTML
+    )
     assert "boicl_pool_builder" in POOL_BUILDER_HTML
     assert "boicl_runner" in POOL_BUILDER_HTML
     assert "Open Runner Tab" in POOL_BUILDER_HTML
@@ -94,7 +108,7 @@ def test_pool_builder_page_contains_import_controls():
     assert "blank until measured" in POOL_BUILDER_HTML
     assert "The objective column is blank until measured." in POOL_BUILDER_HTML
     assert "boicl-focus-runner" in POOL_BUILDER_HTML
-    assert "target=\"boicl_runner\"" in POOL_BUILDER_HTML
+    assert 'target="boicl_runner"' in POOL_BUILDER_HTML
     assert "Save the campaign in the runner to keep it for later" in POOL_BUILDER_HTML
     assert "BroadcastChannel" in POOL_BUILDER_HTML
 
@@ -102,8 +116,16 @@ def test_pool_builder_page_contains_import_controls():
 def test_main_app_candidate_labels_surface_variable_values():
     assert "candidateProcedureSummary" in INDEX_HTML
     assert "candidateOptionLabel" in INDEX_HTML
+    assert "flow=" in INDEX_HTML
+    assert "cool=" in INDEX_HTML
     assert "candidatePreview" in INDEX_HTML
-    assert "enter 73.5 for 73.5%, not 0.735" in INDEX_HTML
+    assert "candidateSearchResults" in INDEX_HTML
+    assert "candidateSearchMeta" in INDEX_HTML
+    assert "/api/export-procedures.csv" in INDEX_HTML
+    assert (
+        "measured outcome and its uncertainty in the original objective units"
+        in INDEX_HTML
+    )
     assert "openPoolBuilder" in INDEX_HTML
     assert "boicl_pool_builder" in INDEX_HTML
     assert "boicl_runner" in INDEX_HTML
@@ -123,6 +145,16 @@ def test_main_app_candidate_labels_surface_variable_values():
     assert "Pool Builder imported" in INDEX_HTML
     assert "boicl-focus-runner" in INDEX_HTML
     assert "BroadcastChannel" in INDEX_HTML
+
+
+def test_export_procedures_csv_contains_only_procedure_column(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset("live_pool.csv", b"procedure\nproc b\nproc a\n")
+
+    rows = list(csv.DictReader(StringIO(state.export_procedures_csv())))
+
+    assert rows == [{"procedure": "proc b"}, {"procedure": "proc a"}]
+    assert state.export_procedures_filename().endswith("_procedures.csv")
 
 
 def test_import_dataset_can_select_between_multiple_objectives(tmp_path):
@@ -185,9 +217,12 @@ def test_defaults_match_current_numeric_settings():
     assert "benchmark_starting_baseline" not in DEFAULT_CONFIG
     assert DEFAULT_CONFIG["objective_lower_bound"] == ""
     assert DEFAULT_CONFIG["objective_upper_bound"] == ""
-    assert DEFAULT_CONFIG["ucb_lambda"] == 0.1
-    assert DEFAULT_CONFIG["llm_samples"] == 3
+    assert DEFAULT_CONFIG["ucb_lambda"] == 0.5
+    assert DEFAULT_CONFIG["llm_samples"] == 5
     assert DEFAULT_CONFIG["llm_uncertainty_calibration"] == 1.0
+    assert DEFAULT_CONFIG["llm_prediction_temperature"] == 0.7
+    assert DEFAULT_CONFIG["llm_inverse_temperature"] == 0.7
+    assert DEFAULT_CONFIG["llm_diagnostics"] is False
     assert DEFAULT_CONFIG["llm_pool_scope"] == "full"
     assert DEFAULT_CONFIG["inverse_filter"] == 16
     assert DEFAULT_CONFIG["inverse_random_candidates"] == 0
@@ -205,6 +240,12 @@ def test_model_fields_are_real_selectors():
     assert '<select id="inverseModel"></select>' in INDEX_HTML
     assert 'id="objectiveLowerBound"' in INDEX_HTML
     assert 'id="objectiveUpperBound"' in INDEX_HTML
+    assert "<summary>Advanced BO-ICL sampling</summary>" in INDEX_HTML
+    assert 'id="llmPredictionTemperature"' in INDEX_HTML
+    assert 'id="llmInverseTemperature"' in INDEX_HTML
+    assert 'id="llmDiagnostics"' in INDEX_HTML
+    assert "$('objectiveValue').value = '';" in INDEX_HTML
+    assert "$('objectiveUncertainty').value = '';" in INDEX_HTML
     assert 'id="modelOptions"' not in INDEX_HTML
     assert 'id="embeddingModelOptions"' not in INDEX_HTML
 
@@ -331,7 +372,9 @@ def test_dataset_stats_include_paper_guides():
 
 def test_offline_benchmark_appends_random_config_without_live_observations(tmp_path):
     state = LocalBOState(tmp_path)
-    state.import_dataset("dataset.csv", b"procedure,value\nproc a,1\nproc b,2\nproc c,3\n")
+    state.import_dataset(
+        "dataset.csv", b"procedure,value\nproc a,1\nproc b,2\nproc c,3\n"
+    )
     state.update_config(
         {
             "acquisition": "random",
@@ -458,7 +501,9 @@ def test_llm_benchmark_scores_after_one_initial_point(tmp_path, monkeypatch):
     )
     calls = []
 
-    def fake_llm_suggestions(available, observations=None, rng=None, k=None, acquisition=None):
+    def fake_llm_suggestions(
+        available, observations=None, rng=None, k=None, acquisition=None
+    ):
         calls.append(
             {
                 "available": len(available),
@@ -495,7 +540,9 @@ def test_live_llm_suggests_after_one_observation(tmp_path, monkeypatch):
     state.add_observation({"candidate_id": "cand-0", "value": 1.0})
     calls = []
 
-    def fake_llm_suggestions(available, observations=None, rng=None, k=None, acquisition=None):
+    def fake_llm_suggestions(
+        available, observations=None, rng=None, k=None, acquisition=None
+    ):
         calls.append(len(observations or []))
         candidate = available[0]
         return [
@@ -571,17 +618,25 @@ def test_delete_observation_removes_live_row_and_autosaves(tmp_path):
     saved = state.save_campaign({"name": "Live delete"})
     state.add_observation({"candidate_id": "cand-0", "value": 4.0})
     state.add_observation({"candidate_id": "cand-1", "value": 6.0})
+    state.suggestions = [{"candidate_id": "cand-0", "procedure": "proc a"}]
+    state.inverse_designs = [
+        {
+            "procedure": "target-like query",
+            "target": 8.0,
+            "source": "inverse_filter",
+            "active": True,
+        }
+    ]
 
     payload = state.delete_observation({"id": "obs-1"})
 
     assert [obs["id"] for obs in payload["observations"]] == ["obs-2"]
+    assert payload["suggestions"] == []
+    assert payload["inverse_designs"][0]["active"] is False
     assert payload["available_count"] == 1
     saved_payload = json.loads(
         (
-            tmp_path
-            / "saved_experiments"
-            / saved["campaign"]["id"]
-            / "campaign.json"
+            tmp_path / "saved_experiments" / saved["campaign"]["id"] / "campaign.json"
         ).read_text(encoding="utf-8")
     )
     assert [obs["id"] for obs in saved_payload["observations"]] == ["obs-2"]
@@ -589,9 +644,32 @@ def test_delete_observation_removes_live_row_and_autosaves(tmp_path):
     assert [obs["id"] for obs in state.observations] == ["obs-2", "obs-3"]
 
 
+def test_reset_run_clears_inverse_design_rows(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset("live_pool.csv", b"procedure\nproc a\nproc b\n")
+    state.add_observation({"candidate_id": "cand-0", "value": 4.0})
+    state.suggestions = [{"candidate_id": "cand-1", "procedure": "proc b"}]
+    state.inverse_designs = [
+        {
+            "procedure": "target-like query",
+            "target": 8.0,
+            "source": "inverse_filter",
+            "active": True,
+        }
+    ]
+
+    payload = state.reset_run()
+
+    assert payload["observations"] == []
+    assert payload["suggestions"] == []
+    assert payload["inverse_designs"] == []
+
+
 def test_import_campaign_archive_restores_and_saves_copy(tmp_path):
     state = LocalBOState(tmp_path)
-    state.import_dataset("archive_dataset.csv", b"procedure,value\nproc a,1\nproc b,2\n")
+    state.import_dataset(
+        "archive_dataset.csv", b"procedure,value\nproc a,1\nproc b,2\n"
+    )
     state.save_campaign({"name": "Archive campaign"})
     state.add_observation({"candidate_id": "cand-0", "value": 1.0})
     state.update_config({"acquisition": "random", "benchmark_iterations": 1})
@@ -611,10 +689,7 @@ def test_import_campaign_archive_restores_and_saves_copy(tmp_path):
         "boicl_archive_campaign_"
     )
     assert (
-        tmp_path
-        / "saved_experiments"
-        / payload["campaign"]["id"]
-        / "campaign.json"
+        tmp_path / "saved_experiments" / payload["campaign"]["id"] / "campaign.json"
     ).exists()
 
 
@@ -630,7 +705,9 @@ def test_start_fresh_clears_loaded_state_without_deleting_saves(tmp_path):
     assert payload["benchmark_runs"] == []
     assert payload["campaign"]["saved"] is False
     assert payload["dataset"]["id"] == ""
-    assert (tmp_path / "saved_experiments" / saved["campaign"]["id"] / "campaign.json").exists()
+    assert (
+        tmp_path / "saved_experiments" / saved["campaign"]["id"] / "campaign.json"
+    ).exists()
 
 
 def test_delete_campaign_removes_saved_folder_and_clears_active_save(tmp_path):
@@ -698,8 +775,18 @@ def test_live_observation_keeps_model_prediction_for_plot_and_export(tmp_path):
             "embedding_model": "text-embedding-ada-002",
             "llm_samples": 3,
             "llm_uncertainty_calibration": 4.33,
+            "llm_prediction_temperature": 0.3,
+            "llm_inverse_temperature": 0.1,
             "inverse_filter": 16,
             "inverse_seed": "target-like generated procedure",
+        }
+    ]
+    state.inverse_designs = [
+        {
+            "procedure": "target-like generated procedure",
+            "target": 55.0,
+            "source": "inverse_filter",
+            "active": True,
         }
     ]
 
@@ -708,13 +795,11 @@ def test_live_observation_keeps_model_prediction_for_plot_and_export(tmp_path):
     )
 
     observation = payload["observations"][0]
+    assert payload["inverse_designs"][0]["active"] is False
     assert observation["prediction"]["mean"] == 42.0
     assert observation["prediction"]["std"] == 3.5
     assert observation["prediction"]["optimizer"] == "llm"
-    assert (
-        observation["prediction"]["acquisition_function"]
-        == "upper_confidence_bound"
-    )
+    assert observation["prediction"]["acquisition_function"] == "upper_confidence_bound"
 
     rows = list(csv.DictReader(StringIO(state.export_observations_csv())))
     assert rows[0]["prediction_mean"] == "42.0"
@@ -726,11 +811,14 @@ def test_live_observation_keeps_model_prediction_for_plot_and_export(tmp_path):
     assert rows[0]["embedding_model"] == "text-embedding-ada-002"
     assert rows[0]["prediction_llm_samples"] == "3"
     assert rows[0]["prediction_llm_uncertainty_calibration"] == "4.33"
+    assert rows[0]["prediction_llm_prediction_temperature"] == "0.3"
+    assert rows[0]["prediction_llm_inverse_temperature"] == "0.1"
     assert rows[0]["prediction_inverse_filter"] == "16"
     assert rows[0]["prediction_inverse_seed"] == "target-like generated procedure"
     assert rows[0]["alpha phase (%)_uncertainty"] == "0.6"
     assert "<th>Model / Acq.</th>" in INDEX_HTML
     assert "<th>Method</th>" in INDEX_HTML
+    assert "<th>Status</th>" in INDEX_HTML
 
 
 def test_live_plot_collapses_candidate_replicates_but_preserves_raw_rows(tmp_path):
@@ -774,10 +862,19 @@ def test_config_change_clears_stale_model_suggestions(tmp_path):
             "prediction_model": "gpt-4o",
         }
     ]
+    state.inverse_designs = [
+        {
+            "procedure": "target-like query",
+            "target": 50.0,
+            "source": "inverse_filter",
+            "active": True,
+        }
+    ]
 
     payload = state.update_config({"acquisition": "greedy"})
 
     assert payload["suggestions"] == []
+    assert payload["inverse_designs"][0]["active"] is False
     assert "Update suggestions" in payload["last_model_status"]
 
 
@@ -788,10 +885,12 @@ def test_llm_model_keeps_original_units_when_target_scaling_is_enabled(
 
     told_values = []
     calibration_values = []
+    init_kwargs = []
 
     class FakeAskTellFewShotTopk:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            init_kwargs.append(kwargs)
 
         def set_calibration_factor(self, value):
             calibration_values.append(value)
@@ -808,6 +907,8 @@ def test_llm_model_keeps_original_units_when_target_scaling_is_enabled(
             "inverse_target_floor_value": "5",
             "inverse_target_multiplier": 1.0,
             "inverse_target_jitter": 0.0,
+            "llm_prediction_temperature": 0.3,
+            "llm_inverse_temperature": 0.1,
         }
     )
     observations = [
@@ -823,6 +924,8 @@ def test_llm_model_keeps_original_units_when_target_scaling_is_enabled(
         ("best procedure", 100.0),
     ]
     assert calibration_values == [1.0]
+    assert init_kwargs[0]["temperature"] == 0.3
+    assert init_kwargs[0]["inverse_temperature"] == 0.1
     assert state._inverse_target_model_value(scaler, [observations[0]]) == 5.0
 
 
@@ -847,7 +950,7 @@ def test_llm_acquisition_best_uses_original_units_when_scaling_enabled(
     class FakeModel:
         def predict(self, procedures, system_message=""):
             assert system_message
-            return [GaussDist(50.0, 0.0) for _ in procedures]
+            return [GaussDist(50.0, 0.0, [50.0, 50.0]) for _ in procedures]
 
     best_values = []
 
@@ -939,15 +1042,23 @@ def test_live_random_walk_records_control_points_and_exports_them(tmp_path):
     assert '"target_count": 2' in random_row["run_settings_json"]
 
 
+def _write_valid_ada_cache(path, rows):
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["x", "embedding", "embedding_model"])
+        for text, first in rows:
+            writer.writerow(
+                [text, json.dumps(first + [0.0] * 1534), "text-embedding-ada-002"]
+            )
+
+
 def test_embedding_cache_status_counts_current_dataset_and_model(tmp_path):
     state = LocalBOState(tmp_path)
+    state.config["embedding_model"] = "text-embedding-ada-002"
     state.import_dataset("dataset.csv", b"procedure,value\nproc a,1\nproc b,2\n")
     state.cache_dir.mkdir()
-    state.embedding_cache_path().write_text(
-        "x,embedding,embedding_model\n"
-        '"proc a","[1.0, 0.0]",text-embedding-ada-002\n'
-        '"other","[0.0, 1.0]",text-embedding-ada-002\n',
-        encoding="utf-8",
+    _write_valid_ada_cache(
+        state.embedding_cache_path(), [("proc a", [1.0, 0.0]), ("other", [0.0, 1.0])]
     )
 
     status = state.embedding_cache_status()
@@ -962,13 +1073,11 @@ def test_precompute_embeddings_finishes_when_dataset_is_already_cached(
 ):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     state = LocalBOState(tmp_path)
+    state.config["embedding_model"] = "text-embedding-ada-002"
     state.import_dataset("dataset.csv", b"procedure,value\nproc a,\nproc b,\n")
     state.cache_dir.mkdir()
-    state.embedding_cache_path().write_text(
-        "x,embedding,embedding_model\n"
-        '"proc a","[1.0, 0.0]",text-embedding-ada-002\n'
-        '"proc b","[0.0, 1.0]",text-embedding-ada-002\n',
-        encoding="utf-8",
+    _write_valid_ada_cache(
+        state.embedding_cache_path(), [("proc a", [1.0, 0.0]), ("proc b", [0.0, 1.0])]
     )
 
     payload = state.precompute_embeddings()
@@ -981,20 +1090,34 @@ def test_precompute_embeddings_finishes_when_dataset_is_already_cached(
     assert "already cached" in payload["last_model_status"]
 
 
-def test_cached_approx_sample_uses_saved_embeddings_without_api(tmp_path):
-    state = LocalBOState(tmp_path)
-    state.cache_dir.mkdir()
-    state.embedding_cache_path().write_text(
-        "x,embedding,embedding_model\n"
-        '"proc a","[1.0, 0.0]",text-embedding-ada-002\n'
-        '"proc b","[0.0, 1.0]",text-embedding-ada-002\n'
-        '"target","[0.95, 0.05]",text-embedding-ada-002\n',
-        encoding="utf-8",
-    )
+def test_cached_approx_sample_uses_saved_embeddings_without_api(tmp_path, monkeypatch):
+    import openai
 
-    assert state._cached_approx_sample(["proc a", "proc b"], "target", 1) == [
-        "proc a"
-    ]
+    monkeypatch.setattr(
+        openai,
+        "OpenAI",
+        lambda **kwargs: pytest.fail(
+            "Validated cache must not construct a provider client"
+        ),
+    )
+    state = LocalBOState(tmp_path)
+    state.config["embedding_model"] = "text-embedding-ada-002"
+    state.cache_dir.mkdir()
+    # The fixture must satisfy the declared ada-002 dimensionality. Its
+    # remaining coordinates are zero so the cosine geometry is unchanged.
+    with state.embedding_cache_path().open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["x", "embedding", "embedding_model"])
+        for text, first in [
+            ("proc a", [1.0, 0.0]),
+            ("proc b", [0.0, 1.0]),
+            ("target", [0.95, 0.05]),
+        ]:
+            writer.writerow(
+                [text, json.dumps(first + [0.0] * 1534), "text-embedding-ada-002"]
+            )
+
+    assert state._cached_approx_sample(["proc a", "proc b"], "target", 1) == ["proc a"]
     assert state.progress_snapshot()["status"] == "idle"
 
 
@@ -1164,7 +1287,9 @@ def test_inverse_target_can_use_supplied_benchmark_observations(tmp_path):
 
 def test_inverse_target_uses_seeded_multiplier_jitter(tmp_path):
     state = LocalBOState(tmp_path)
-    state.update_config({"inverse_target_multiplier": 1.2, "inverse_target_jitter": 0.05})
+    state.update_config(
+        {"inverse_target_multiplier": 1.2, "inverse_target_jitter": 0.05}
+    )
     observations = [{"procedure": "proc b", "value": 3.0}]
     expected_rng = random.Random(11)
     expected = 3.0 * expected_rng.normalvariate(1.2, 0.05)
@@ -1189,6 +1314,28 @@ def test_inverse_target_floor_prevents_zero_anchored_maximize_target(tmp_path):
     assert state._inverse_target_display_value(observations) == 5.0
 
 
+def test_inverse_target_is_clipped_to_entered_objective_bounds(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.update_config(
+        {
+            "objective_lower_bound": "0",
+            "objective_upper_bound": "100",
+            "inverse_target_multiplier": 1.2,
+            "inverse_target_jitter": 0,
+        }
+    )
+
+    assert (
+        state._inverse_target_display_value([{"procedure": "proc high", "value": 97.8}])
+        == 100.0
+    )
+
+    state.update_config({"inverse_target_value": "140"})
+
+    with pytest.raises(ValueError, match="Manual inverse target"):
+        state._inverse_target_display_value([{"procedure": "proc high", "value": 97.8}])
+
+
 def test_llm_scored_candidate_count_uses_shortlist(tmp_path):
     state = LocalBOState(tmp_path)
     state.update_config(
@@ -1211,7 +1358,27 @@ def test_llm_scored_candidate_count_uses_shortlist(tmp_path):
     assert state._llm_scored_candidate_count(500) == 10
 
 
-def test_live_llm_shortlist_uses_full_available_pool_after_one_seed(
+def test_llm_diagnostics_logs_raw_sample_values(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.update_config({"llm_diagnostics": True})
+
+    class FakeModel:
+        def predict(self, procedures, system_message=""):
+            return [GaussDist(0.0, 0.0, [0.0, 0.0, 0.0]) for _ in procedures]
+
+    scored = state._llm_score_procedures(
+        FakeModel(),
+        ["proc a"],
+        0.0,
+        lambda dist, best: dist.mean(),
+        1,
+    )
+
+    assert scored[6] == [[0.0, 0.0, 0.0]]
+    assert "samples=[0, 0, 0]" in state.events[0]["message"]
+
+
+def test_live_llm_shortlist_uses_full_available_pool_after_two_seeds(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
@@ -1221,6 +1388,8 @@ def test_live_llm_shortlist_uses_full_available_pool_after_one_seed(
     state.update_config(
         {
             "optimizer": "llm",
+            "acquisition": "upper_confidence_bound",
+            "ucb_lambda": 0.1,
             "batch_size": 1,
             "score_limit": 3,
             "inverse_filter": 2,
@@ -1228,15 +1397,20 @@ def test_live_llm_shortlist_uses_full_available_pool_after_one_seed(
         }
     )
     state.add_observation({"candidate_id": "cand-0", "value": 1})
+    state.add_observation({"candidate_id": "cand-1", "value": 2})
 
     class FakeModel:
         def ask(self, *args, **kwargs):
-            raise AssertionError("live LLM scoring should bypass the <2-example fallback")
+            raise AssertionError(
+                "live LLM scoring should bypass the <2-example fallback"
+            )
 
         def predict(self, possible_x, system_message=""):
             assert system_message
             return [
-                GaussDist(8.5, 0.7) if procedure == "proc 8" else GaussDist(7.0, 0.2)
+                GaussDist(8.5, 0.7, [7.8, 9.2])
+                if procedure == "proc 8"
+                else GaussDist(7.0, 0.2, [6.8, 7.2])
                 for procedure in possible_x
             ]
 
@@ -1256,18 +1430,22 @@ def test_live_llm_shortlist_uses_full_available_pool_after_one_seed(
     payload = state.suggest()
     suggestion = payload["suggestions"][0]
 
-    assert seen["retrieval_counts"] == [9]
+    assert seen["retrieval_counts"] == [8]
     assert suggestion["procedure"] == "proc 8"
     assert suggestion["acquisition"] == 8.57
     assert suggestion["mean"] == 8.5
     assert suggestion["std"] == 0.7
     assert len(payload["inverse_designs"]) == 1
+    assert payload["inverse_designs"][0]["active"] is True
+    assert payload["inverse_designs"][0]["experiment_count"] == 3
 
     payload = state.suggest()
 
-    assert seen["retrieval_counts"] == [9, 9]
+    assert seen["retrieval_counts"] == [8, 8]
     assert len(payload["inverse_designs"]) == 1
     assert payload["inverse_designs"][0]["target"] == 12.0
+    assert payload["inverse_designs"][0]["active"] is True
+    assert payload["inverse_designs"][0]["experiment_count"] == 3
 
 
 def test_live_llm_shortlist_can_prefilter_with_broad_pool(tmp_path, monkeypatch):
@@ -1278,6 +1456,8 @@ def test_live_llm_shortlist_can_prefilter_with_broad_pool(tmp_path, monkeypatch)
     state.update_config(
         {
             "optimizer": "llm",
+            "acquisition": "upper_confidence_bound",
+            "ucb_lambda": 0.1,
             "batch_size": 1,
             "score_limit": 3,
             "llm_pool_scope": "broad",
@@ -1286,11 +1466,14 @@ def test_live_llm_shortlist_can_prefilter_with_broad_pool(tmp_path, monkeypatch)
         }
     )
     state.add_observation({"candidate_id": "cand-0", "value": 1})
+    state.add_observation({"candidate_id": "cand-1", "value": 2})
 
     class FakeModel:
         def predict(self, possible_x, system_message=""):
             return [
-                GaussDist(3.0, 1.0) if index == 0 else GaussDist(1.0, 0.1)
+                GaussDist(3.0, 1.0, [2, 4])
+                if index == 0
+                else GaussDist(1.0, 0.1, [0.9, 1.1])
                 for index, _ in enumerate(possible_x)
             ]
 
@@ -1327,15 +1510,18 @@ def test_llm_flat_predictions_use_inverse_retrieval_rank(tmp_path):
         }
     )
     state.add_observation({"candidate_id": "cand-0", "value": 1})
+    state.add_observation({"candidate_id": "cand-4", "value": 2})
 
     class FakeModel:
         def predict(self, possible_x, system_message=""):
-            return [GaussDist(0.0, 0.0) for _ in possible_x]
+            return [GaussDist(0.0, 0.0, [0, 0]) for _ in possible_x]
 
     state._build_llm_model = lambda observations=None: (FakeModel(), {"mode": "off"})
     state._inverse_target_display_value = lambda *args, **kwargs: 5.0
     state._generate_inverse_text = lambda *args, **kwargs: "target-like query"
-    state._cached_approx_sample = lambda procedures, query, k, lambda_mult=0.5: procedures[:k]
+    state._cached_approx_sample = (
+        lambda procedures, query, k, lambda_mult=0.5: procedures[:k]
+    )
 
     suggestions = state._llm_suggestions(
         state.available_candidates(),
@@ -1366,7 +1552,9 @@ def test_api_retry_recovers_from_rate_limit_message(tmp_path):
     def flaky_call():
         attempts["count"] += 1
         if attempts["count"] < 2:
-            raise RuntimeError("Error code: 429 - rate limit reached. Please try again in 1ms.")
+            raise RuntimeError(
+                "Error code: 429 - rate limit reached. Please try again in 1ms."
+            )
         return "ok"
 
     assert state._api_call_with_retries("Retry smoke", flaky_call) == "ok"
@@ -1390,7 +1578,9 @@ def test_float_coercion_rejects_empty_and_nonfinite():
     assert _coerce_float("nan") is None
 
 
-def test_api_key_save_sanitizes_prefixed_values_and_load_overrides(tmp_path, monkeypatch):
+def test_api_key_save_sanitizes_prefixed_values_and_load_overrides(
+    tmp_path, monkeypatch
+):
     env_path = tmp_path / ".env"
     _write_env_value(env_path, "OPENAI_API_KEY", "OPENAI_API_KEY='sk-local'")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-stale")
@@ -1402,14 +1592,13 @@ def test_api_key_save_sanitizes_prefixed_values_and_load_overrides(tmp_path, mon
     assert __import__("os").environ["OPENAI_API_KEY"] == "sk-local"
 
 
-def test_blank_saved_system_message_falls_back_to_default(tmp_path):
+def test_explicit_blank_system_message_is_preserved(tmp_path):
     state = LocalBOState(tmp_path)
     state.config["prediction_system_message"] = ""
 
     message = state.prediction_system_message()
 
-    assert message.startswith(DEFAULT_PREDICTION_SYSTEM_MESSAGE)
-    assert "Prediction task guardrail" in message
+    assert message == ""
 
 
 def test_dataset_prompt_regeneration_preserves_custom_prompt_on_import(tmp_path):
@@ -1446,15 +1635,16 @@ def test_auto_prompts_refresh_without_adding_bounds_to_llm_context(tmp_path):
         }
     )
 
-    assert "Active objective selected in the tool: alpha Mo2C" in payload["config"][
-        "prediction_system_message"
-    ]
+    assert (
+        "Active objective selected in the tool: alpha Mo2C"
+        in payload["config"]["prediction_system_message"]
+    )
     assert "bounded from 0 to 100" not in payload["config"]["prediction_system_message"]
     assert "alpha Mo2C" in payload["config"]["inverse_system_message"]
     assert payload["plot_objective_bounds"] == {"lower": 0.0, "upper": 100.0}
 
 
-def test_custom_prompts_are_not_replaced_and_saved_bounds_are_stripped(tmp_path):
+def test_custom_prompts_preserve_exact_user_text_including_bounds(tmp_path):
     state = LocalBOState(tmp_path)
     state.import_dataset("pool.csv", b"procedure,objective\nproc a,\nproc b,\n")
     state.update_config(
@@ -1480,14 +1670,80 @@ def test_custom_prompts_are_not_replaced_and_saved_bounds_are_stripped(tmp_path)
         }
     )
 
-    assert payload["config"]["prediction_system_message"] == "custom prediction"
-    assert payload["config"]["inverse_system_message"] == "custom inverse"
+    assert payload["config"]["prediction_system_message"].startswith(
+        "custom prediction"
+    )
+    assert payload["config"]["inverse_system_message"].startswith("custom inverse")
     assert state.prediction_system_message().startswith("custom prediction")
-    assert "Prediction task guardrail" in state.prediction_system_message()
-    assert "not inverse design" in state.prediction_system_message()
-    assert "bounded from 0 to 100" not in state.prediction_system_message()
-    assert OBJECTIVE_BOUNDS_PROMPT_MARKER not in state.prediction_system_message()
-    assert OBJECTIVE_BOUNDS_PROMPT_MARKER not in state.inverse_system_message()
+    assert (
+        state.prediction_system_message()
+        == payload["config"]["prediction_system_message"]
+    )
+    assert state.inverse_system_message() == payload["config"]["inverse_system_message"]
+    assert "bounded from 0 to 100" in state.prediction_system_message()
+    assert OBJECTIVE_BOUNDS_PROMPT_MARKER in state.inverse_system_message()
+
+
+def test_edited_managed_prompt_prefix_does_not_grant_permission_to_overwrite(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset("pool.csv", b"procedure,objective\nproc a,\nproc b,\n")
+    edited = state.config["prediction_system_message"] + "\nUser experimental note."
+    state.update_config({"prediction_system_message": edited})
+    state.update_config({"objective_name": "new objective"})
+    assert state.config["prediction_system_message"] == edited
+    assert state.prediction_system_message() == edited
+
+
+@pytest.mark.parametrize(
+    "best,direction,expected",
+    [
+        (40, "maximize", 48),
+        (40, "minimize", 32),
+        (-40, "maximize", -32),
+        (-40, "minimize", -48),
+    ],
+)
+def test_generic_llm_target_direction_uses_raw_units(
+    tmp_path, best, direction, expected
+):
+    state = LocalBOState(tmp_path)
+    state.update_config({"objective_direction": direction, "inverse_target_jitter": 0})
+    observations = [dict(procedure="seed", value=best)]
+    assert state._inverse_target_model_value(
+        {"mode": "off"}, observations
+    ) == pytest.approx(expected)
+
+
+def test_llm_initial_design_policy_never_calls_model_with_one_design(tmp_path):
+    state = LocalBOState(tmp_path)
+    state.import_dataset("pool.csv", b"procedure\nseed\ncandidate\n")
+    state.add_observation({"candidate_id": "cand-0", "value": 0})
+    state._build_llm_model = lambda *args: pytest.fail(
+        "one-design BO must not call a model"
+    )
+    result = state._llm_suggestions(state.available_candidates(), rng=random.Random(4))
+    assert result[0]["source"] == "initial_design"
+    assert result[0]["mean"] is None
+
+
+def test_llm_partial_failures_cannot_shift_scores_or_turn_one_sample_into_agreement(
+    tmp_path,
+):
+    state = LocalBOState(tmp_path)
+
+    class FakeModel:
+        def predict(self, *args, **kwargs):
+            return [GaussDist(100, 0, [100]), GaussDist(80, 0, [80, 80])]
+
+    result = state._llm_score_procedures(
+        FakeModel(),
+        ["failed", "accepted"],
+        70,
+        lambda dist, best: dist.mean() - best,
+        1,
+    )
+    assert result[0] == ["accepted"]
+    assert result[1] == [10]
 
 
 def test_browser_config_tracks_llm_and_inverse_models(tmp_path):
@@ -1499,6 +1755,8 @@ def test_browser_config_tracks_llm_and_inverse_models(tmp_path):
             "prediction_model": "gpt-4o-mini",
             "inverse_model": "openrouter/mistralai/mistral-7b-instruct:free",
             "llm_samples": 3,
+            "llm_prediction_temperature": 0.35,
+            "llm_inverse_temperature": 0.15,
             "inverse_filter": 4,
         }
     )
@@ -1507,14 +1765,23 @@ def test_browser_config_tracks_llm_and_inverse_models(tmp_path):
     assert payload["config"]["prediction_model"] == "gpt-4o-mini"
     assert payload["config"]["inverse_model"].startswith("openrouter/")
     assert payload["config"]["llm_samples"] == 3
+    assert payload["config"]["llm_prediction_temperature"] == 0.35
+    assert payload["config"]["llm_inverse_temperature"] == 0.15
     assert payload["config"]["inverse_filter"] == 4
 
 
 def test_fewshot_can_use_separate_inverse_model():
-    asktell = AskTellFewShotTopk(model="gpt-4o-mini", inverse_model="gpt-4o")
+    asktell = AskTellFewShotTopk(
+        model="gpt-4o-mini",
+        inverse_model="gpt-4o",
+        temperature=0.3,
+        inverse_temperature=0.1,
+    )
 
     assert asktell._model == "gpt-4o-mini"
     assert asktell._inverse_model == "gpt-4o"
+    assert asktell._temperature == 0.3
+    assert asktell._inverse_temperature == 0.1
 
 
 def test_pool_keeps_embedding_model_setting():

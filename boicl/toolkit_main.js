@@ -1,0 +1,838 @@
+// Main toolkit controls over CampaignService. This is a view, never a second ledger.
+let sharedCampaignId =
+  new URLSearchParams(location.search).get("campaign") || "";
+let sharedPoll = null;
+let featureUpload = null;
+let refinementId = null;
+const graphOnly = location.pathname === "/campaign-graph";
+
+async function toolkitFetch(path, body, method = "POST") {
+  const response = await fetch(path, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: method === "GET" ? undefined : JSON.stringify(body || {}),
+  });
+  const payload = await response.json();
+  if (!response.ok) throw Error(payload.error || "Request failed");
+  return payload;
+}
+async function chooseSharedCampaign(id) {
+  if (!id) {
+    localStorage.removeItem("boicl_shared_campaign_id");
+    location.href = "/generic";
+    return;
+  }
+  const nextCampaign = id.replace(/^shared:/, "");
+  if (nextCampaign !== sharedCampaignId) {
+    refinementId = null;
+    for (const field of [
+      "objectiveValue",
+      "objectiveUncertainty",
+      "qualityGOF",
+      "qualityGap",
+      "qualityNote",
+      "randomWalkValue",
+      "randomWalkUncertainty",
+      "refinementReason",
+      "manualProcedure",
+      "candidateSelect",
+      "candidateSearch",
+    ])
+      if (document.getElementById(field)) $(field).value = "";
+    if (document.getElementById("pendingMeasurement"))
+      $("pendingMeasurement").innerHTML = "";
+    if (document.getElementById("sharedCheckpoints"))
+      $("sharedCheckpoints").open = false;
+    if (document.getElementById("embeddingModel"))
+      delete $("embeddingModel").dataset.edited;
+  }
+  sharedCampaignId = nextCampaign;
+  const url = new URL(location.href);
+  if (sharedCampaignId) {
+    url.searchParams.set("campaign", sharedCampaignId);
+    localStorage.setItem("boicl_shared_campaign_id", sharedCampaignId);
+  } else {
+    url.searchParams.delete("campaign");
+    localStorage.removeItem("boicl_shared_campaign_id");
+  }
+  history.replaceState({}, "", url);
+  await refresh();
+}
+async function toolkitAction(action, extra = {}) {
+  const requestedCampaign = sharedCampaignId;
+  const payload = await toolkitFetch("/api/toolkit/action", {
+    campaign: requestedCampaign,
+    action,
+    ...extra,
+  });
+  if (requestedCampaign !== sharedCampaignId) return payload;
+  state = payload;
+  const returned = state.shared_campaign?.campaign_id;
+  if (returned && returned !== sharedCampaignId) {
+    sharedCampaignId = returned;
+    history.replaceState({}, "", `/?campaign=${returned}`);
+    localStorage.setItem("boicl_shared_campaign_id", returned);
+  }
+  render();
+  scheduleSharedPoll();
+  return state;
+}
+function scheduleSharedPoll() {
+  clearTimeout(sharedPoll);
+  if (!sharedCampaignId) return;
+  // Refresh data/plots across views without replacing in-progress settings edits.
+  sharedPoll = setTimeout(async () => {
+    try {
+      const requestedCampaign = sharedCampaignId;
+      const next = await toolkitFetch(
+        "/api/toolkit/state?campaign=" + encodeURIComponent(requestedCampaign),
+        null,
+        "GET",
+      );
+      if (requestedCampaign !== sharedCampaignId) return;
+      const active = document.activeElement;
+      if (
+        active &&
+        ["INPUT", "SELECT", "TEXTAREA"].includes(active.tagName) &&
+        !graphOnly
+      ) {
+        state = next;
+        renderPlot();
+        renderProgress(next.progress || {});
+      } else {
+        state = next;
+        render();
+      }
+    } catch (error) {
+      renderError(error.message);
+    }
+    scheduleSharedPoll();
+  }, 2000);
+}
+function sharedMeasurement(
+  valueId = "objectiveValue",
+  sigmaId = "objectiveUncertainty",
+) {
+  const generic = state.shared_config.data_schema === "generic";
+  return {
+    [generic ? "value" : "moc_wt_pct"]: $(valueId).value,
+    [generic ? "objective_sigma" : "moc_wt_pct_sigma"]: $(sigmaId).value,
+    gof: $("qualityGOF").value,
+    [generic ? "closure_gap" : "closure_gap_wt_pct"]: $("qualityGap").value,
+    closure_gap_origin: $("qualityGapOrigin").value,
+    source_note: $("qualityNote").value,
+  };
+}
+async function toolkitRequest(path, options = {}) {
+  let p = {};
+  setBusy(true);
+  try {
+    if (path.startsWith("/api/import-dataset"))
+      throw Error(
+        "Use the explicit feature-mapping form to create a new structured campaign, or Start Fresh for the legacy dataset workflow.",
+      );
+    if (path.startsWith("/api/import-campaign-archive")) {
+      // Preserve 128-bit RNG integers: send original file text, never parsed numbers.
+      const bundle_json =
+        typeof options.body === "string"
+          ? options.body
+          : new TextDecoder().decode(options.body);
+      const result = await toolkitFetch("/api/moc/import", { bundle_json });
+      await chooseSharedCampaign(result.campaign_id);
+      return state;
+    }
+    if (options.body) {
+      p =
+        typeof options.body === "string"
+          ? JSON.parse(options.body)
+          : JSON.parse(new TextDecoder().decode(options.body));
+    }
+    if (path === "/api/load-campaign") {
+      if (!p.id.startsWith("shared:")) {
+        await toolkitFetch(path, p);
+        localStorage.removeItem("boicl_shared_campaign_id");
+        location.href = "/generic";
+        return;
+      }
+      await chooseSharedCampaign(p.id);
+      return state;
+    }
+    if (path === "/api/start-fresh") {
+      await chooseSharedCampaign("");
+      return state;
+    }
+    if (path === "/api/config") {
+      p.selector_mode = $("sharedSelectorMode").value;
+      p.inverse_target_reference_scale = Number(
+        $("inverseTargetReferenceScale").value,
+      );
+      for (const [visible, stored] of [
+        ["prediction_system_message", "forward_system_message"],
+        ["inverse_system_message", "inverse_system_message"],
+      ])
+        if (state.shared_config.llm[stored] === null && p[visible] === "")
+          p[visible] = null;
+      if (p.optimizer === "gpr_embeddings")
+        p.n_components = Number($("sharedDimensions").value);
+      if (
+        state.shared_config.engine === "gpr_features" ||
+        p.optimizer === "gpr_features"
+      )
+        p.structured_gp = {
+          burn_in: Number($("gpBurnIn").value),
+          retained_draws: Number($("gpDraws").value),
+          predict_thin: Number($("gpThin").value),
+        };
+      return await toolkitAction("config", { values: p });
+    }
+    if (path === "/api/suggest") return await toolkitAction("suggest");
+    if (path === "/api/save-campaign") return await toolkitAction("save", p);
+    if (path === "/api/precompute-embeddings")
+      return await toolkitAction("cache-prepare");
+    if (path === "/api/regenerate-prompts")
+      return await toolkitAction("reset-prompts");
+    if (path === "/api/observe") {
+      const selected = $("pendingMeasurement").value;
+      if (!selected)
+        throw Error("Reserve a suggestion before saving its measured outcome.");
+      return await toolkitAction("measure", {
+        suggestion_id: selected,
+        values: sharedMeasurement(),
+        request_id: crypto.randomUUID(),
+      });
+    }
+    if (path === "/api/random-walk/start")
+      return await toolkitAction("random-start", {
+        target_count: Number(p.target_count),
+      });
+    if (path === "/api/random-walk/observe") {
+      const candidate = state.live_random_walk?.current_candidate;
+      if (!candidate)
+        throw Error("Start an independent random reservation first.");
+      return await toolkitAction("random-measure", {
+        suggestion_id: candidate.suggestion_id,
+        values: sharedMeasurement("randomWalkValue", "randomWalkUncertainty"),
+        request_id: "random-control:" + candidate.suggestion_id,
+      });
+    }
+    if (path === "/api/random-walk/clear")
+      return await toolkitAction("random-cancel");
+    if (path === "/api/reset")
+      throw Error(
+        "Load a preset or create a new structured campaign to reset initialization. The current history is preserved.",
+      );
+    if (path === "/api/delete-campaign")
+      throw Error(
+        "Shared campaign histories are retained. Use Save Copy or load another campaign.",
+      );
+    throw Error(
+      "This action applies to the generic dataset workflow. Start Fresh or load a legacy dataset to use it.",
+    );
+  } catch (error) {
+    renderError(error.message);
+    return null;
+  } finally {
+    setBusy(false);
+    if (state?.shared_campaign) renderShared();
+    scheduleSharedPoll();
+  }
+}
+function fieldVisible(id, show) {
+  const element = $(id);
+  if (element) element.closest(".field")?.classList.toggle("hidden", !show);
+}
+async function loadSharedCheckpoints() {
+  if (!sharedCampaignId) return;
+  const id = sharedCampaignId,
+    previous = $("checkpointSelect").value;
+  const result = await toolkitFetch(
+    "/api/moc/checkpoints?id=" + encodeURIComponent(id),
+    null,
+    "GET",
+  );
+  if (id !== sharedCampaignId) return;
+  $("checkpointSelect").innerHTML = result.checkpoints
+    .map(
+      (r) =>
+        `<option value="${escapeHtml(r.checkpoint_id)}">${escapeHtml(r.created_at)} · ${escapeHtml(r.name || r.reason || "Saved point")} · ${r.observation_count} measured / ${r.pending_count} pending</option>`,
+    )
+    .join("");
+  if (result.checkpoints.some((r) => r.checkpoint_id === previous))
+    $("checkpointSelect").value = previous;
+  $("restoreCheckpoint").disabled = !result.checkpoints.length;
+}
+function sharedHiddenCurves() {
+  try {
+    return JSON.parse(
+      localStorage.getItem("boicl_plot_visibility:" + sharedCampaignId) || "[]",
+    );
+  } catch (_) {
+    return [];
+  }
+}
+function sharedCurveVisible(id) {
+  return !sharedHiddenCurves().includes(id);
+}
+function renderSharedComparisons() {
+  const rows = (state.benchmark_runs || []).filter(
+    (r) => r.kind === "independent_campaign_comparison",
+  );
+  if (state.shared_control_id)
+    rows.push({
+      id: "random-control",
+      name: "Independent measured random control",
+      campaign_id: state.shared_control_id,
+    });
+  $("sharedComparisonChoices").innerHTML = rows.length
+    ? rows
+        .map(
+          (r) =>
+            `<label class="switchline"><input type="checkbox" data-curve="${escapeHtml(r.id)}" ${sharedCurveVisible(r.id) ? "checked" : ""}>${escapeHtml(r.name)} <a href="/?campaign=${encodeURIComponent(r.campaign_id)}">Open arm</a></label>`,
+        )
+        .join("")
+    : '<p class="muted">Create a matched pair or start an independent random control to add comparison curves.</p>';
+  document.querySelectorAll("[data-curve]").forEach(
+    (input) =>
+      (input.onchange = () => {
+        const hidden = new Set(sharedHiddenCurves());
+        if (input.checked) hidden.delete(input.dataset.curve);
+        else hidden.add(input.dataset.curve);
+        localStorage.setItem(
+          "boicl_plot_visibility:" + sharedCampaignId,
+          JSON.stringify([...hidden]),
+        );
+        renderPlot();
+        renderBenchmarkRuns();
+      }),
+  );
+}
+function renderShared() {
+  const enabled = Boolean(state?.shared_campaign),
+    config = state?.shared_config;
+  $("sharedQuality").classList.toggle("hidden", !enabled);
+  $("sharedPending").classList.toggle("hidden", !enabled);
+  $("sharedGPSettings").classList.toggle(
+    "hidden",
+    !enabled || $("optimizer").value !== "gpr_features",
+  );
+  $("sharedSelector").classList.toggle(
+    "hidden",
+    !enabled || $("optimizer").value !== "llm",
+  );
+  $("sharedProvenance").classList.toggle("hidden", !enabled);
+  $("sharedComparisons").classList.toggle("hidden", !enabled);
+  $("sharedCheckpoints").classList.toggle("hidden", !enabled);
+  $("sharedCampaignIdentity").classList.toggle("hidden", !enabled);
+  $("focusedView").href =
+    "/moc" +
+    (sharedCampaignId
+      ? "?campaign=" + encodeURIComponent(sharedCampaignId)
+      : "");
+  $("focusedView").classList.toggle(
+    "hidden",
+    enabled && config.data_schema === "generic",
+  );
+  [...$("optimizer").options].forEach((o) => {
+    if (["gpr_features", "gpr_embeddings"].includes(o.value))
+      o.disabled = !enabled;
+    if (o.value === "gpr") o.hidden = enabled;
+  });
+  if (!enabled) return;
+  $("sharedCampaignIdentity").textContent =
+    "Active campaign: " + config.name + " · " + sharedCampaignId;
+  $("engineStatus").textContent = state.shared_campaign.engine_label;
+  const llm = $("optimizer").value === "llm",
+    embedding = $("optimizer").value === "gpr_embeddings";
+  fieldVisible(
+    "ucbLambda",
+    llm && state.shared_config.llm.acquisition === "upper_confidence_bound",
+  );
+  $("llmPredictionTemperature")
+    .closest("details")
+    .classList.toggle("hidden", !llm);
+  fieldVisible(
+    "inverseTargetReferenceScale",
+    llm && config.data_schema === "generic",
+  );
+  $("inverseTargetReferenceScale").value = config.llm.reference_scale;
+  $("inverseTargetReferenceScale").readOnly = Boolean(config.bounds);
+  $("inverseTargetReferenceScaleHint").textContent = config.bounds
+    ? "The objective bounds set this scale to their width."
+    : "Positive scale in objective units, used only when the best measured objective is zero. Default: 1 objective unit.";
+  if (!llm && !embedding) {
+    $("keyStatus").textContent = "Structured GP runs locally";
+    $("keyStatus").className = "chip good";
+    $("embeddingDetail").textContent =
+      "Synthesis features are mapped explicitly; embeddings are not needed.";
+  } else if (state.shared_campaign.synthetic_demo) {
+    $("embeddingDetail").textContent =
+      "Synthetic demonstration vectors; production embeddings are not loaded.";
+  }
+  for (const id of [
+    "predictionModel",
+    "inverseModel",
+    "predictionSystemMessage",
+    "inverseSystemMessage",
+    "llmSamples",
+    "llmUncertaintyCalibration",
+    "llmPredictionTemperature",
+    "llmInverseTemperature",
+    "selectorK",
+    "inverseFilter",
+    "inverseTargetMultiplier",
+    "inverseTargetJitter",
+    "inverseTargetFloorValue",
+  ])
+    fieldVisible(id, llm);
+  for (const id of [
+    "embeddingModel",
+    "apiPauseSeconds",
+    "apiRetryAttempts",
+    "apiRateLimitCooldownSeconds",
+  ])
+    fieldVisible(id, llm || embedding);
+  fieldVisible("nNeighbors", embedding);
+  fieldVisible("sharedDimensions", embedding);
+  $("sharedDimensions").value = config.embedding_gp.dimensions;
+  for (const id of [
+    "objectiveScaling",
+    "inverseRandomCandidates",
+    "llmPoolScope",
+    "inverseTargetValue",
+    "inverseDesignCount",
+    "scoreLimit",
+    "replicatesPerCandidate",
+    "batchSize",
+    "llmDiagnostics",
+  ])
+    fieldVisible(id, false);
+  $("regeneratePrompts").classList.toggle("hidden", !llm);
+  $("inverseDesignPanel").classList.add("hidden");
+  $("objectiveName").readOnly = true;
+  $("workflowMode").disabled = true;
+  $("objectiveDirection").disabled = config.data_schema !== "generic";
+  $("objectiveLowerBound").readOnly = config.data_schema !== "generic";
+  $("objectiveUpperBound").readOnly = config.data_schema !== "generic";
+  $("prepareEmbeddings").disabled = busy || (!llm && !embedding);
+  $("deleteCampaign").disabled = true;
+  $("resetRun").disabled = true;
+  $("gpBurnIn").value = config.structured_gp.burn_in;
+  $("gpDraws").value = config.structured_gp.retained_draws;
+  $("gpThin").value = config.structured_gp.predict_thin;
+  $("sharedSelectorMode").value = config.llm.selector_mode;
+  $("predictionSystemMessage").placeholder =
+    state.shared_prompt_preview.forward;
+  $("inverseSystemMessage").placeholder = state.shared_prompt_preview.inverse;
+  for (const id of ["predictionSystemMessage", "inverseSystemMessage"])
+    $(id).title =
+      "Blank managed prompts are shown as placeholder text. Custom text, including an intentionally empty prompt, stays unchanged. Reset Prompts explicitly restores managed prompts.";
+  document.querySelector('label[for="iterationsPerTrial"]').textContent =
+    "New-measurement budget (blank = unlimited)";
+  document.querySelector('label[for="apiRetryAttempts"]').textContent =
+    "Maximum attempts (including first)";
+  $("iterationsPerTrial").value = config.new_measurement_budget ?? "";
+  $("workflowBanner").textContent =
+    (state.shared_campaign.synthetic_demo ? "SYNTHETIC DEMO · " : "") +
+    "Shared campaign " +
+    sharedCampaignId +
+    ". Reserve a recommendation, then record the measured outcome. Seeds are initialization at x=0; pending predictions do not enter the measured curve.";
+  const pending = state.suggestions.filter((r) => r.status === "pending"),
+    previous = $("pendingMeasurement").value;
+  $("pendingMeasurement").innerHTML = pending
+    .map(
+      (r) =>
+        `<option value="${r.suggestion_id}">${escapeHtml(r.candidate_id)}</option>`,
+    )
+    .join("");
+  if (previous) $("pendingMeasurement").value = previous;
+  $("addObservation").disabled = busy || !$("pendingMeasurement").value;
+  document
+    .querySelectorAll("[data-shared-reserve]")
+    .forEach(
+      (b) =>
+        (b.disabled =
+          busy ||
+          state.suggestions.find(
+            (r) => r.suggestion_id === b.dataset.sharedReserve,
+          )?.status === "pending"),
+    );
+  $("sharedRecord").textContent = JSON.stringify(
+    {
+      campaign_id: sharedCampaignId,
+      engine: state.shared_campaign.engine_label,
+      config,
+      history: state.shared_history,
+    },
+    null,
+    2,
+  );
+  $("measurementHint").textContent =
+    config.data_schema === "moc"
+      ? "Enter cubic MoC in wt% (0–100), esd in the Uncertainty field, and GOF and closure gap below."
+      : "Enter " +
+        config.objective +
+        (config.units ? " in " + config.units : " in original units") +
+        ". Optional measurement uncertainty is distinct from predictive uncertainty.";
+  document.querySelector('label[for="qualityGap"]').textContent =
+    config.data_schema === "moc"
+      ? "Closure gap (wt%)"
+      : "Quality gap (original metadata units)";
+  document.querySelector('label[for="randomWalkTarget"]').textContent =
+    "New control measurements";
+  $("clearRandomWalk").textContent = "Start new control";
+  $("clearRandomWalk").title =
+    "Release the pending random reservation and create a fresh independent arm; previous results remain saved.";
+  $("candidateSearch").closest(".field").classList.add("hidden");
+  $("clearCandidate").classList.add("hidden");
+  $("manualProcedure").readOnly = true;
+  $("candidateSearchResults").classList.add("hidden");
+  $("acquisition").disabled = !llm;
+  if (!llm) {
+    $("acquisition").innerHTML =
+      "<option>" +
+      (state.suggestions[0]?.acquisition_function ||
+        "Automatic: maximin / expected improvement") +
+      "</option>";
+  } else if (
+    ![...$("acquisition").options].some(
+      (o) => o.value === config.llm.acquisition,
+    )
+  )
+    setSelectOptions(
+      "acquisition",
+      state.acquisition_functions,
+      config.llm.acquisition,
+    );
+  $("refinementControls").classList.toggle("hidden", !refinementId);
+  $("addObservation").classList.toggle("hidden", Boolean(refinementId));
+  $("sharedReplayStep").innerHTML = state.shared_campaign.suggestions
+    .map(
+      (r) =>
+        `<option value="${r.suggestion_id}">${escapeHtml(r.candidate_id || r.status)} · ${r.status}</option>`,
+    )
+    .join("");
+  for (const anchor of document.querySelectorAll(
+    'a[href="/api/export-procedures.csv"],a[href="/api/export-observations.csv"]',
+  )) {
+    const kind = anchor.href.includes("procedures")
+      ? "procedures"
+      : "observations";
+    anchor.dataset.sharedExport = kind;
+  }
+  document
+    .querySelectorAll("[data-shared-export]")
+    .forEach(
+      (a) =>
+        (a.href =
+          "/api/toolkit/export?campaign=" +
+          sharedCampaignId +
+          "&kind=" +
+          a.dataset.sharedExport),
+    );
+  renderSharedComparisons();
+  if (graphOnly) {
+    document.body.classList.add("graph-only");
+  }
+}
+function renderSharedObservations() {
+  const rows = state.observations || [];
+  $("observations").innerHTML =
+    '<div class="scroll"><table><thead><tr><th>Experiment</th><th>Procedure</th><th>Value ± esd</th><th>Quality</th><th>Prediction</th><th></th></tr></thead><tbody>' +
+    rows
+      .map(
+        (r) =>
+          `<tr><td>${r.is_seed ? "Initialization" : escapeHtml(r.observation_id)}</td><td class="procedure">${escapeHtml(r.procedure)}</td><td>${fmt(r.value)}${r.uncertainty != null ? " ± " + fmt(r.uncertainty) : " (esd unknown)"}</td><td>GOF ${fmt(r.gof)}; gap ${fmt(r.closure_gap_wt_pct ?? r.closure_gap)}${r.refines_observation_id ? " · refinement" : ""}</td><td>${r.prediction?.mean != null ? fmt(r.prediction.mean) + (r.prediction.std != null ? " ± " + fmt(r.prediction.std) : "") : "—"}</td><td><button data-refine="${r.id}">Refine</button></td></tr>`,
+      )
+      .join("") +
+    "</tbody></table></div>";
+  document.querySelectorAll("[data-refine]").forEach(
+    (b) =>
+      (b.onclick = () => {
+        const row = rows.find((r) => r.id === b.dataset.refine);
+        refinementId = row.id;
+        $("objectiveValue").value = row.value;
+        $("objectiveUncertainty").value = row.uncertainty ?? "";
+        $("qualityGOF").value = row.gof ?? "";
+        $("qualityGap").value = row.closure_gap_wt_pct ?? row.closure_gap ?? "";
+        $("qualityGapOrigin").value = row.closure_gap_origin || "unknown";
+        $("qualityNote").value = row.source_note || "";
+        $("manualProcedure").value = row.procedure;
+        $("refinementReason").value = "";
+        renderShared();
+        $("liveResultPanel").scrollIntoView({ behavior: "smooth" });
+      }),
+  );
+}
+function renderSharedSuggestions() {
+  const rows = state.suggestions || [];
+  $("suggestions").innerHTML = rows.length
+    ? rows
+        .map(
+          (r) =>
+            `<article class="notice"><strong>${escapeHtml(r.status)} · ${escapeHtml(r.candidate_id)}</strong>${r.planned_quality_repeat ? " · planned quality repeat" : ""}<p class="procedure">${escapeHtml(r.procedure)}</p><p>${escapeHtml(r.selection_reason || "")} · Score ${fmt(r.acquisition)} ${escapeHtml(r.acquisition_units || "")}</p><p>Predicted ${fmt(r.mean)}${r.std != null ? " ± " + fmt(r.std) : ""}${r.prediction?.lower95 != null ? " · 95% latent interval " + fmt(r.prediction.lower95) + "–" + fmt(r.prediction.upper95) : ""}${r.prediction?.accepted_samples != null ? " · " + r.prediction.accepted_samples + "/" + r.prediction.requested_samples + " accepted responses" : ""}</p><button data-shared-reserve="${r.suggestion_id}" ${r.status === "pending" ? "disabled" : ""}>${r.status === "pending" ? "Reserved" : "Reserve experiment"}</button>${r.status === "pending" ? ` <button data-shared-use="${r.suggestion_id}">Enter result</button> <button data-shared-release="${r.suggestion_id}">Release</button>` : ""}</article>`,
+        )
+        .join("")
+    : '<div class="empty">No current suggestions. Start a suggestion to select an eligible recipe.</div>';
+  document.querySelectorAll("[data-shared-reserve]").forEach(
+    (b) =>
+      (b.onclick = () =>
+        toolkitAction("reserve", {
+          suggestion_id: b.dataset.sharedReserve,
+        }).catch((e) => renderError(e.message))),
+  );
+  document.querySelectorAll("[data-shared-release]").forEach(
+    (b) =>
+      (b.onclick = () =>
+        toolkitAction("release", {
+          suggestion_id: b.dataset.sharedRelease,
+        }).catch((e) => renderError(e.message))),
+  );
+  document.querySelectorAll("[data-shared-use]").forEach(
+    (b) =>
+      (b.onclick = () => {
+        const r = rows.find((r) => r.suggestion_id === b.dataset.sharedUse);
+        $("pendingMeasurement").value = r.suggestion_id;
+        setCandidateSelection(r, "Reserved");
+      }),
+  );
+}
+document.addEventListener("DOMContentLoaded", () => {
+  $("openCampaignTab").onclick = () => {
+    const selected = $("savedCampaign").value;
+    if (!selected.startsWith("shared:")) {
+      renderError(
+        "Choose an independent shared campaign to open it in a separate tab.",
+      );
+      return;
+    }
+    window.open(
+      "/?campaign=" + encodeURIComponent(selected.slice(7)),
+      "_blank",
+      "noopener",
+    );
+  };
+  $("sharedCheckpoints").ontoggle = () => {
+    if ($("sharedCheckpoints").open)
+      loadSharedCheckpoints().catch((e) => renderError(e.message));
+  };
+  $("refreshCheckpoints").onclick = () =>
+    loadSharedCheckpoints().catch((e) => renderError(e.message));
+  $("saveCheckpoint").onclick = async () => {
+    try {
+      await toolkitFetch("/api/moc/checkpoint", {
+        id: sharedCampaignId,
+        name: $("checkpointName").value || null,
+      });
+      await loadSharedCheckpoints();
+      renderNotice("Named checkpoint saved.");
+    } catch (e) {
+      renderError(e.message);
+    }
+  };
+  $("restoreCheckpoint").onclick = async () => {
+    try {
+      const checkpoint_id = $("checkpointSelect").value;
+      if (!checkpoint_id) throw Error("Choose a saved checkpoint.");
+      const result = await toolkitFetch("/api/moc/restore-checkpoint", {
+        id: sharedCampaignId,
+        checkpoint_id,
+      });
+      await chooseSharedCampaign(result.campaign_id);
+      renderNotice(
+        "Opened an independent campaign copy from the selected checkpoint.",
+      );
+    } catch (e) {
+      renderError(e.message);
+    }
+  };
+  const style = document.createElement("style");
+  style.textContent =
+    "body.graph-only header,body.graph-only aside,body.graph-only .shell>.stack>section:not(:first-child){display:none!important}body.graph-only .shell{display:block;padding:0;max-width:none}body.graph-only .shell>.stack>section:first-child{border:0;margin:0}#featureMapper table{font-size:12px}#featureMapper input,#featureMapper select{min-width:90px}#sharedProvenance pre{font-size:12px}";
+  document.head.append(style);
+  if (graphOnly) document.body.classList.add("graph-only");
+  $("saveRefinement").onclick = async () => {
+    try {
+      if (!$("refinementReason").value.trim())
+        throw Error("Enter the reason for this refinement.");
+      await toolkitAction("refine", {
+        observation_id: refinementId,
+        values: sharedMeasurement(),
+        reason: $("refinementReason").value,
+      });
+      refinementId = null;
+      renderShared();
+    } catch (e) {
+      renderError(e.message);
+    }
+  };
+  $("cancelRefinement").onclick = () => {
+    refinementId = null;
+    renderShared();
+  };
+  $("loadMocPreset").onclick = () => loadPreset(false);
+  $("loadMocPair").onclick = () => loadPreset(true);
+  async function loadPreset(pair) {
+    try {
+      setBusy(true);
+      const r = await toolkitFetch("/api/moc/" + (pair ? "pair" : "create"), {
+        preset: $("mocPreset").value,
+      });
+      await chooseSharedCampaign(pair ? r.gp : r.campaign_id);
+    } catch (e) {
+      renderError(e.message);
+    } finally {
+      setBusy(false);
+      if (state?.shared_campaign) renderShared();
+    }
+  }
+  $("embeddingModel").addEventListener("change", () => {
+    $("embeddingModel").dataset.edited = "true";
+  });
+  $("optimizer").addEventListener("change", () => {
+    const engine = $("optimizer").value;
+    if (state?.shared_campaign) {
+      if (engine === "llm" || engine === "gpr_embeddings")
+        setSelectOptions(
+          "embeddingModel",
+          state.embedding_model_presets,
+          engine === "llm"
+            ? state.shared_config.llm.embedding_model
+            : state.shared_config.embedding_gp.embedding_model,
+        );
+      renderShared();
+    } else if (
+      state &&
+      !state.campaign?.saved &&
+      !$("embeddingModel").dataset.edited
+    ) {
+      setSelectOptions(
+        "embeddingModel",
+        state.embedding_model_presets,
+        engine === "llm" ? "text-embedding-3-large" : "text-embedding-ada-002",
+      );
+    }
+  });
+  $("acquisition").addEventListener("change", () => {
+    if (state?.shared_campaign)
+      fieldVisible(
+        "ucbLambda",
+        $("optimizer").value === "llm" &&
+          $("acquisition").value === "upper_confidence_bound",
+      );
+  });
+  $("pendingMeasurement").onchange = () => {
+    const r = state.suggestions.find(
+      (r) => r.suggestion_id === $("pendingMeasurement").value,
+    );
+    if (r) setCandidateSelection(r, "Reserved");
+  };
+  $("sharedReplay").onclick = async () => {
+    try {
+      $("sharedReplayResult").textContent = JSON.stringify(
+        await toolkitFetch("/api/moc/replay", {
+          id: sharedCampaignId,
+          suggestion_id: $("sharedReplayStep").value,
+        }),
+        null,
+        2,
+      );
+    } catch (e) {
+      renderError(e.message);
+    }
+  };
+  $("sharedLog").onclick = async () => {
+    try {
+      $("sharedReplayResult").textContent = JSON.stringify(
+        await toolkitFetch(
+          "/api/toolkit/history?campaign=" +
+            encodeURIComponent(sharedCampaignId),
+          null,
+          "GET",
+        ),
+        null,
+        2,
+      );
+    } catch (e) {
+      renderError(e.message);
+    }
+  };
+  $("sharedCacheImport").onclick = async () => {
+    try {
+      await toolkitFetch("/api/moc/cache-import", {
+        id: sharedCampaignId,
+        path: $("sharedCachePath").value,
+      });
+      renderNotice("Cache validated and imported.");
+    } catch (e) {
+      renderError(e.message);
+    }
+  };
+  $("inspectFeatures").onclick = async () => {
+    try {
+      const file = $("datasetFile").files[0];
+      if (!file) throw Error("Choose a CSV or Excel file first.");
+      const response = await fetch(
+        "/api/toolkit/inspect-dataset?filename=" +
+          encodeURIComponent(file.name),
+        { method: "POST", body: await file.arrayBuffer() },
+      );
+      featureUpload = await response.json();
+      if (!response.ok) throw Error(featureUpload.error);
+      const options = featureUpload.columns
+        .map(
+          (c) =>
+            `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}</option>`,
+        )
+        .join("");
+      $("featureMapper").innerHTML =
+        `<label>Measured objective<select id="mappedObjective">${options}</select></label><label>Procedure column (optional)<select id="mappedProcedure"><option value="">Generate from selected features</option>${options}</select></label><label>Uncertainty column (optional)<select id="mappedSigma"><option value="">Not reported</option>${options}</select></label><label>Units<input id="mappedUnits"></label><div class="scroll"><table><thead><tr><th>Use feature</th><th>Transform</th><th>Full-space bounds / categories</th></tr></thead><tbody>${featureUpload.columns.map((c, i) => `<tr><td><label><input type="checkbox" data-feature="${i}" style="width:auto">${escapeHtml(c.name)}</label></td><td><select id="transform-${i}">${(c.numeric ? ["linear", "log", "log2"] : ["categorical"]).map((t) => `<option>${t}</option>`).join("")}</select></td><td><input id="bounds-${i}" value="${escapeHtml(JSON.stringify(c.bounds || c.values))}"></td></tr>`).join("")}</tbody></table></div><p class="hint">Choose only independent synthesis features. Set this dataset goal and bounds below. Objective/uncertainty columns must remain unchecked.</p>`;
+      $("featureMapper").insertAdjacentHTML(
+        "beforeend",
+        `<label>Optimization goal<select id="mappedDirection"><option value="maximize">Maximize</option><option value="minimize">Minimize</option></select></label><div class="row"><label>Objective lower bound<input id="mappedLower" type="number" step="any"></label><label>Objective upper bound<input id="mappedUpper" type="number" step="any"></label></div><p class="hint">Choose the goal and bounds for this dataset explicitly. Leave both bounds blank for an unbounded objective. Bounds are in original units.</p>`,
+      );
+      $("mappedDirection").value = "maximize";
+      $("mappedLower").value = "";
+      $("mappedUpper").value = "";
+      $("createStructured").classList.remove("hidden");
+    } catch (e) {
+      renderError(e.message);
+    }
+  };
+  $("createStructured").onclick = async () => {
+    try {
+      const feature_spec = [
+        ...document.querySelectorAll("[data-feature]:checked"),
+      ].map((e) => {
+        const i = Number(e.dataset.feature),
+          c = featureUpload.columns[i],
+          transform = $("transform-" + i).value;
+        return {
+          column: c.name,
+          transform,
+          [transform === "categorical" ? "values" : "bounds"]: JSON.parse(
+            $("bounds-" + i).value,
+          ),
+        };
+      });
+      const bounds = [
+        $("mappedLower").value === "" ? null : Number($("mappedLower").value),
+        $("mappedUpper").value === "" ? null : Number($("mappedUpper").value),
+      ];
+      const body = {
+        records: featureUpload.records,
+        feature_spec,
+        objective: $("mappedObjective").value,
+        procedure_column: $("mappedProcedure").value || null,
+        sigma_column: $("mappedSigma").value || null,
+        units: $("mappedUnits").value,
+        direction: $("mappedDirection").value,
+        bounds: bounds.every((v) => v === null) ? null : bounds,
+        name: $("campaignName").value || "Structured dataset campaign",
+      };
+      const r = await toolkitFetch("/api/toolkit/create-generic", body);
+      await chooseSharedCampaign(r.campaign_id);
+    } catch (e) {
+      renderError(e.message);
+    }
+  };
+});

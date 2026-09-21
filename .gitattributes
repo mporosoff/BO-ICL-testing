@@ -1,0 +1,4 @@
+# Exact source prompt and CSV bytes are part of the provenance contract.
+boicl/prompts/*.txt -text -whitespace
+boicl/data/moc/*.csv -text -whitespace
+*.gz binary

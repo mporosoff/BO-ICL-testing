@@ -1,0 +1,10 @@
+{
+  "operational_version": "moc-corrected-v1",
+  "sha256": {
+    "moc_inverse_v1.txt": "bb152fd5f041da682cf38e0ced6773f13d4fa3eb8bd2b74cd36270e10748366a",
+    "crystal_810c3f7_forward_original.txt": "ed0c7a8b2b5915858576d6736aad4476be75384b1c6312703716b4973ffcf818",
+    "crystal_810c3f7_inverse_original.txt": "21b2b63d4c928cad9675d0721bb51f81d3214a0c1097a3f85028d7e9b48c1028",
+    "moc_forward_v1.txt": "aab5f474408e698ce4358e7b50e9edc69b1ff45e73345f3df1f25d2be86cc99f"
+  },
+  "source_commit": "810c3f7d7ecc632e4cfd422977b10b471e526f82"
+}

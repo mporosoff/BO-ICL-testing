@@ -1,26 +1,23 @@
+"""Embedding GP compatibility API; use EmbeddingGPEngine for campaign workflows."""
 import ast
+import os
+from pathlib import Path
+import tempfile
+import uuid
+
 import numpy as np
 import pandas as pd
-from .pool import Pool
-from .asktell import AskTellFewShot, QuantileTransformer
-from .llm_model import GaussDist
-
-from langchain_core.prompts import FewShotPromptTemplate, PromptTemplate
-from langchain_core.example_selectors import (
-    MaxMarginalRelevanceExampleSelector,
-    SemanticSimilarityExampleSelector,
-)
-from langchain_community.vectorstores import FAISS, Chroma
-
-from typing import *
-from botorch.models.gp_regression import SingleTaskGP
-from gpytorch.likelihoods import GaussianLikelihood
-from gpytorch.mlls import ExactMarginalLogLikelihood
-from botorch.optim.fit import fit_gpytorch_mll_torch
 import torch
-from langchain_openai import OpenAIEmbeddings
-from sklearn.manifold import Isomap
-from openai import OpenAI
+from botorch.models.gp_regression import SingleTaskGP
+from botorch.models.transforms.outcome import Standardize
+from botorch.optim.fit import fit_gpytorch_mll_torch
+from gpytorch.mlls import ExactMarginalLogLikelihood
+
+from .asktell import AskTellFewShot
+from .embedding_cache import EmbeddingCache, EmbeddingSpec, sha256_text
+from .embedding_gp import fit_projection
+from .llm_model import GaussDist
+from .pool import Pool
 
 
 class AskTellGPR(AskTellFewShot):
@@ -31,440 +28,314 @@ class AskTellGPR(AskTellFewShot):
         cache_path=None,
         n_neighbors=5,
         embedding_model="text-embedding-ada-002",
+        embedding_dimensions=None,
+        embedder=None,
+        cancelled=None,
+        fit_steps=100,
+        request_settings=None,
+        seed=616,
         **kwargs,
     ):
-        super().__init__(**kwargs)
-        self._selector_k = None  # Forcing exemple_selector to not build context
-        self._set_regressor()
+        super().__init__(embedding_model=embedding_model, **kwargs)
+        self._selector_k = None
         self.examples = []
-        self.embedding_model = embedding_model
-        self._embedding = OpenAIEmbeddings(model=self.embedding_model)
-        self._embeddings_cache = self._get_cache(cache_path)
-        self.isomap = Isomap(n_components=n_components, n_neighbors=n_neighbors)
         self.pool = pool
-        if self.pool is not None:
-            self._initialize_isomap()
-
-    def _initialize_isomap(self):
-        pool_embeddings = self._query_cache(self.pool._available)
-        self.isomap.fit(pool_embeddings)
+        self.n_components, self.n_neighbors = n_components, n_neighbors
+        self.projection_seed = seed
+        self.isomap = None
+        self._projection_corpus = None
+        self._projection_lookup = {}
+        self.fit_steps = fit_steps
+        self._embedder = embedder
+        self._cancel_event = cancelled
+        self._cancelled = (
+            cancelled.is_set if hasattr(cancelled, "is_set") else cancelled
+        )
+        self._request_settings = request_settings
+        self._cache_path = Path(cache_path) if cache_path else None
+        dimensions = embedding_dimensions or {
+            "text-embedding-ada-002": 1536,
+            "text-embedding-3-large": 3072,
+            "text-embedding-3-small": 1536,
+        }.get(embedding_model)
+        if dimensions is None:
+            raise ValueError(
+                "Declare embedding_dimensions for an unfamiliar embedding model"
+            )
+        self.embedding_spec = EmbeddingSpec(embedding_model, dimensions)
+        safe_directory = (
+            self._cache_path.with_name(
+                self._cache_path.name + ".safe-" + self.embedding_spec.fingerprint[:12]
+            )
+            if self._cache_path
+            else Path(tempfile.mkdtemp(prefix="boicl-embedding-"))
+        )
+        self.embedding_cache = EmbeddingCache(safe_directory, self.embedding_spec)
+        self.cache_import_errors = []
+        self._embeddings_cache = self._get_cache(cache_path)
+        self._set_regressor()
 
     def _get_cache(self, cache_path=None):
-        try:
-            cache = pd.read_csv(cache_path)
-            if "embedding" in cache.columns:
-                cache["embedding"] = cache["embedding"].apply(self._parse_embedding)
-            if "embedding_model" not in cache.columns:
-                cache["embedding_model"] = self.embedding_model
-            print(f"Loaded cache from {cache_path}.")
-        except:
-            print("Cached embeddings not found. Creating new cache table.")
-            cache = pd.DataFrame({"x": [], "embedding": [], "embedding_model": []})
-        return cache
+        columns = ["x", "embedding", "embedding_model", "input_sha256", "dimensions"]
+        if not cache_path or not Path(cache_path).exists():
+            return pd.DataFrame(columns=columns)
+        cache = pd.read_csv(cache_path)
+        if not {"x", "embedding", "embedding_model"}.issubset(cache.columns):
+            self.cache_import_errors.append(
+                "Legacy CSV lacks explicit input or model identity; no rows reused"
+            )
+            return pd.DataFrame(columns=columns)
+        accepted = []
+        for _, row in cache.iterrows():
+            try:
+                if row["embedding_model"] != self.embedding_model:
+                    continue
+                exact = self.embedding_spec.format(row["x"])
+                digest = sha256_text(exact)
+                if (
+                    "input_sha256" in row
+                    and pd.notna(row["input_sha256"])
+                    and row["input_sha256"] != digest
+                ):
+                    raise ValueError("Legacy CSV exact-input hash mismatch")
+                if (
+                    "dimensions" in row
+                    and pd.notna(row["dimensions"])
+                    and int(row["dimensions"]) != self.embedding_spec.dimensions
+                ):
+                    raise ValueError("Legacy CSV declared dimension mismatch")
+                vector = self.embedding_cache._vector(
+                    self._parse_embedding(row["embedding"])
+                )
+                record = {
+                    "candidate_id": digest,
+                    "input_text": exact,
+                    "input_sha256": digest,
+                    "namespace": "candidate",
+                    "source": "validated legacy CSV; exact stored text",
+                }
+                self.embedding_cache._entries[self.embedding_cache._key(record)] = (
+                    record,
+                    vector,
+                )
+                accepted.append(
+                    dict(
+                        x=row["x"],
+                        embedding=vector.tolist(),
+                        embedding_model=self.embedding_model,
+                        input_sha256=digest,
+                        dimensions=self.embedding_spec.dimensions,
+                    )
+                )
+            except (TypeError, ValueError) as error:
+                self.cache_import_errors.append(str(error))
+        return pd.DataFrame(accepted, columns=columns)
 
     @staticmethod
     def _parse_embedding(value):
-        if isinstance(value, (list, tuple)):
-            return list(value)
-        if isinstance(value, np.ndarray):
-            return value.tolist()
-        if pd.isna(value):
-            return value
         if isinstance(value, str):
             try:
-                parsed = ast.literal_eval(value)
-            except (SyntaxError, ValueError):
-                return value
-            if isinstance(parsed, (list, tuple)):
-                return list(parsed)
-        return value
+                value = ast.literal_eval(value)
+            except (SyntaxError, ValueError) as error:
+                raise ValueError("Invalid numeric embedding list in CSV") from error
+        if isinstance(value, (list, tuple, np.ndarray)):
+            return list(value)
+        raise ValueError("Embedding must be a numeric list")
+
+    def _sync_legacy_table(self):
+        self._embeddings_cache = pd.DataFrame(
+            [
+                {
+                    "x": row["input_text"],
+                    "embedding": vector.tolist(),
+                    "embedding_model": self.embedding_model,
+                    "input_sha256": row["input_sha256"],
+                    "dimensions": self.embedding_spec.dimensions,
+                }
+                for row, vector in self.embedding_cache._entries.values()
+                if row.get("namespace") == "candidate"
+            ],
+            columns=["x", "embedding", "embedding_model", "input_sha256", "dimensions"],
+        )
 
     def save_cache(self, cache_path):
-        self._embeddings_cache.to_csv(cache_path, index=False)
+        self._sync_legacy_table()
+        path = Path(cache_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+        self._embeddings_cache.to_csv(temporary, index=False)
+        os.replace(temporary, path)
+        self.embedding_cache._checkpoint()
+
+    def _provider_embeddings(self, inputs):
+        if self._embedder:
+            return self._embedder(inputs)
+        # Construct remote clients only for an intentional cache miss. The
+        # shared wrapper owns total attempts, cancellation and request spacing.
+        from openai import OpenAI
+        from .request_policy import ReliableClient, RequestPolicy
+
+        if not hasattr(self, "_embedding_client"):
+            policy = RequestPolicy(self._request_settings, cancelled=self._cancel_event)
+            self._embedding_client = ReliableClient(OpenAI(max_retries=0), policy)
+        return self._embedding_client.embeddings.create(
+            input=inputs, model=self.embedding_model, encoding_format="float"
+        )
 
     def _query_cache(self, X):
-        """
-        Queries embeddings from cache; fetches missing embeddings via OpenAI API in batches.
-
-        Parameters:
-            X (list of str): Input data for which embeddings are needed.
-
-        Returns:
-            List of embeddings corresponding to X.
-        """
-        model_cache = self._embeddings_cache[
-            self._embeddings_cache["embedding_model"] == self.embedding_model
-        ]
-        in_cache = model_cache["x"].to_list()
-        not_in_cache = np.setdiff1d(X, in_cache).tolist()
-
-        not_in_cache = [
-            str(i) for i in not_in_cache if isinstance(i, str) and i.strip()
-        ]
-
-        batch_size = 5
-        new_embeddings = []
-
-        if len(not_in_cache) > 0:
-            print(
-                f"Processing {len(not_in_cache)} new items in {len(not_in_cache) // batch_size + 1} batches..."
-            )
-
-            client = OpenAI()
-
-            for i in range(0, len(not_in_cache), batch_size):
-                batch = not_in_cache[i : i + batch_size]
-
-                try:
-                    response = client.embeddings.create(
-                        input=batch,
-                        model=self.embedding_model,
-                        encoding_format="float",
-                    )
-
-                    batch_embeddings = [data.embedding for data in response.data]
-                    new_embeddings.extend(batch_embeddings)
-
-                except Exception as e:
-                    print(f"❌ Error processing batch {i//batch_size + 1}: {e}")
-                    continue
-
-            if new_embeddings:
-                self._embeddings_cache = pd.concat(
-                    [
-                        self._embeddings_cache,
-                        pd.DataFrame(
-                            {
-                                "x": not_in_cache,
-                                "embedding": new_embeddings,
-                                "embedding_model": self.embedding_model,
-                            }
-                        ),
-                    ],
-                    ignore_index=True,
-                )
-
-        else:
-            print("✅ No new items to process; all embeddings found in cache.")
-
-        embedding = []
-        for xi in X:
-            result = self._embeddings_cache[
-                (self._embeddings_cache["x"] == xi)
-                & (self._embeddings_cache["embedding_model"] == self.embedding_model)
-            ]["embedding"].to_list()
-            if result:
-                embedding.append(result[0])
-            else:
-                raise ValueError(
-                    f"❌ Embedding for '{xi}' not found in cache after update."
-                )
-
-        if len(embedding) != len(X):
+        values = list(X)
+        if any(not isinstance(x, str) or not x.strip() for x in values):
+            raise ValueError("Embedding inputs must be nonempty procedure strings")
+        unique = list(dict.fromkeys(values))
+        records = [{"candidate_id": sha256_text(x), "procedure": x} for x in unique]
+        report = self.embedding_cache.prepare(
+            records, self._provider_embeddings, batch_size=64, cancelled=self._cancelled
+        )
+        self._sync_legacy_table()
+        if self._cache_path:
+            self.save_cache(self._cache_path)
+        if report["missing_ids"]:
             raise ValueError(
-                "❌ Embedding length does not match X length. Caching issue detected."
+                f"{len(report['missing_ids'])} embeddings remain missing; successful batches saved for resume"
             )
+        matrix = self.embedding_cache.matrix(records)
+        by_input = dict(zip(unique, matrix))
+        return [by_input[x].tolist() for x in values]
 
-        return embedding
+    def _initialize_isomap(self):
+        if self.pool is None:
+            raise ValueError(
+                "Pass the fixed full candidate pool, including measured designs, before fitting embedding GP"
+            )
+        original = self.pool._pool if isinstance(self.pool, Pool) else list(self.pool)
+        corpus = list(dict.fromkeys(self.format_x(x) for x in original))
+        if not corpus:
+            raise ValueError("Embedding projection corpus is empty")
+        if self._projection_corpus == corpus:
+            return
+        vectors = self._query_cache(corpus)
+        self.isomap, coordinates, self.projection_diagnostics = fit_projection(
+            vectors, self.n_components, self.n_neighbors, self.projection_seed
+        )
+        self._projection_corpus = corpus
+        self._projection_lookup = dict(zip(corpus, coordinates))
+        self.projection_fingerprint = sha256_text(
+            str(
+                (
+                    corpus,
+                    self.embedding_spec.fingerprint,
+                    self.n_components,
+                    self.n_neighbors,
+                    self.projection_seed,
+                )
+            )
+        )
 
-    # def _query_cache(self, X):
-    #     in_cache = self._embeddings_cache["x"].to_list()
-    #     not_in_cache = np.setdiff1d(X, in_cache)
-    #     new_embeddings = []
-    #     # print("length in not in cache:",len(not_in_cache))
-    #     if not_in_cache.size > 0:
-    #         print(f"Processing {len(not_in_cache)} items...")
-    #         client = OpenAI()
-    #         for i in not_in_cache:
-    #             response = client.embeddings.create(
-    #                 input=i,
-    #                 model= "text-embedding-ada-002" #"text-embedding-3-small"
-    #             )
-    #             new_embeddings.append(response.data[0].embedding)
-    #     else:
-    #         print("No items in not_in_cache to process.")
-
-    #     #print(len(new_embeddings[0]),not_in_cache,type(X))
-    #     self._embeddings_cache = pd.concat(
-    #         [
-    #             self._embeddings_cache,
-    #             pd.DataFrame({"x": not_in_cache, "embedding": new_embeddings}),
-    #         ],
-    #         ignore_index=True,
-    #     )
-    #     print("Make it to 1")
-    #     embedding = [
-    #         self._embeddings_cache[self._embeddings_cache["x"] == xi][
-    #             "embedding"
-    #         ].to_list()[0]
-    #         for xi in X
-    #     ]
-
-    #     print("Make it to 2")
-
-    #     if len(embedding) != len(X):
-    #         raise ValueError(
-    #             (
-    #                 "Embedding length does not match X length."
-    #                 "Something went wrong on caching."
-    #             )
-    #         )
-    #     print("Make it to 3")
-
-    #     return embedding
+    def _project(self, X):
+        self._initialize_isomap()
+        if any(x not in self._projection_lookup for x in X):
+            raise ValueError(
+                "Procedure is absent from the fixed full projection corpus"
+            )
+        return np.asarray([self._projection_lookup[x] for x in X], dtype=float)
 
     def _set_regressor(self):
-        self.likelihood = GaussianLikelihood()
         self.regressor = None
-
-    def _setup_prompt(
-        self,
-        example: Dict,
-        prompt_template: Optional[PromptTemplate] = None,
-        suffix: Optional[str] = None,
-        prefix: Optional[str] = None,
-    ) -> FewShotPromptTemplate:
-        if prefix is None:
-            prefix = (
-                "The following are correctly answered questions. "
-                "Each answer is numeric and ends with ###\n"
-            )
-        if prompt_template is None:
-            prompt_template = PromptTemplate(
-                input_variables=["x", "y", "y_name"],
-                template="Q: Given {x}, what is {y_name}?\nA: {y}###\n\n",
-            )
-            if suffix is not None:
-                raise ValueError(
-                    "Cannot provide suffix if using default prompt template."
-                )
-            suffix = "Q: Given {x}. What is {y_name}?\nA: "
-        elif suffix is None:
-            raise ValueError("Must provide suffix if using custom prompt template.")
-        # test out prompt
-        if example is not None:
-            prompt_template.format(**example)
-            examples = [example]
-        # TODO: make fake example text
-        else:
-            examples = []
-        example_selector = None
-        if self._selector_k is not None:
-            if len(examples) == 0:
-                raise ValueError("Cannot do zero-shot with selector")
-            sim_selector = (
-                SemanticSimilarityExampleSelector
-                if self.cos_sim
-                else MaxMarginalRelevanceExampleSelector
-            )
-            example_selector = sim_selector.from_examples(
-                [example],
-                OpenAIEmbeddings(),
-                FAISS,
-                k=self._selector_k,
-            )
-        return FewShotPromptTemplate(
-            examples=examples if example_selector is None else None,
-            example_prompt=prompt_template,
-            example_selector=example_selector,
-            suffix=suffix,
-            prefix=prefix,
-            input_variables=["x", "y_name"],
-        )
-
-    def _predict(self, X):
-        if len(X) == 0:
-            raise ValueError("X is empty")
-        embedding = self._query_cache(X)
-        embedding_isomap = self.isomap.transform(embedding)
-        results = []
-        with torch.no_grad():
-            self.regressor.eval()
-            self.likelihood.eval()
-            means = self.likelihood(self.regressor(torch.tensor(embedding_isomap))).mean
-            stds = self.likelihood(
-                self.regressor(torch.tensor(embedding_isomap))
-            ).variance.sqrt()
-        results = [GaussDist(mean.item(), std.item()) for mean, std in zip(means, stds)]
-        return results, 0
+        self.likelihood = None
 
     def _train(self, X, y):
-        embedding = self._query_cache(X)
-        embedding = np.array(embedding)
-        if self.pool is None:
+        train_x = torch.as_tensor(self._project(X), dtype=torch.double)
+        train_y = torch.as_tensor(list(map(float, y)), dtype=torch.double).unsqueeze(-1)
+        if not torch.isfinite(train_y).all():
+            raise ValueError("Observed outcomes must be finite")
+        self.regressor = SingleTaskGP(
+            train_x, train_y, outcome_transform=Standardize(m=1)
+        )
+        self.likelihood = self.regressor.likelihood
+        mll = ExactMarginalLogLikelihood(self.likelihood, self.regressor)
+        fit_gpytorch_mll_torch(mll, step_limit=self.fit_steps)
 
-            embedding_isomap = self.isomap.fit_transform(embedding)
-
-        else:
-
-            embedding_isomap = self.isomap.transform(embedding)
-
-        print("emebdding check5")
-        train_x = torch.tensor(embedding_isomap)
-        print("emebdding check6")
-
-        train_y = torch.tensor(list(map(float, y))).unsqueeze(-1).double()
-        print("train check")
-        self.regressor = SingleTaskGP(train_x, train_y)
-        print("train check2")
-        mll = ExactMarginalLogLikelihood(self.regressor.likelihood, self.regressor)
-        fit_gpytorch_mll_torch(mll)
-
-    def _tell(self, x: str, y: float, alt_ys: Optional[List[float]] = None) -> Dict:
-        """Tell the optimizer about a new example."""
-        if self.use_quantiles:
-            self.qt = QuantileTransformer(
-                values=self._ys + [y], n_quantiles=self.n_quantiles
+    def _predict(self, X, observation_noise=False):
+        if not X or self.regressor is None:
+            raise ValueError("Fit measured observations before requesting predictions")
+        query = torch.as_tensor(self._project(X), dtype=torch.double)
+        with torch.no_grad():
+            self.regressor.eval()
+            self.regressor.likelihood.eval()
+            posterior = self.regressor.posterior(
+                query, observation_noise=observation_noise
             )
-            y = self.qt.to_quantiles(y)
+            means = posterior.mean.squeeze(-1)
+            stds = posterior.variance.clamp_min(0).sqrt().squeeze(-1)
+        return [GaussDist(mean.item(), std.item()) for mean, std in zip(means, stds)], 0
 
+    def tell(self, x, y, alt_ys=None, train=True):
         if alt_ys is not None:
-            raise ValueError("Alt ys not supported for GPR.")
-        example_dict = dict(
-            x=self.format_x(x),
-            y=self.format_y(y),
-            y_name=self._y_name,
-        )
-        self._ys.append(y)
-        inv_dict = dict(
-            x=self.format_x(x),
-            y=self.format_y(y),
-            y_name=self._y_name,
-            x_name=self._x_name,
-        )
-        return example_dict, inv_dict
-
-    def tell(
-        self, x: str, y: float, alt_ys: Optional[List[float]] = None, train=True
-    ) -> None:
-        # Reimplement tell to avoid feeding new points to the prompt exemple_selector
-        """Tell the optimizer about a new example."""
-        example_dict, inv_example = self._tell(x, y, alt_ys)
-
-        if not self._ready:
-            self.prompt = self._setup_prompt(
-                None, self._prompt_template, self._suffix, self._prefix
+            raise ValueError("Alternative completion responses are not GP measurements")
+        if self.use_quantiles:
+            raise ValueError(
+                "Embedding GP uses fitted outcome standardization; external quantile transformation is unsupported"
             )
-            self._ready = True
-
-        self.examples.append(example_dict)
+        procedure, outcome = self.format_x(x), float(y)
+        if not np.isfinite(outcome):
+            raise ValueError("Observed outcomes must be finite")
+        self.examples.append({"x": procedure, "y": outcome, "y_name": self._y_name})
+        self._observed_x.add(procedure)
+        self._ys.append(outcome)
         self._example_count += 1
-
+        self._ready = True
         if train:
-            try:
-                self._train(
-                    [
-                        self.prompt.format(
-                            x=ex["x"],
-                            y_name=self._y_name,
-                        )
-                        for ex in self.examples
-                    ],
-                    [ex["y"] for ex in self.examples],
-                )
-
-            except ValueError as e:
-                msg = (
-                    f"{40*'-'} ERROR {40*'-'}\n"
-                    f"{e}\n"
-                    f"Not enough data to train.\n"
-                    f"We use an isomap considering 5 neighbors. Therefore, more than 6 points are needed to train the model.\n"
-                    f"Use train=False to tell N-1 points to the model first.\n"
-                    f"Then use train=True to tell the last point to train the model.\n"
-                    f"Alternatively, use `pool` to pass a boicl.Pool to train the isomap during AskTellGPR construction.\n"
-                    f'{85*"-"}'
-                )
-                raise ValueError(msg)
-
-    def predict(
-        self, x: str, system_message: str = None
-    ) -> Union[Tuple[float, float], List[Tuple[float, float]]]:
-        # Reimplement predict to avoid creating llms and the inverse prompt
-        """Predict the probability distribution and values for a given x.
-
-        Args:
-            x: The x value(s) to predict.
-        Returns:
-            The probability distribution and values for the given x.
-
-        """
-        if not isinstance(x, list):
-            x = [x]
-        # if not self.regressor:
-        #     raise ValueError("Model not trained. Please provide more data.")
-        if not self._ready:
-            self.prompt = self._setup_prompt(
-                None, self._prompt_template, self._suffix, self._prefix
+            self._train(
+                [e["x"] for e in self.examples], [e["y"] for e in self.examples]
             )
-            self._ready = True
 
-        # if self._selector_k is not None:
-        #     self.prompt.example_selector.k = min(self._example_count, self._selector_k)
-
-        queries = [
-            self.prompt.format(
-                x=self.format_x(x_i),
-                y_name=self._y_name,
-            )
-            for x_i in x
-        ]
-        results, tokens = self._predict(queries)
+    def predict(self, x, system_message=None, observation_noise=False):
+        single = not isinstance(x, list)
+        values = [x] if single else x
+        inputs = [self.format_x(item) for item in values]
+        if observation_noise:
+            results, tokens = self._predict(inputs, observation_noise=True)
+        else:
+            results, tokens = self._predict(inputs)
         self.tokens_used += tokens
+        return results[0] if single else results
 
-        # compute mean and standard deviation
-        if len(x) == 1:
-            return results[0]
-        return results
-
-    def _ask(
-        self,
-        possible_x: List[str],
-        best: float,
-        aq_fxn: Callable,
-        k: int,
-        system_message: str,
-    ) -> Tuple[List[str], List[float], List[float]]:
-        results = self.predict(possible_x, system_message=system_message)
-        # drop empties
-        if type(results) != type([]):
-            results = [results]
-        results = [r for r in results if len(r) > 0]
-        aq_vals = [aq_fxn(r, best) for r in results]
-        selected = np.argsort(aq_vals)[::-1][:k]
-        means = [r.mean() for r in results]
-        stds = [r.std() for r in results]
-        print(selected, means, stds)
-
+    def _ask(self, possible_x, best, aq_fxn, k, system_message):
+        results = self.predict(possible_x)
+        results = results if isinstance(results, list) else [results]
+        records = [
+            (x, dist, float(aq_fxn(dist, best)))
+            for x, dist in zip(possible_x, results)
+            if len(dist) > 0
+        ]
+        records = [record for record in records if np.isfinite(record[2])]
+        records.sort(key=lambda record: -record[2])
+        records = records[:k]
         return (
-            [possible_x[i] for i in selected],
-            [aq_vals[i] for i in selected],
-            [means[i] for i in selected],
-            [stds[i] for i in selected],
+            [r[0] for r in records],
+            [r[2] for r in records],
+            [r[1].mean() for r in records],
+            [r[1].std() for r in records],
         )
 
     def ask(
         self,
-        possible_x: Union[Pool, List[str]],
-        aq_fxn: str = "upper_confidence_bound",
-        k: int = 1,
-        inv_filter: int = None,
-        aug_random_filter: int = None,
-        lambda_mult: float = 0.5,
-        _lambda: float = 0.5,
-        system_message: Optional[str] = "",
-        inv_system_message: Optional[str] = "",
-    ) -> Tuple[List[str], List[float], List[float]]:
-        # if inv_filter:
-        #     raise ValueError("Inverse filtering not supported for GPR.")
-
+        possible_x,
+        aq_fxn="expected_improvement",
+        k=1,
+        inv_filter=None,
+        aug_random_filter=None,
+        lambda_mult=0.5,
+        _lambda=0.5,
+        system_message="",
+        inv_system_message="",
+    ):
         return super().ask(
             possible_x,
             aq_fxn,
             k,
             inv_filter=0,
-            aug_random_filter=aug_random_filter
-            if aug_random_filter
-            else len(possible_x),
+            aug_random_filter=len(possible_x),
             lambda_mult=lambda_mult,
             _lambda=_lambda,
             system_message=system_message,

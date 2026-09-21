@@ -1,7 +1,10 @@
 """utilities for building and selecting from a pool"""
 from typing import List, Any, Callable
 import numpy as np
+import hashlib
+import json
 from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores.utils import DistanceStrategy
 from langchain_openai import OpenAIEmbeddings
 
 
@@ -23,32 +26,47 @@ class Pool:
         self,
         pool: List[Any],
         formatter: Callable = lambda x: str(x),
-        embedding_model: str = "text-embedding-ada-002",
+        embedding_model: str = "text-embedding-3-large",
     ) -> None:
         if type(pool) is not list:
             raise TypeError("Pool must be a list")
-        self._pool = pool
+        self._pool = list({formatter(item): item for item in pool}.values())
         self._selected = []
-        self._available = pool[:]
+        self._available = self._pool[:]
         self.format = formatter
         self.embedding_model = embedding_model
         self._db = None
+        self._db_fingerprint = None
 
     def _get_db(self):
-        if self._db is None:
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "texts": [self.format(x) for x in self._available],
+                    "model": self.embedding_model,
+                    "representation": "float32-l2-normalized-cosine-v1",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if self._db is None or self._db_fingerprint != fingerprint:
             self._db = FAISS.from_texts(
-                [self.format(x) for x in self._pool],
+                [self.format(x) for x in self._available],
                 OpenAIEmbeddings(model=self.embedding_model),
-                metadatas=[dict(data=p) for p in self._pool],
+                metadatas=[dict(data=p) for p in self._available],
+                normalize_L2=True,
+                distance_strategy=DistanceStrategy.MAX_INNER_PRODUCT,
             )
+            self._db_fingerprint = fingerprint
         return self._db
 
     def sample(self, n: int) -> List[str]:
         """Sample n items from the pool"""
         if n > len(self._available):
             raise ValueError("Not enough items in pool")
-        samples = np.random.choice(self._available, size=n, replace=False)
-        return samples
+        indices = np.random.choice(len(self._available), size=n, replace=False)
+        return [self._available[i] for i in indices]
 
     def choose(self, x: str) -> None:
         """Choose a specific item from the pool"""
@@ -57,13 +75,20 @@ class Pool:
         self._selected.append(x)
         self._available.remove(x)
 
-    def approx_sample(self, x: str, k: int, lambda_mult: float = 0.5) -> None:
+    def approx_sample(
+        self, x: str, k: int, lambda_mult: float = 0.5, fetch_k: int = 100
+    ) -> List[str]:
         """Given an approximation of x, return k similar"""
 
-        # want to select extra, then remove previously chosen
-        _k = k + len(self._selected)
+        if not self._available or k == 0:
+            return []
+        if not 0 <= lambda_mult <= 1:
+            raise ValueError("MMR lambda must lie between zero and one")
         docs = self._get_db().max_marginal_relevance_search(
-            x, k=_k, fetch_k=5 * _k, lambda_mult=lambda_mult
+            self.format(x),
+            k=min(k, len(self._available)),
+            fetch_k=min(fetch_k, len(self._available)),
+            lambda_mult=lambda_mult,
         )
         docs = [d.metadata["data"] for d in docs]
         # remove previously chosen
@@ -77,7 +102,7 @@ class Pool:
         self._available = self._pool[:]
 
     def __len__(self) -> int:
-        return len(self._pool)
+        return len(self._available)
 
     def __repr__(self) -> str:
         return f"Pool of {len(self)} items with {len(self._selected)} selected"

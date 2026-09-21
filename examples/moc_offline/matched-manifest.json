@@ -1,0 +1,26 @@
+{
+  "schema": "matched-campaign-v1",
+  "campaigns": [
+    "c7fa900a7f094e01be9ca5876b5477f0",
+    "ebc8002f04274a5ea2c91094d6236a0a"
+  ],
+  "pool_fingerprint": "b3434aca55ed5bff204f327c02f847c5d122f5e6f4093108eb68580a407d3193",
+  "initialization_fingerprint": "1bff85bf7f8ec28a592c97db07d4b29cf5752a1b984e1110d8b63c76ab5b130d",
+  "shared": {
+    "objective": "moc_wt_pct",
+    "bounds": [0.0, 100.0],
+    "direction": "maximize",
+    "repeat_policy": "source_reset_quality_repeats",
+    "new_measurement_budget": 3,
+    "seed": 616
+  },
+  "shared_later_outcomes": false,
+  "method_difference": "GP maximin below 10 distinct measured designs, then bounded transformed EI; LLM empirical EI from two designs",
+  "m12_resolution": {
+    "authoritative": 83.8,
+    "superseded": 81.7,
+    "authority": "user confirmation in handoff request",
+    "date": "2026-09-20"
+  },
+  "synthetic_demo": true
+}

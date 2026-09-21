@@ -1,0 +1,6 @@
+procedure,setting,hold,cost,esd,gof,gap
+Synthetic process A,1,1,42,0.5,1,0
+Synthetic process B,2,2,25,0.5,1,0
+Synthetic process C,3,4,10,0.5,1,0
+Synthetic process D,4,8,,,,
+Synthetic process E,5,16,,,,

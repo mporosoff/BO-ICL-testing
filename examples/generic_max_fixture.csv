@@ -1,0 +1,6 @@
+procedure,setting,hold,response,esd,gof,gap
+Synthetic recipe A,1,1,-4,0.2,1,0
+Synthetic recipe B,2,2,2,0.3,1,0
+Synthetic recipe C,3,4,7,0.4,1,0
+Synthetic recipe D,4,8,,,,
+Synthetic recipe E,5,16,,,,
