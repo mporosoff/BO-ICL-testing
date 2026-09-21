@@ -25,7 +25,7 @@ from .measurement_quality import (
     QUALITY_FIELDS as DEFINITION_FIELDS,
 )
 
-from .campaign_config import resolve_config, ENGINE_LABELS
+from .campaign_config import resolve_config, preview_preset, ENGINE_LABELS
 from .moc_import import (
     load_moc_package,
     digest,
@@ -47,6 +47,74 @@ def fingerprint(value):
     return digest(
         json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
     )
+
+
+def resolved_method_metadata(config):
+    """Describe the saved method, never a hard-coded source-study assumption."""
+    result = {
+        key: deepcopy(config[key])
+        for key in (
+            "engine",
+            "preset",
+            "preset_version",
+            "preset_provenance",
+            "new_measurement_budget",
+            "batch_size",
+            "auto_suggest",
+            "selection_policy",
+            "objective",
+            "units",
+            "bounds",
+            "direction",
+        )
+    }
+    result["engine_label"] = ENGINE_LABELS[config["engine"]]
+    result["settings_basis"] = "current_resolved_configuration"
+    if config["selection_policy"] == "random_control":
+        result.update(
+            acquisition="uniform_random",
+            acquisition_units=None,
+            description="Independent uniform random selection from eligible candidates",
+        )
+    elif config["engine"] == "gpr_features":
+        gp = config["structured_gp"]
+        threshold = gp["ei_after_unique_measured_designs"]
+        units = (
+            "standardized objective units"
+            if config["bounds"] is None
+            else "standardized padded-logit units"
+        )
+        result.update(
+            acquisition="expected_improvement",
+            acquisition_units=units,
+            ei_after_unique_measured_designs=threshold,
+            xi=gp["ei_xi_standardized_logit"],
+            coverage_acquisition="maximin",
+            description=f"GP maximin below {threshold} distinct measured designs, then expected improvement in {units} (xi={gp['ei_xi_standardized_logit']})",
+        )
+    elif config["engine"] == "llm":
+        llm = config["llm"]
+        units = (
+            "probability"
+            if llm["acquisition"] == "probability_of_improvement"
+            else "raw objective units"
+        )
+        result.update(
+            acquisition=llm["acquisition"],
+            acquisition_units=units,
+            xi=llm["xi"],
+            min_observed_designs=2,
+            forward_model=llm["forward_model"],
+            inverse_model=llm["inverse_model"],
+            description=f"LLM empirical {llm['acquisition']} from two designs in {units} (xi={llm['xi']})",
+        )
+    else:
+        result.update(
+            acquisition="expected_improvement",
+            acquisition_units="raw objective units",
+            description="Embedding GP Gaussian expected improvement in raw objective units",
+        )
+    return result
 
 
 def toolkit_revision():
@@ -155,6 +223,7 @@ class CampaignService:
             "[a-f0-9]{32}", data["campaign_id"]
         ):
             raise ValueError("Invalid campaign ID")
+        data["resolved_method"] = resolved_method_metadata(data["config"])
         checkpoint = self._write_checkpoint(data, reason=reason)
         try:
             atomic_json(self.root / f"campaign-{data['campaign_id']}.json", data)
@@ -425,6 +494,11 @@ class CampaignService:
                     definition["historical_policy"],
                     definition["decision_reason"],
                 )
+        data["provenance"]["preset_at_creation"] = {
+            "settings_basis": "creation_time_snapshot",
+            "config": deepcopy(data["config"]),
+            "preset_provenance": deepcopy(data["config"]["preset_provenance"]),
+        }
         with self.lock:
             self._save(data, reason="Campaign created")
             self.campaigns[data["campaign_id"]] = data
@@ -529,11 +603,25 @@ class CampaignService:
             "value" if data["config"].get("data_schema") == "generic" else "moc_wt_pct"
         )
 
-    def create_pair(self, package=None, overrides=None, synthetic_demo=False):
+    def create_pair(
+        self, package=None, overrides=None, synthetic_demo=False, *, study="source"
+    ):
+        if study not in {"source", "five_point"}:
+            raise ValueError("Unknown matched-pair study; choose source or five_point")
         package = package or load_moc_package()
-        gp = self.create("moc_gp", package, overrides, synthetic_demo)
-        llm = self.create("moc_llm", package, overrides, synthetic_demo)
+        prefix = "moc_five_" if study == "five_point" else "moc_"
+        # Validate both configurations before creating either campaign.
+        resolve_config(prefix + "gp", overrides)
+        resolve_config(prefix + "llm", overrides)
+        gp = self.create(prefix + "gp", package, overrides, synthetic_demo)
+        llm = self.create(prefix + "llm", package, overrides, synthetic_demo)
         manifest = self.comparison(gp, llm)
+        manifest.update(settings_basis="creation_time_snapshot", study=study)
+        with self.lock:
+            for cid in (gp, llm):
+                data = self.get(cid)
+                data["provenance"]["matched_pair_at_creation"] = deepcopy(manifest)
+                self._save(data, reason="Matched pair created")
         atomic_json(self.root / f"matched-{gp}-{llm}.json", manifest)
         return {"gp": gp, "llm": llm, "manifest": manifest}
 
@@ -541,6 +629,7 @@ class CampaignService:
         a, b = self.get(gp), self.get(llm)
         keys = [
             "objective",
+            "units",
             "bounds",
             "direction",
             "repeat_policy",
@@ -562,7 +651,21 @@ class CampaignService:
             initialization_fingerprint=a["initialization_fingerprint"],
             shared={k: a["config"][k] for k in keys},
             shared_later_outcomes=False,
-            method_difference="GP maximin below 10 distinct measured designs, then bounded transformed EI; LLM empirical EI from two designs",
+            settings_basis="current_resolved_configuration",
+            methods={
+                data["campaign_id"]: resolved_method_metadata(data["config"])
+                for data in (a, b)
+            },
+            creation_snapshots={
+                data["campaign_id"]: deepcopy(
+                    data["provenance"].get("preset_at_creation")
+                )
+                for data in (a, b)
+            },
+            method_difference="; ".join(
+                resolved_method_metadata(data["config"])["description"]
+                for data in (a, b)
+            ),
             m12_resolution=a["provenance"].get("m12_resolution"),
             synthetic_demo=a["synthetic_demo"] or b["synthetic_demo"],
         )
@@ -583,6 +686,7 @@ class CampaignService:
             return dict(
                 campaign_id=cid,
                 config=deepcopy(data["config"]),
+                resolved_method=resolved_method_metadata(data["config"]),
                 engine_label=ENGINE_LABELS[data["config"]["engine"]],
                 counts=dict(
                     candidates=len(data["candidates"]),
@@ -626,6 +730,8 @@ class CampaignService:
                     "name": d["config"]["name"],
                     "engine": ENGINE_LABELS[d["config"]["engine"]],
                     "data_schema": d["config"].get("data_schema", "moc"),
+                    "preset": d["config"]["preset"],
+                    "preset_version": d["config"]["preset_version"],
                     "selection_policy": d["config"].get("selection_policy", "engine"),
                     "comparison_parent_id": d["config"].get("comparison_parent_id"),
                     "created_at": d["created_at"],
@@ -635,6 +741,88 @@ class CampaignService:
                 }
                 for d in self.campaigns.values()
             ]
+
+    def preview_preset(self, preset, overrides=None, cid=None):
+        """Preview an explicit preset change without writes, inference or cache work."""
+        if cid is None:
+            return preview_preset(preset, overrides)
+        data = self.get(cid)
+        before = data["config"]
+        factory = resolve_config(preset)
+        if factory["data_schema"] != before["data_schema"]:
+            raise ValueError(
+                "Cannot apply a generic preset to MoC data or a MoC preset to generic data; create a new mapped campaign"
+            )
+        if factory["initialization"] != before["initialization"]:
+            raise ValueError(
+                "Preset initialization differs from this campaign; three/eight-observation changes require a new campaign"
+            )
+        if overrides is not None and not isinstance(overrides, dict):
+            raise ValueError("Configuration overrides must be an object")
+        changes = deepcopy(overrides or {})
+        preserved = [
+            "measurement_definition",
+            "selection_policy",
+            "comparison_parent_id",
+        ]
+        if before["data_schema"] == "generic":
+            preserved.extend(["objective", "units", "direction", "bounds"])
+        for key in preserved:
+            if key in changes and changes[key] != before[key]:
+                raise ValueError(
+                    f"Applying a preset must preserve {key}; use its explicit campaign action instead"
+                )
+            changes[key] = deepcopy(before[key])
+        if "name" not in changes:
+            changes["name"] = before["name"]
+            preserved.append("name")
+        if before["data_schema"] == "generic":
+            gp = changes.setdefault("structured_gp", {})
+            llm = changes.setdefault("llm", {})
+            if not isinstance(gp, dict) or not isinstance(llm, dict):
+                raise ValueError("Engine settings must be objects")
+            for key in ("feature_spec", "logit_delta_pp"):
+                if key in gp and gp[key] != before["structured_gp"][key]:
+                    raise ValueError(
+                        f"Applying a preset must preserve the generic {key} mapping"
+                    )
+                gp[key] = deepcopy(before["structured_gp"][key])
+                preserved.append("structured_gp." + key)
+            for key in ("forward_system_message", "inverse_system_message"):
+                if key not in llm:
+                    llm[key] = before["llm"][key]
+                    preserved.append("llm." + key)
+        result = preview_preset(preset, changes)
+        proposed = deepcopy(data)
+        proposed["config"] = deepcopy(result["config"])
+        self._validate_bundle(proposed)
+        result.update(campaign_id=cid, before=before, preserved_fields=preserved)
+        return result
+
+    def apply_preset(self, cid, preset, overrides=None):
+        """Explicitly apply factory settings while keeping the campaign's ledger."""
+        with self.lock:
+            preview = self.preview_preset(preset, overrides, cid)
+            data = self.get(cid)
+            if data["config"] == preview["config"]:
+                return self.summary(cid)
+            previous = deepcopy(data["config"]["preset_provenance"])
+            data["config"] = deepcopy(preview["config"])
+            data["provenance"].setdefault("preset_applications", []).append(
+                {
+                    "at": now(),
+                    "previous": previous,
+                    "applied": deepcopy(data["config"]["preset_provenance"]),
+                    "resolved_config_sha256": fingerprint(data["config"]),
+                    "preserved_fields": preview["preserved_fields"],
+                }
+            )
+            self._invalidate(
+                data,
+                f"Preset explicitly applied: {preview['name']} v{preview['version']}; measurements and initialization preserved",
+            )
+            self._save(data, reason="Preset explicitly applied")
+        return self.summary(cid)
 
     def update_config(self, cid, changes, apply=True):
         with self.lock:
@@ -1503,12 +1691,14 @@ class CampaignService:
             "toolkit_code_revision",
             "imported_from_campaign_id",
             "restored_from_checkpoint",
+            "resolved_method",
         }
         if set(data) - known:
             raise ValueError(
                 f"Unknown campaign bundle fields: {sorted(set(data)-known)}"
             )
         required = known - {
+            "resolved_method",
             "initial_observations",
             "toolkit_code_revision",
             "imported_from_campaign_id",
@@ -1992,6 +2182,7 @@ class CampaignService:
         )
         data["provenance"].setdefault("measurement_quality_default", quality_metadata())
         validate_training_definitions(data)
+        data["resolved_method"] = resolved_method_metadata(data["config"])
 
     def export(self, cid):
         with self.lock:

@@ -5,6 +5,14 @@ synthesis-parameter GP, a matched GPT-4o BO-ICL campaign, and a separate embeddi
 baseline. The included 7,776-design dataset starts from M7=72.1, M12=83.8, and
 M13=23.4 wt%. The structured GP runs entirely offline without credentials.
 
+Built-in **MoC five-point comparison — six-variable GP** and **MoC five-point
+comparison — BO-ICL LLM** presets (v1.0.0) configure five new syntheses per arm,
+automatic refresh off, and GP expected improvement from the three supplied seeds.
+The source-compatible GP preset retains its ten-design coverage threshold.
+See [the five-point study guide](docs/MOC_FIVE_POINT_STUDY.md) for configuration,
+cache readiness and continuation steps. Generic applications retain their own
+dataset, objective, bounds, prompts and budget.
+
 Start with [the MoC operator guide](docs/MOC_OPERATOR_GUIDE.md),
 [migration and audit notes](docs/MOC_MIGRATION_AND_AUDIT.md), and
 [implementation verification](docs/MOC_IMPLEMENTATION_REPORT.md).
@@ -59,10 +67,16 @@ Open the browser app, paste API keys in the **API Keys** panel, and click
 
 ## Shared campaigns in the main and focused views
 
-The main toolkit is the landing page. **Load preset** creates a new shared campaign;
+The main toolkit is the landing page. **Built-in presets → Create campaign from preset** creates a new shared campaign after previewing its complete configuration;
 **Load Selected** resumes a saved one. The optional **Focused campaign view** opens
 the same MoC campaign ID and graph. Generic shared campaigns use the main view.
 **Resume selected as independent copy** restores a checkpoint as a new arm.
+
+**Review matched GP + LLM pair → Create reviewed matched pair** creates the
+five-point study arms. **Preset action → Apply/reset current shared campaign**
+explicitly reviews a preset reset while preserving measurements. Saved campaign
+settings and preset versions survive reload, archive import and checkpoints;
+factory updates are never silently applied to an existing campaign.
 
 The shared graph gives initialization separate consecutive positions i1, i2,
 i3, … in a shaded region, then a divider before BO steps 1, 2, … . Those initial
@@ -330,8 +344,10 @@ are not unit-cube scaled. These warnings are not OpenAI API errors; they mean
 the GP has little variation to learn from.
 
 LLM campaigns with fewer than two distinct measured designs use an explicit
-initial-design stage without a chat call. Structured MoC GP uses maximin coverage
-until ten distinct designs; generic structured GP defaults to two.
+initial-design stage without a chat call. The source-compatible structured MoC
+GP uses maximin coverage until ten distinct designs. The five-point study preset
+uses threshold three, and therefore EI from its supplied seeds; generic
+structured GP defaults to two. The saved threshold governs each campaign.
 
 ## Files And Local State
 

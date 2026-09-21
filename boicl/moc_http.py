@@ -35,10 +35,15 @@ def service(handler):
 
 
 def get(handler, parsed):
-    svc = service(handler)
     query = parse_qs(parsed.query)
     cid = query.get("id", [""])[0]
     action = parsed.path.rsplit("/", 1)[-1]
+    if action == "presets":
+        from .campaign_config import preset_catalog
+
+        handler._send_json({"presets": preset_catalog()})
+        return
+    svc = service(handler)
     if action == "list":
         handler._send_json(
             {
@@ -165,14 +170,22 @@ def post(handler, parsed):
         )
         options = {
             "package": package,
-            "overrides": {"new_measurement_budget": p.get("budget")},
+            "overrides": {"new_measurement_budget": p["budget"]}
+            if "budget" in p
+            else None,
             "synthetic_demo": bool(getattr(type(handler), "moc_demo", False)),
         }
+        if action == "pair" and "study" in p:
+            options["study"] = p["study"]
         result = (
             svc.create_pair(**options)
             if action == "pair"
             else {"campaign_id": svc.create(p.get("preset", "moc_llm"), **options)}
         )
+    elif action == "preset-preview":
+        result = svc.preview_preset(p["preset"], overrides=p.get("overrides"), cid=cid)
+    elif action == "preset-apply":
+        result = svc.apply_preset(cid, p["preset"], overrides=p.get("overrides"))
     elif action == "suggest":
         result = svc.start_suggestion(cid)
     elif action == "inverse-proposal":

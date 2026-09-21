@@ -2,7 +2,31 @@
 
 This audit compares the effective configuration with the local handoff's `01_IMPLEMENTATION_PROMPT.md`, `03_EMBEDDINGS_AND_RUN_READINESS.md`, and `profiles/matched_campaign_requirements.json`, including the documented corrections to crystal snapshot `810c3f7d7ecc632e4cfd422977b10b471e526f82`. The handoff is reference input, not installed application content. The managed preset resolver is [campaign_config.py](../boicl/campaign_config.py); the main and focused views, CLI, exported configuration, and shared engine dispatcher use it.
 
-The values below apply to new campaigns. Explicit settings and custom prompts in existing saved campaigns remain authoritative. An engine change does not turn a generic objective into MoC chemistry. No live provider call or laboratory result was used to validate these defaults.
+The source-continuation values below apply to new source-compatible campaigns.
+The versioned five-point study presets have the explicit differences listed here.
+Explicit settings and custom prompts in existing saved campaigns remain authoritative.
+An engine change does not turn a generic objective into MoC chemistry. No live
+provider call or laboratory result was used to validate these defaults.
+
+## Five-point study presets, version 1.0.0
+
+**MoC five-point comparison — six-variable GP** (`moc_five_gp`) and **MoC
+five-point comparison — BO-ICL LLM** (`moc_five_llm`) are built-in complete
+configurations. Both set the new-measurement budget to five, batch size to one,
+and automatic suggestion refresh to false. The GP sets
+`ei_after_unique_measured_designs=3`; its first new recommendation uses EI.
+Source GP `moc_gp` retains threshold ten. Both GP presets preserve transformed
+EI with `ei_xi_standardized_logit=0.01`, kernel, feature transforms, quality noise,
+bounded response and production sampler. Remaining study LLM settings match the
+corrected defaults below. Cooling remains a fixed approximately four-hour
+laboratory step, outside the six features.
+
+Reusable `ENGINE_DEFAULTS`, named study settings and saved campaign overrides
+are separate. Full resolved configurations and preset provenance/version survive
+loading, checkpoint copies and export/import. Factory updates do not reset older
+campaigns. Deliberate preset application is reviewed, preserves the physical
+ledger and compatible dataset/provenance fields, and records the change.
+See [the study guide](MOC_FIVE_POINT_STUDY.md).
 
 ## Campaign and LLM defaults
 

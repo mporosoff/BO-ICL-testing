@@ -19,6 +19,8 @@ def catalog(service):
             observation_count=row["observation_count"],
             benchmark_count=0,
             dataset_filename="shared campaign",
+            preset=row.get("preset"),
+            preset_version=row.get("preset_version"),
         )
         for row in service.list()
     ]
@@ -33,6 +35,9 @@ def legacy_config(config):
     api = config["api"]
     bounds = config["bounds"] or [None, None]
     result.update(
+        preset=config["preset"],
+        preset_version=config.get("preset_version"),
+        preset_provenance=deepcopy(config.get("preset_provenance")),
         workflow_mode="live",
         optimizer=config["engine"],
         objective_name=config["objective"],

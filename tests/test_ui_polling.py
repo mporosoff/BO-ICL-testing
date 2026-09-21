@@ -378,7 +378,7 @@ const source=fs.readFileSync(process.argv[1],'utf8');
 async function exercise(scenario){
  const elements=new Map(),calls=[],errors=[];let resolveConfig,rejectConfig,resolveProposal,loads=0;
  const el=id=>{if(!elements.has(id))elements.set(id,{value:id==='manualTarget'?'0':'3'});return elements.get(id);};
- const context={current:'arm-a',$:el,guarded:async fn=>{try{await fn();}catch(e){errors.push(e.message);}},
+ const context={current:'arm-a',campaignEpoch:0,requireSavedSettings(){},$:el,guarded:async fn=>{try{await fn();}catch(e){errors.push(e.message);}},
   api:async(action,body)=>{calls.push({action,body});
    if(action==='config')return new Promise((resolve,reject)=>{resolveConfig=resolve;rejectConfig=reject;});
    return new Promise(resolve=>{resolveProposal=resolve;});},load:async()=>{loads+=1;}};
