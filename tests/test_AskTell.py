@@ -26,6 +26,63 @@ LIVE_API_TESTS = os.environ.get("RUN_LIVE_API_TESTS") == "1"
 np.random.seed(0)
 
 
+def test_failed_middle_prediction_retains_candidate_ownership():
+    from boicl.aqfxns import expected_improvement
+    from boicl.llm_model import make_dd
+
+    model = AskTellFewShotTopk()
+    model.predict = lambda *args, **kwargs: [
+        make_dd([10, 10], [0.5, 0.5]),
+        make_dd([], []),
+        make_dd([80, 90], [0.5, 0.5]),
+    ]
+    selected, acquisition, means = model._ask(
+        ["a", "failed", "c"], 20, expected_improvement, 2, "system"
+    )
+    assert selected == ["c", "a"]
+    assert means == [85, 10]
+    assert acquisition == [65, 0]
+    assert model.last_prediction_records[1]["candidate"] == "failed"
+
+
+def test_calibration_zero_is_valid_and_inverse_requests_one_completion(monkeypatch):
+    from boicl import asktell as module
+
+    calls = []
+    monkeypatch.setattr(module, "get_llm", lambda **kwargs: calls.append(kwargs))
+    model = AskTellFewShotTopk()
+    model.set_calibration_factor(0)
+    assert model._calibration_factor == 0
+    model._setup_inv_llm("gpt-4o")
+    model._setup_llm("gpt-4o")
+    assert [call["n"] for call in calls] == [1, 5]
+    assert all("best_of" not in call and "top_p" not in call for call in calls)
+
+
+def test_pool_excludes_selected_before_building_retrieval(monkeypatch):
+    import boicl.pool as module
+
+    seen = []
+
+    class FakeDB:
+        def max_marginal_relevance_search(self, query, **kwargs):
+            seen.append((query, kwargs))
+            return []
+
+    def build(texts, embeddings, **kwargs):
+        seen.append((texts, kwargs))
+        return FakeDB()
+
+    monkeypatch.setattr(module.FAISS, "from_texts", build)
+    monkeypatch.setattr(module, "OpenAIEmbeddings", lambda **kwargs: object())
+    pool = Pool(["a", "b", "b", "c"], formatter=lambda x: "prefix:" + x)
+    pool.choose("a")
+    pool.approx_sample("query", 2)
+    assert seen[0][0] == ["prefix:b", "prefix:c"]
+    assert seen[1][0] == "prefix:query"
+    assert len(pool) == 2
+
+
 def pytest_generate_tests(metafunc):
     if "asktell_class" in metafunc.fixturenames:
         models = metafunc.cls.asktells_to_test()

@@ -1,0 +1,35 @@
+{
+  "synthetic_demo": true,
+  "provider_calls": 0,
+  "laboratory_validation": false,
+  "arms": {
+    "gp": {
+      "initial_candidate": "moc-32c375b3a148b782",
+      "next_candidate": "moc-9977ffb796cc65cf",
+      "counts_after_resume": {
+        "candidates": 7776,
+        "measured": 4,
+        "unique_measured": 4,
+        "pending": 1,
+        "available": 7771,
+        "new_measurements": 1
+      },
+      "replay_verified": true,
+      "selection_reason": "Space-filling: 3 of 10 measured designs; greatest distance to active observed designs"
+    },
+    "llm": {
+      "initial_candidate": "moc-162520bf1f942295",
+      "next_candidate": "moc-716c19031cbf9ac9",
+      "counts_after_resume": {
+        "candidates": 7776,
+        "measured": 4,
+        "unique_measured": 4,
+        "pending": 1,
+        "available": 7771,
+        "new_measurements": 1
+      },
+      "replay_verified": true,
+      "selection_reason": "Highest empirical acquisition; stable retrieval-order ties"
+    }
+  }
+}

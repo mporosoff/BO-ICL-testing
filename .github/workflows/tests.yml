@@ -24,8 +24,6 @@ jobs:
           pre-commit run --all-files
 
   test:
-    # Skip this job for now - will be re-enabled later
-    if: false
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -46,7 +44,5 @@ jobs:
         run: |
           pip install .[gpr]
       - name: Run Test
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           pytest tests

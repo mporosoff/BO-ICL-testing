@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -103,21 +104,26 @@ PREDICTION_GUARDRAIL_MARKER = "Prediction task guardrail:"
 
 DEFAULT_CONFIG = {
     "workflow_mode": "live",
-    "optimizer": "gpr",
+    "optimizer": "llm",
     "objective_name": "objective",
     "objective_direction": "maximize",
     "objective_scaling": "off",
     "objective_lower_bound": "",
     "objective_upper_bound": "",
-    "acquisition": "upper_confidence_bound",
-    "embedding_model": "text-embedding-ada-002",
+    "acquisition": "expected_improvement",
+    "embedding_model": "text-embedding-3-large",
     "prediction_model": "gpt-4o",
     "inverse_model": "gpt-4o",
     "prediction_system_message": DEFAULT_PREDICTION_SYSTEM_MESSAGE,
     "inverse_system_message": DEFAULT_INVERSE_SYSTEM_MESSAGE,
-    "llm_samples": 3,
+    "prediction_prompt_managed_hash": None,
+    "inverse_prompt_managed_hash": None,
+    "llm_samples": 5,
     "llm_uncertainty_calibration": 1.0,
-    "selector_k": 0,
+    "llm_prediction_temperature": 0.7,
+    "llm_inverse_temperature": 0.7,
+    "llm_diagnostics": False,
+    "selector_k": 5,
     "llm_pool_scope": "full",
     "inverse_filter": 16,
     "inverse_random_candidates": 0,
@@ -125,7 +131,7 @@ DEFAULT_CONFIG = {
     "inverse_target_multiplier": 1.2,
     "inverse_target_jitter": 0.05,
     "inverse_target_floor_value": "",
-    "inverse_design_count": 3,
+    "inverse_design_count": 1,
     "batch_size": 1,
     "iterations_per_trial": 0,
     "replicates_per_candidate": 1,
@@ -136,13 +142,13 @@ DEFAULT_CONFIG = {
     "benchmark_seed": 0,
     "greedy_final_iteration": False,
     "random_replicates": 0,
-    "ucb_lambda": 0.1,
+    "ucb_lambda": 0.5,
     "score_limit": 250,
     "api_pause_seconds": 0.5,
     "api_retry_attempts": 8,
     "api_rate_limit_cooldown_seconds": 10.0,
     "n_neighbors": 5,
-    "n_components": 16,
+    "n_components": 32,
     "auto_suggest": True,
     "plot_stat_guides": "max",
 }
@@ -176,6 +182,8 @@ BENCHMARK_RESUME_MATCH_KEYS = [
     "inverse_model",
     "llm_samples",
     "llm_uncertainty_calibration",
+    "llm_prediction_temperature",
+    "llm_inverse_temperature",
     "selector_k",
     "llm_pool_scope",
     "inverse_filter",
@@ -227,15 +235,19 @@ def _prompt_examples(candidates: List[Dict[str, Any]], limit: int = 5) -> List[s
 
 def _is_auto_prediction_prompt(value: Optional[str]) -> bool:
     text = (value or "").strip()
-    return not text or text == DEFAULT_PREDICTION_SYSTEM_MESSAGE or text.startswith(
-        GENERATED_PREDICTION_PROMPT_PREFIX
+    return (
+        not text
+        or text == DEFAULT_PREDICTION_SYSTEM_MESSAGE
+        or text.startswith(GENERATED_PREDICTION_PROMPT_PREFIX)
     )
 
 
 def _is_auto_inverse_prompt(value: Optional[str]) -> bool:
     text = (value or "").strip()
-    return not text or text == DEFAULT_INVERSE_SYSTEM_MESSAGE or text.startswith(
-        GENERATED_INVERSE_PROMPT_PREFIX
+    return (
+        not text
+        or text == DEFAULT_INVERSE_SYSTEM_MESSAGE
+        or text.startswith(GENERATED_INVERSE_PROMPT_PREFIX)
     )
 
 
@@ -380,9 +392,7 @@ def _read_npy_table(raw: bytes) -> pd.DataFrame:
         if array.shape[1] == 2:
             columns.append("objective")
         else:
-            columns.extend(
-                f"objective_{index}" for index in range(1, array.shape[1])
-            )
+            columns.extend(f"objective_{index}" for index in range(1, array.shape[1]))
         return pd.DataFrame(array, columns=columns)
     raise ValueError("The NPY file must be a 1D or 2D table-like array.")
 
@@ -477,12 +487,16 @@ def _collapse_live_observation_points(
                 "candidate_id": group["candidate_id"],
                 "procedure": group["procedure"],
                 "value": mean,
-                "uncertainty": replicate_std if len(values) > 1 else measurement_uncertainty,
+                "uncertainty": replicate_std
+                if len(values) > 1
+                else measurement_uncertainty,
                 "replicate_std": replicate_std,
                 "measurement_uncertainty": measurement_uncertainty,
                 "replicate_count": len(values),
                 "raw_indices": group["raw_indices"],
-                "best_basis": "replicate_mean" if len(values) > 1 else "single_measurement",
+                "best_basis": "replicate_mean"
+                if len(values) > 1
+                else "single_measurement",
                 "prediction": group["prediction"] or {},
             }
         )
@@ -626,7 +640,9 @@ def _target_scaler(values: List[float], direction: str, mode: str) -> Dict[str, 
     if span <= 1e-12:
         return {"mode": "off"}
     if mode == "auto":
-        mode = "minmax" if span > 1.0 or float(np.max(np.abs(directed))) > 1.0 else "off"
+        mode = (
+            "minmax" if span > 1.0 or float(np.max(np.abs(directed))) > 1.0 else "off"
+        )
     if mode == "minmax":
         return {"mode": "minmax", "min": float(np.min(directed)), "span": span}
     if mode == "zscore":
@@ -655,7 +671,9 @@ def _unscale_target(value: float, direction: str, scaler: Dict[str, float]) -> f
     return _display_value(target, direction)
 
 
-def _unscale_uncertainty(value: Optional[float], scaler: Dict[str, float]) -> Optional[float]:
+def _unscale_uncertainty(
+    value: Optional[float], scaler: Dict[str, float]
+) -> Optional[float]:
     if value is None:
         return None
     scale = 1.0
@@ -776,7 +794,7 @@ def _retry_delay_seconds(
         unit = (match.group(2) or "s").lower()
         delay = value / 1000 if unit.startswith("m") else value
     else:
-        delay = base * (2 ** attempt)
+        delay = base * (2**attempt)
     lowered = text.lower()
     if rate_limit_cooldown > 0 and (
         "tokens per min" in lowered
@@ -792,7 +810,9 @@ def _retry_delay_seconds(
 def _write_env_value(env_path: Path, key: str, value: str) -> None:
     value = _clean_api_key_value(value, key)
     env_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    lines = (
+        env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    )
     found = False
     out = []
     for line in lines:
@@ -813,18 +833,14 @@ def _merged_config(saved: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         for key in DEFAULT_CONFIG:
             if key in saved:
                 config[key] = saved[key]
+        if saved.get("optimizer") == "gpr" and "embedding_model" not in saved:
+            config["embedding_model"] = "text-embedding-ada-002"
     config["benchmark_initial_points"] = max(
         1, min(3, int(config.get("benchmark_initial_points") or 1))
     )
     strategy = str(config.get("benchmark_initial_seed_strategy") or "random").strip()
     config["benchmark_initial_seed_strategy"] = (
         strategy if strategy in {"random", "mean_nonzero"} else "random"
-    )
-    config["prediction_system_message"] = _strip_bounds_instruction(
-        config.get("prediction_system_message") or DEFAULT_PREDICTION_SYSTEM_MESSAGE
-    )
-    config["inverse_system_message"] = _strip_bounds_instruction(
-        config.get("inverse_system_message") or DEFAULT_INVERSE_SYSTEM_MESSAGE
     )
     return config
 
@@ -944,7 +960,10 @@ class LocalBOState:
                 "detail": detail,
                 "updated": _now(),
             }
-            print(f"[{self.progress['updated']}] {progress.get('label') or 'Run'}: {detail}", flush=True)
+            print(
+                f"[{self.progress['updated']}] {progress.get('label') or 'Run'}: {detail}",
+                flush=True,
+            )
         return self.progress_snapshot()
 
     def check_cancelled(self) -> None:
@@ -1026,7 +1045,8 @@ class LocalBOState:
                     "observation_count": len(payload.get("observations", [])),
                     "benchmark_count": len(payload.get("benchmark_runs", [])),
                     "random_walk_count": len(
-                        (payload.get("live_random_walk") or {}).get("observations") or []
+                        (payload.get("live_random_walk") or {}).get("observations")
+                        or []
                     ),
                 }
             )
@@ -1078,9 +1098,11 @@ class LocalBOState:
         existing_created = None
         if path.exists():
             try:
-                existing_created = json.loads(path.read_text(encoding="utf-8")).get(
-                    "meta", {}
-                ).get("created")
+                existing_created = (
+                    json.loads(path.read_text(encoding="utf-8"))
+                    .get("meta", {})
+                    .get("created")
+                )
             except (OSError, json.JSONDecodeError):
                 existing_created = None
         payload["meta"]["created"] = existing_created or payload["meta"]["saved"]
@@ -1111,9 +1133,7 @@ class LocalBOState:
         if not self._has_project_state_locked():
             return None
         if not self.campaign_id:
-            self.campaign_name = (
-                f"Autosaved before importing {Path(filename).name}"
-            )
+            self.campaign_name = f"Autosaved before importing {Path(filename).name}"
             self.campaign_id = self._unique_campaign_id(self.campaign_name)
         self._write_campaign_locked()
         previous = {"id": self.campaign_id, "name": self.campaign_name}
@@ -1131,14 +1151,23 @@ class LocalBOState:
         total = len(procedures)
         cached = 0
         path = self.embedding_cache_path()
-        if total and path.exists():
+        issues = []
+        if total and (
+            path.exists()
+            or self._embedding_cache_model_obj is not None
+            or any(path.parent.glob(path.name + ".safe-*/manifest.json"))
+        ):
             try:
-                cache = pd.read_csv(path, usecols=["x", "embedding_model"])
-                model_cache = cache[cache["embedding_model"] == self.config["embedding_model"]]
-                cached_texts = set(model_cache["x"].astype(str).tolist())
-                cached = sum(1 for procedure in procedures if procedure in cached_texts)
-            except (OSError, ValueError, KeyError, pd.errors.ParserError):
+                cache = self._embedding_cache_model()
+                records = [
+                    {"candidate_id": str(index), "procedure": procedure}
+                    for index, procedure in enumerate(procedures)
+                ]
+                cached = cache.coverage(records)["hit_count"]
+                issues = cache.last_report.get("incompatible_rows", [])
+            except (OSError, ValueError, KeyError, pd.errors.ParserError) as error:
                 cached = 0
+                issues = [{"reason": str(error)}]
         return {
             "model": self.config["embedding_model"],
             "path": str(path),
@@ -1146,6 +1175,7 @@ class LocalBOState:
             "total_count": total,
             "missing_count": max(0, total - cached),
             "ready": total > 0 and cached >= total,
+            "validation_issues": issues,
         }
 
     def key_status(self) -> Dict[str, Any]:
@@ -1197,10 +1227,7 @@ class LocalBOState:
                             value += 5
                     return value
 
-                scored = [
-                    (score(candidate), candidate)
-                    for candidate in available
-                ]
+                scored = [(score(candidate), candidate) for candidate in available]
                 matches = [
                     candidate
                     for _, candidate in sorted(
@@ -1244,7 +1271,8 @@ class LocalBOState:
                 "objective_names": self.objective_names,
                 "key_status": self.key_status(),
                 "candidates": [
-                    self.public_candidate(candidate) for candidate in self.candidates[:500]
+                    self.public_candidate(candidate)
+                    for candidate in self.candidates[:500]
                 ],
                 "candidate_count": len(self.candidates),
                 "label_count": len(labelled_values),
@@ -1303,7 +1331,9 @@ class LocalBOState:
                 horizon = max(horizon, int(point.get("index", 0)))
         return horizon
 
-    def labelled_candidates(self, objective: Optional[str] = None) -> List[Dict[str, Any]]:
+    def labelled_candidates(
+        self, objective: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         objective = objective or self.config["objective_name"]
         return [
             cand
@@ -1311,7 +1341,9 @@ class LocalBOState:
             if cand.get("objectives", {}).get(objective) is not None
         ]
 
-    def candidate_objective_values(self, objective: Optional[str] = None) -> List[float]:
+    def candidate_objective_values(
+        self, objective: Optional[str] = None
+    ) -> List[float]:
         objective = objective or self.config["objective_name"]
         return [
             float(cand["objectives"][objective])
@@ -1328,9 +1360,7 @@ class LocalBOState:
     def plot_objective_bounds(self) -> Tuple[Optional[float], Optional[float]]:
         lower, upper = self.objective_bounds()
         objective_name = str(self.config.get("objective_name") or "").lower()
-        percent_like = any(
-            token in objective_name for token in ["%", "pct", "percent"]
-        )
+        percent_like = any(token in objective_name for token in ["%", "pct", "percent"])
         if percent_like:
             lower = 0.0 if lower is None else lower
             upper = 100.0 if upper is None else upper
@@ -1365,19 +1395,20 @@ class LocalBOState:
         return lower, upper
 
     def prediction_system_message(self) -> str:
-        message = _strip_bounds_instruction(
-            self.config.get("prediction_system_message")
-            or DEFAULT_PREDICTION_SYSTEM_MESSAGE
-        )
+        message = self.config.get("prediction_system_message")
+        if message is None:
+            message = DEFAULT_PREDICTION_SYSTEM_MESSAGE
+        managed = message == DEFAULT_PREDICTION_SYSTEM_MESSAGE or hashlib.sha256(
+            message.encode("utf-8")
+        ).hexdigest() == self.config.get("prediction_prompt_managed_hash")
         guardrail = _prediction_guardrail_instruction()
-        if PREDICTION_GUARDRAIL_MARKER not in message:
+        if managed and PREDICTION_GUARDRAIL_MARKER not in message:
             message = f"{message}\n\n{guardrail}"
         return message
 
     def inverse_system_message(self) -> str:
-        return _strip_bounds_instruction(
-            self.config.get("inverse_system_message") or DEFAULT_INVERSE_SYSTEM_MESSAGE
-        )
+        message = self.config.get("inverse_system_message")
+        return DEFAULT_INVERSE_SYSTEM_MESSAGE if message is None else message
 
     def _refresh_dataset_prompts_locked(self, force: bool = False) -> bool:
         if not self.candidates:
@@ -1385,21 +1416,37 @@ class LocalBOState:
                 raise ValueError("Import a dataset before generating dataset prompts.")
             return False
         changed = False
-        if force or _is_auto_prediction_prompt(
-            self.config.get("prediction_system_message")
+        prediction_text = self.config.get("prediction_system_message")
+        inverse_text = self.config.get("inverse_system_message")
+        if (
+            force
+            or prediction_text in (None, DEFAULT_PREDICTION_SYSTEM_MESSAGE)
+            or hashlib.sha256(prediction_text.encode("utf-8")).hexdigest()
+            == self.config.get("prediction_prompt_managed_hash")
         ):
             self.config["prediction_system_message"] = _dataset_prediction_prompt(
                 self.candidates,
                 self.objective_names,
                 self.config.get("objective_name"),
             )
+            self.config["prediction_prompt_managed_hash"] = hashlib.sha256(
+                self.config["prediction_system_message"].encode("utf-8")
+            ).hexdigest()
             changed = True
-        if force or _is_auto_inverse_prompt(self.config.get("inverse_system_message")):
+        if (
+            force
+            or inverse_text in (None, DEFAULT_INVERSE_SYSTEM_MESSAGE)
+            or hashlib.sha256(inverse_text.encode("utf-8")).hexdigest()
+            == self.config.get("inverse_prompt_managed_hash")
+        ):
             self.config["inverse_system_message"] = _dataset_inverse_prompt(
                 self.candidates,
                 self.objective_names,
                 self.config.get("objective_name"),
             )
+            self.config["inverse_prompt_managed_hash"] = hashlib.sha256(
+                self.config["inverse_system_message"].encode("utf-8")
+            ).hexdigest()
             changed = True
         if changed:
             self.log("Generated dataset-specific BO-ICL system messages.")
@@ -1412,23 +1459,47 @@ class LocalBOState:
             return self.to_json()
 
     def _embedding_cache_model(self):
-        from boicl import AskTellGPR
+        from .embedding_cache import EmbeddingCache, EmbeddingSpec
 
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        existing_manifest = list(
+            self.embedding_cache_path().parent.glob(
+                self.embedding_cache_path().name + ".safe-*/manifest.json"
+            )
+        )
         key = (
             str(self.embedding_cache_path()),
             self.config["embedding_model"],
             self.config["objective_name"],
+            self.embedding_cache_path().stat().st_mtime_ns
+            if self.embedding_cache_path().exists()
+            else None,
+            tuple((str(path), path.stat().st_mtime_ns) for path in existing_manifest),
         )
-        if self._embedding_cache_model_obj is not None and key == self._embedding_cache_model_key:
+        if (
+            self._embedding_cache_model_obj is not None
+            and key == self._embedding_cache_model_key
+        ):
             return self._embedding_cache_model_obj
-        self._embedding_cache_model_obj = AskTellGPR(
-            cache_path=str(self.embedding_cache_path()),
-            embedding_model=self.config["embedding_model"],
-            n_neighbors=1,
-            n_components=1,
-            y_name=self.config["objective_name"],
+        model = self.config["embedding_model"]
+        dimensions = {
+            "text-embedding-ada-002": 1536,
+            "text-embedding-3-small": 1536,
+            "text-embedding-3-large": 3072,
+        }.get(model)
+        if dimensions is None:
+            raise ValueError(
+                "Declare dimensions for this embedding model before preparing vectors"
+            )
+        spec = EmbeddingSpec(model, dimensions)
+        path = self.embedding_cache_path()
+        self._embedding_cache_model_obj = EmbeddingCache(
+            path.with_name(path.name + ".safe-" + spec.fingerprint[:12]), spec
         )
+        if path.exists():
+            self._embedding_cache_model_obj.last_report = (
+                self._embedding_cache_model_obj.import_legacy_csv(path)
+            )
         self._embedding_cache_model_key = key
         return self._embedding_cache_model_obj
 
@@ -1437,67 +1508,64 @@ class LocalBOState:
     ) -> List[List[float]]:
         if not texts:
             return []
-        model = self._embedding_cache_model()
+        cache = self._embedding_cache_model()
         normalized_texts = [str(text) for text in texts]
-        unique_texts = list(dict.fromkeys(text for text in normalized_texts if text.strip()))
-        model_cache = model._embeddings_cache[
-            model._embeddings_cache["embedding_model"] == self.config["embedding_model"]
+        unique_texts = list(
+            dict.fromkeys(text for text in normalized_texts if text.strip())
+        )
+        records = [
+            {
+                "candidate_id": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "procedure": text,
+            }
+            for text in unique_texts
         ]
-        cached_by_text = {
-            str(row["x"]): row["embedding"]
-            for _, row in model_cache.iterrows()
-        }
-        missing = [text for text in unique_texts if text not in cached_by_text]
-        if missing:
-            client = OpenAI()
-            batch_size = 25
+        before = cache.coverage(records)
+        if before["missing_ids"]:
+            from .request_policy import RequestPolicy, ReliableClient
+
+            policy = RequestPolicy(
+                {
+                    "maximum_attempts": self.config["api_retry_attempts"],
+                    "request_spacing_s": self.config["api_pause_seconds"],
+                    "base_cooldown_s": self.config["api_rate_limit_cooldown_seconds"],
+                },
+                cancelled=self.cancel_event,
+            )
+            client = ReliableClient(OpenAI(max_retries=0), policy)
             self.set_progress(
                 progress_label,
-                0,
-                len(missing),
-                detail=f"Embedding new texts with {self.config['embedding_model']}",
+                before["hit_count"],
+                len(records),
+                detail=f"Preparing exact inputs with {cache.spec.model}",
             )
-            rows = []
-            for start in range(0, len(missing), batch_size):
-                self.check_cancelled()
-                batch = missing[start : start + batch_size]
-                response = self._api_call_with_retries(
-                    progress_label,
-                    lambda batch=batch: client.embeddings.create(
-                        input=batch,
-                        model=self.config["embedding_model"],
-                        encoding_format="float",
-                    ),
-                )
-                rows.extend(
-                    {
-                        "x": text,
-                        "embedding": data.embedding,
-                        "embedding_model": self.config["embedding_model"],
-                    }
-                    for text, data in zip(batch, response.data)
-                )
+
+            def progress(report):
                 self.set_progress(
                     progress_label,
-                    min(start + len(batch), len(missing)),
-                    len(missing),
-                    detail=f"Cached {min(start + len(batch), len(missing))} new embedding(s)",
+                    before["hit_count"] + report["generated"],
+                    len(records),
+                    detail=f"Saved {report['generated']} new vectors; {len(report['errors'])} row/request errors",
                 )
-                self.check_cancelled()
-            if rows:
-                model._embeddings_cache = pd.concat(
-                    [model._embeddings_cache, pd.DataFrame(rows)],
-                    ignore_index=True,
+
+            report = cache.prepare(
+                records,
+                lambda batch: client.embeddings.create(
+                    input=batch, model=cache.spec.model, encoding_format="float"
+                ),
+                batch_size=25,
+                cancelled=self.cancel_event.is_set,
+                progress=progress,
+            )
+            self.check_cancelled()
+            if report["missing_ids"]:
+                raise ValueError(
+                    f"{len(report['missing_ids'])} embedding inputs remain missing. "
+                    f"Successful batches are saved; first error: {report['errors'][:1]}"
                 )
-                model.save_cache(str(self.embedding_cache_path()))
-                for row in rows:
-                    cached_by_text[str(row["x"])] = row["embedding"]
-        embeddings = []
-        for text in normalized_texts:
-            if text not in cached_by_text:
-                raise ValueError(f"Embedding for '{text}' was not found in the local cache.")
-            embeddings.append(cached_by_text[text])
-        return embeddings
+        matrix = cache.matrix(records)
+        cached_by_text = dict(zip(unique_texts, matrix.tolist()))
+        return [cached_by_text[text] for text in normalized_texts]
 
     def precompute_embeddings(self) -> Dict[str, Any]:
         with self.lock:
@@ -1624,7 +1692,9 @@ class LocalBOState:
             if self.campaign_name:
                 parts.append(_safe_cache_fragment(self.campaign_name.lower()))
             elif self.dataset_filename:
-                parts.append(_safe_cache_fragment(Path(self.dataset_filename).stem.lower()))
+                parts.append(
+                    _safe_cache_fragment(Path(self.dataset_filename).stem.lower())
+                )
             else:
                 parts.append("campaign")
             parts.append(time.strftime("%Y%m%d_%H%M%S"))
@@ -1641,7 +1711,9 @@ class LocalBOState:
         meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
         with self.lock:
             previous_project = self._save_current_and_branch_for_import_locked(filename)
-            base_name = str(meta.get("name") or Path(filename).stem or "Imported campaign")
+            base_name = str(
+                meta.get("name") or Path(filename).stem or "Imported campaign"
+            )
             archive_id = _safe_cache_fragment(str(meta.get("id") or "").lower())
             if archive_id and not self.campaign_file(archive_id).exists():
                 campaign_id = archive_id
@@ -1803,7 +1875,8 @@ class LocalBOState:
         data_columns = list(df.columns[1:])
         requested_objective = (objective_name or "").strip()
         value_columns = _numeric_columns(
-            df, [column for column in data_columns if not _is_uncertainty_column(column)]
+            df,
+            [column for column in data_columns if not _is_uncertainty_column(column)],
         )
         uncertainty_columns = _numeric_columns(
             df, [column for column in data_columns if _is_uncertainty_column(column)]
@@ -1872,7 +1945,9 @@ class LocalBOState:
                     for objective, uncertainty_column in uncertainty_by_objective.items()
                 }
                 uncertainties = {
-                    key: value for key, value in uncertainties.items() if value is not None
+                    key: value
+                    for key, value in uncertainties.items()
+                    if value is not None
                 }
                 candidate = {
                     "id": f"cand-{len(self.candidates)}",
@@ -1921,6 +1996,8 @@ class LocalBOState:
                 "prediction_system_message",
                 "inverse_system_message",
                 "llm_samples",
+                "llm_prediction_temperature",
+                "llm_inverse_temperature",
                 "selector_k",
                 "llm_pool_scope",
                 "inverse_filter",
@@ -1966,24 +2043,28 @@ class LocalBOState:
                     value = float(value)
                 elif key in {
                     "llm_uncertainty_calibration",
+                    "llm_prediction_temperature",
+                    "llm_inverse_temperature",
                     "inverse_target_multiplier",
                     "inverse_target_jitter",
                     "api_pause_seconds",
                     "api_rate_limit_cooldown_seconds",
                 }:
                     value = float(value)
-                elif key in {"auto_suggest", "greedy_final_iteration"}:
+                elif key in {
+                    "auto_suggest",
+                    "greedy_final_iteration",
+                    "llm_diagnostics",
+                }:
                     value = bool(value)
                 elif key in {"prediction_system_message", "inverse_system_message"}:
-                    value = _strip_bounds_instruction(value)
+                    value = str(value)
                 self.config[key] = value
             self.config["optimizer"] = (
                 "llm" if self.config["optimizer"] == "llm" else "gpr"
             )
             self.config["workflow_mode"] = (
-                "offline"
-                if self.config["workflow_mode"] == "offline"
-                else "live"
+                "offline" if self.config["workflow_mode"] == "offline" else "live"
             )
             if self.config["acquisition"] not in ACQUISITION_FUNCTIONS:
                 self.config["acquisition"] = DEFAULT_CONFIG["acquisition"]
@@ -2023,10 +2104,20 @@ class LocalBOState:
                 else "random"
             )
             self.config["benchmark_seed"] = int(self.config["benchmark_seed"])
-            self.config["random_replicates"] = max(0, int(self.config["random_replicates"]))
-            self.config["llm_samples"] = max(1, min(20, int(self.config["llm_samples"])))
+            self.config["random_replicates"] = max(
+                0, int(self.config["random_replicates"])
+            )
+            self.config["llm_samples"] = max(
+                1, min(20, int(self.config["llm_samples"]))
+            )
             self.config["llm_uncertainty_calibration"] = max(
                 0.0, min(100.0, float(self.config["llm_uncertainty_calibration"]))
+            )
+            self.config["llm_prediction_temperature"] = max(
+                0.0, min(2.0, float(self.config["llm_prediction_temperature"]))
+            )
+            self.config["llm_inverse_temperature"] = max(
+                0.0, min(2.0, float(self.config["llm_inverse_temperature"]))
             )
             self.config["selector_k"] = max(0, int(self.config["selector_k"]))
             self.config["inverse_filter"] = max(0, int(self.config["inverse_filter"]))
@@ -2060,11 +2151,15 @@ class LocalBOState:
             current_suggestion_config = {
                 key: self.config.get(key) for key in suggestion_config_keys
             }
-            if (
-                self.suggestions
-                and current_suggestion_config != previous_suggestion_config
+            active_inverse_filter = any(
+                design.get("source") == "inverse_filter" and design.get("active")
+                for design in self.inverse_designs
+            )
+            if current_suggestion_config != previous_suggestion_config and (
+                self.suggestions or active_inverse_filter
             ):
                 self.suggestions = []
+                self._deactivate_inverse_filter_designs_locked()
                 self.last_model_status = (
                     "Run settings changed. Update suggestions before selecting "
                     "the next point."
@@ -2077,7 +2172,9 @@ class LocalBOState:
         candidate_id = payload.get("candidate_id") or None
         procedure = (payload.get("procedure") or "").strip()
         if candidate_id:
-            match = next((cand for cand in self.candidates if cand["id"] == candidate_id), None)
+            match = next(
+                (cand for cand in self.candidates if cand["id"] == candidate_id), None
+            )
             if match is None:
                 raise ValueError("Selected candidate was not found.")
             procedure = match["procedure"]
@@ -2101,6 +2198,7 @@ class LocalBOState:
             )
             self.refresh_active_objective()
             self.suggestions = []
+            self._deactivate_inverse_filter_designs_locked()
             self.last_error = None
             self.last_model_status = "Observation added. Suggestions need an update."
             self.log(f"Added objective value {value:g}.")
@@ -2125,11 +2223,10 @@ class LocalBOState:
             removed = self.observations.pop(index)
             self.refresh_active_objective()
             self.suggestions = []
+            self._deactivate_inverse_filter_designs_locked()
             self.last_error = None
             self.last_model_status = "Observation deleted. Suggestions need an update."
-            self.log(
-                f"Deleted observation {obs_id} with value {removed.get('value')}."
-            )
+            self.log(f"Deleted observation {obs_id} with value {removed.get('value')}.")
             self._autosave_locked()
             return self.to_json()
 
@@ -2345,16 +2442,25 @@ class LocalBOState:
             "llm_samples": suggestion.get("llm_samples")
             if suggestion.get("llm_samples") is not None
             else self.config.get("llm_samples"),
-            "llm_uncertainty_calibration": suggestion.get(
-                "llm_uncertainty_calibration"
-            )
+            "llm_uncertainty_calibration": suggestion.get("llm_uncertainty_calibration")
             if suggestion.get("llm_uncertainty_calibration") is not None
             else self.config.get("llm_uncertainty_calibration"),
+            "llm_prediction_temperature": suggestion.get("llm_prediction_temperature")
+            if suggestion.get("llm_prediction_temperature") is not None
+            else self.config.get("llm_prediction_temperature"),
+            "llm_inverse_temperature": suggestion.get("llm_inverse_temperature")
+            if suggestion.get("llm_inverse_temperature") is not None
+            else self.config.get("llm_inverse_temperature"),
+            "llm_diagnostics": suggestion.get("llm_diagnostics")
+            if suggestion.get("llm_diagnostics") is not None
+            else self.config.get("llm_diagnostics"),
             "score_limit": suggestion.get("score_limit")
             if suggestion.get("score_limit") is not None
             else self.config.get("score_limit"),
             "time": _now(),
         }
+        if suggestion.get("llm_sample_values") is not None:
+            prediction["llm_sample_values"] = suggestion.get("llm_sample_values")
         if suggestion.get("selection_note"):
             prediction["selection_note"] = suggestion.get("selection_note")
         if suggestion.get("inverse_seed"):
@@ -2381,8 +2487,16 @@ class LocalBOState:
             "llm_uncertainty_calibration": self.config.get(
                 "llm_uncertainty_calibration"
             ),
+            "llm_prediction_temperature": self.config.get("llm_prediction_temperature"),
+            "llm_inverse_temperature": self.config.get("llm_inverse_temperature"),
+            "llm_diagnostics": self.config.get("llm_diagnostics"),
             "score_limit": self.config.get("score_limit"),
         }
+
+    def _deactivate_inverse_filter_designs_locked(self) -> None:
+        for design in self.inverse_designs:
+            if design.get("source") == "inverse_filter":
+                design["active"] = False
 
     def _matching_prediction_locked(
         self, candidate_id: Optional[str], procedure: str
@@ -2422,6 +2536,7 @@ class LocalBOState:
             iteration_cap = int(self.config["iterations_per_trial"])
             if iteration_cap and len(active_observations) >= iteration_cap:
                 self.suggestions = []
+                self._deactivate_inverse_filter_designs_locked()
                 self.last_model_status = "Iteration cap reached."
                 self.finish_progress("Updating suggestions", "Iteration cap reached.")
                 self._autosave_locked()
@@ -2429,21 +2544,30 @@ class LocalBOState:
             available = self.available_candidates()
             if not available:
                 self.suggestions = []
+                self._deactivate_inverse_filter_designs_locked()
                 self.last_model_status = "No unevaluated candidates remain."
-                self.finish_progress("Updating suggestions", "No unevaluated candidates remain.")
+                self.finish_progress(
+                    "Updating suggestions", "No unevaluated candidates remain."
+                )
                 self._autosave_locked()
                 return self.to_json()
             missing_key = self._missing_key_for_suggestions()
             if missing_key:
                 self.suggestions = self._random_suggestions(available)
-                self.last_model_status = f"{missing_key} missing. Showing random candidates."
-                self.log(f"Add {missing_key} to enable {self.config['optimizer'].upper()} suggestions.")
+                self._deactivate_inverse_filter_designs_locked()
+                self.last_model_status = (
+                    f"{missing_key} missing. Showing random candidates."
+                )
+                self.log(
+                    f"Add {missing_key} to enable {self.config['optimizer'].upper()} suggestions."
+                )
                 self.finish_progress("Updating suggestions", f"{missing_key} missing.")
                 self._autosave_locked()
                 return self.to_json()
             min_observations = 1 if self.config["optimizer"] == "llm" else 2
             if len(active_observations) < min_observations:
                 self.suggestions = self._random_suggestions(available)
+                self._deactivate_inverse_filter_designs_locked()
                 self.last_model_status = (
                     f"Add at least {min_observations} observation"
                     f"{'s' if min_observations != 1 else ''} before model suggestions."
@@ -2457,6 +2581,7 @@ class LocalBOState:
                 return self.to_json()
             if len(self._training_observations()) < min_observations:
                 self.suggestions = self._random_suggestions(available)
+                self._deactivate_inverse_filter_designs_locked()
                 self.last_model_status = (
                     f"Add at least {min_observations} unique procedure"
                     f"{'s' if min_observations != 1 else ''} before model suggestions."
@@ -2493,9 +2618,7 @@ class LocalBOState:
                         available, active_observations
                     )
                 self.check_cancelled()
-                self.last_model_status = (
-                    f"Updated {self.config['optimizer'].upper()} on {len(active_observations)} observations."
-                )
+                self.last_model_status = f"Updated {self.config['optimizer'].upper()} on {len(active_observations)} observations."
                 self.log(f"Updated suggestions with {self.config['acquisition']}.")
                 self.finish_progress(
                     "Updating suggestions",
@@ -2503,16 +2626,20 @@ class LocalBOState:
                 )
             except RunCancelled as exc:
                 self.suggestions = []
+                self._deactivate_inverse_filter_designs_locked()
                 self.last_error = None
                 self.last_model_status = str(exc)
                 self.log("Stopped suggestion update.")
                 self.cancel_progress("Updating suggestions", str(exc))
             except Exception as exc:  # pragma: no cover - needs live API/GPR deps
                 self.suggestions = self._random_suggestions(available)
+                self._deactivate_inverse_filter_designs_locked()
                 self.last_error = "".join(
                     traceback.format_exception_only(type(exc), exc)
                 ).strip()
-                self.last_model_status = "Model update failed. Showing random candidates."
+                self.last_model_status = (
+                    "Model update failed. Showing random candidates."
+                )
                 self.log("Model update failed; see status panel.")
                 self.fail_progress("Updating suggestions", self.last_error)
             self._autosave_locked()
@@ -2621,29 +2748,64 @@ class LocalBOState:
         k: Optional[int] = None,
         acquisition: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        from boicl import AskTellGPR
+        from boicl import AskTellGPR, Pool
 
         acquisition_name = acquisition or self.config["acquisition"]
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        active_observations, scaler = self._training_rows_and_scaler(observations)
-        n_obs = len(active_observations)
-        n_neighbors = min(self.config["n_neighbors"], max(1, n_obs - 1))
-        n_components = min(self.config["n_components"], max(1, n_obs - 1))
-        subset = self._candidate_subset(available, rng)
+        measured = (
+            observations if observations is not None else self.active_observations()
+        )
+        measured = [dict(row) for row in measured if row.get("value") is not None]
+        if not measured:
+            return self._random_suggestions(
+                available,
+                rng=rng,
+                k=k,
+                source="initial_design",
+                selection_note="No measured outcomes; initial design selection.",
+            )
+        # Keep individual measurements and their metadata. This baseline learns
+        # homoskedastic noise, rather than applying the structured GP noise rule.
+        scaler = _target_scaler(
+            [row["value"] for row in measured],
+            self.config["objective_direction"],
+            self.config["objective_scaling"],
+        )
+        active_observations = [
+            dict(
+                row,
+                target=_scale_target(
+                    row["value"], self.config["objective_direction"], scaler
+                ),
+            )
+            for row in measured
+        ]
+        subset = list(available)
         procedures = [cand["procedure"] for cand in subset]
         self.check_cancelled()
-        self._cached_embeddings(
-            [obs["procedure"] for obs in active_observations] + procedures,
-            "Preparing embeddings for GPR",
-        )
-        self.check_cancelled()
         model = AskTellGPR(
+            pool=Pool(
+                [candidate["procedure"] for candidate in self.candidates],
+                embedding_model=self.config["embedding_model"],
+            ),
             cache_path=str(self.embedding_cache_path()),
             embedding_model=self.config["embedding_model"],
-            n_neighbors=n_neighbors,
-            n_components=n_components,
+            n_neighbors=self.config["n_neighbors"],
+            n_components=self.config["n_components"],
             y_name=self.config["objective_name"],
             y_formatter=lambda y: f"{float(y):0.6g}",
+            cancelled=self.cancel_event,
+            request_settings={
+                "maximum_attempts": self.config["api_retry_attempts"],
+                "request_spacing_s": self.config["api_pause_seconds"],
+                "base_cooldown_s": self.config["api_rate_limit_cooldown_seconds"],
+            },
+        )
+        self.set_progress(
+            "Preparing full-corpus embedding GP",
+            0,
+            len(self.candidates),
+            detail="Fixed full-corpus Isomap; scoring all eligible designs",
         )
 
         for obs in active_observations[:-1]:
@@ -2669,6 +2831,13 @@ class LocalBOState:
         stds = raw[3] if len(raw) > 3 else [None] * len(selected)
         by_proc = {cand["procedure"]: cand for cand in subset}
         metadata = self._suggestion_context_metadata("gpr", acquisition_name)
+        metadata.update(
+            uncertainty_type="GP latent-function posterior",
+            noise_model="Learned homoskedastic noise; measurement quality metadata retained",
+            measurement_metadata=measured,
+            projection_fingerprint=getattr(model, "projection_fingerprint", None),
+            projection_diagnostics=getattr(model, "projection_diagnostics", None),
+        )
         return [
             {
                 "candidate_id": by_proc[procedure]["id"],
@@ -2698,20 +2867,26 @@ class LocalBOState:
         # scaled 0/1 answers being unscaled into artificial 0/100 predictions.
         active_observations, scaler = _group_training_observations(
             observations if observations is not None else self.active_observations(),
-            self.config["objective_direction"],
+            "maximize",
             "off",
         )
         model = AskTellFewShotTopk(
             model=self.config["prediction_model"],
             inverse_model=self.config["inverse_model"],
+            temperature=float(self.config["llm_prediction_temperature"]),
+            inverse_temperature=float(self.config["llm_inverse_temperature"]),
             k=int(self.config["llm_samples"]),
             selector_k=selector_k,
             y_name=self.config["objective_name"],
             x_name="procedure",
             y_formatter=lambda y: f"{float(y):0.6g}",
+            embedding_model=self.config["embedding_model"],
+            maximize=self.config["objective_direction"] == "maximize",
+            objective_bounds=self.objective_bounds(),
         )
-        calibration = float(self.config.get("llm_uncertainty_calibration") or 0.0)
-        if calibration > 0:
+        calibration = self.config.get("llm_uncertainty_calibration")
+        if calibration is not None:
+            calibration = float(calibration)
             model.set_calibration_factor(calibration)
         for obs in active_observations:
             model.tell(obs["procedure"], obs["target"])
@@ -2726,22 +2901,61 @@ class LocalBOState:
             upper_confidence_bound,
         )
 
+        maximize = self.config["objective_direction"] == "maximize"
         if acquisition_name == "probability_of_improvement":
-            return probability_of_improvement
+            return partial(probability_of_improvement, maximize=maximize)
         if acquisition_name == "expected_improvement":
-            return expected_improvement
+            return partial(expected_improvement, maximize=maximize)
         if acquisition_name == "log_expected_improvement":
-            return log_expected_improvement
+            return lambda dist, best: np.log(
+                expected_improvement(dist, best, maximize=maximize) + 1e-15
+            )
         if acquisition_name == "upper_confidence_bound":
-            return partial(
-                upper_confidence_bound,
-                _lambda=float(self.config["ucb_lambda"]),
+            return (
+                lambda dist, best: (1 if maximize else -1) * dist.mean()
+                + float(self.config["ucb_lambda"]) * dist.std()
             )
         if acquisition_name == "greedy":
-            return greedy
+            return lambda dist, best: (1 if maximize else -1) * greedy(dist, best)
         if acquisition_name == "random":
             return None
         raise ValueError(f"Unknown acquisition function: {acquisition_name}")
+
+    @staticmethod
+    def _distribution_raw_samples(dist) -> List[float]:
+        samples = []
+        if hasattr(dist, "raw_samples"):
+            samples = dist.raw_samples()
+        elif hasattr(dist, "values"):
+            samples = list(getattr(dist, "values"))
+        elif hasattr(dist, "mean"):
+            samples = [dist.mean()]
+        clean_samples = []
+        for value in samples or []:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(numeric):
+                clean_samples.append(numeric)
+        return clean_samples
+
+    def _log_llm_diagnostics(self, scored: List[Dict[str, Any]]) -> None:
+        if not self.config.get("llm_diagnostics") or not scored:
+            return
+        for index, item in enumerate(scored, start=1):
+            samples = item.get("samples") or []
+            sample_text = ", ".join(f"{value:g}" for value in samples) or "n/a"
+            procedure = " ".join(str(item.get("procedure") or "").split())
+            if len(procedure) > 96:
+                procedure = f"{procedure[:93]}..."
+            self.log(
+                "LLM diagnostic "
+                f"{index}/{len(scored)}: mean={item['mean']:g}, "
+                f"std={float(item.get('std') or 0.0):g}, "
+                f"acq={item['acquisition']:g}, "
+                f"samples=[{sample_text}] | {procedure}"
+            )
 
     def _llm_score_procedures(
         self,
@@ -2750,30 +2964,67 @@ class LocalBOState:
         best: float,
         aq_fxn,
         k: int,
-    ) -> Tuple[List[str], List[float], List[float], List[Optional[float]], bool]:
+    ) -> Tuple[
+        List[str],
+        List[float],
+        List[float],
+        List[Optional[float]],
+        bool,
+        Dict[str, Any],
+        List[List[float]],
+    ]:
         results = model.predict(
             procedures,
             system_message=self.prediction_system_message(),
         )
         if not isinstance(results, list):
             results = [results]
+        if len(results) != len(procedures):
+            raise ValueError(
+                "Prediction count differs from candidate count; refusing misaligned scores"
+            )
         scored = []
-        for procedure, dist in zip(procedures, results):
+        for rank, (procedure, dist) in enumerate(zip(procedures, results)):
             try:
                 if len(dist) <= 0:
                     continue
+                raw_samples = self._distribution_raw_samples(dist)
+                lower, upper = self.objective_bounds()
+                accepted = [
+                    value
+                    for value in raw_samples
+                    if (lower is None or value >= lower)
+                    and (upper is None or value <= upper)
+                ]
+                if len(accepted) < 2:
+                    self.log(
+                        f"LLM candidate at retrieval rank {rank}: fewer than two valid samples; excluded from ranking."
+                    )
+                    continue
+                if len(accepted) != len(raw_samples):
+                    from boicl.llm_model import make_dd, scale_distribution
+
+                    dist = make_dd(accepted, np.full(len(accepted), 1 / len(accepted)))
+                    factor = self.config.get("llm_uncertainty_calibration")
+                    dist = scale_distribution(
+                        dist, 1 if factor is None else factor, self.objective_bounds()
+                    )
+                raw_samples = accepted
                 scored.append(
                     {
                         "procedure": procedure,
                         "acquisition": float(aq_fxn(dist, best)),
                         "mean": float(dist.mean()),
-                        "std": None
-                        if dist.std() is None
-                        else float(dist.std()),
+                        "std": None if dist.std() is None else float(dist.std()),
+                        "samples": raw_samples,
+                        "rank": rank,
+                        "accepted_samples": len(raw_samples),
+                        "requested_samples": int(self.config["llm_samples"]),
                     }
                 )
             except (TypeError, ValueError, AttributeError):
                 continue
+        self._log_llm_diagnostics(scored)
         degenerate = self._llm_scores_are_degenerate(scored)
         degenerate_info = {}
         if degenerate and scored:
@@ -2785,8 +3036,7 @@ class LocalBOState:
             }
         if not degenerate:
             scored.sort(
-                key=lambda item: (item["acquisition"], item["mean"]),
-                reverse=True,
+                key=lambda item: (-item["acquisition"], item["rank"]),
             )
         selected = scored[:k]
         return (
@@ -2796,6 +3046,7 @@ class LocalBOState:
             [item["std"] for item in selected],
             degenerate,
             degenerate_info,
+            [item.get("samples") for item in selected],
         )
 
     @staticmethod
@@ -2821,6 +3072,20 @@ class LocalBOState:
         acquisition: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         acquisition_name = acquisition or self.config["acquisition"]
+        active = (
+            observations if observations is not None else self.active_observations()
+        )
+        if (
+            len({row["procedure"] for row in active if row.get("value") is not None})
+            < 2
+        ):
+            return self._random_suggestions(
+                available,
+                rng=rng,
+                k=k,
+                source="initial_design",
+                selection_note="Fewer than two observed designs; explicit random initial design policy.",
+            )
         model, scaler = self._build_llm_model(observations)
         if int(self.config["inverse_filter"]) > 0:
             if self.config.get("llm_pool_scope") == "broad":
@@ -2856,9 +3121,13 @@ class LocalBOState:
             )
             filtered_lookup = set(filtered)
             remaining = [
-                procedure for procedure in procedures if procedure not in filtered_lookup
+                procedure
+                for procedure in procedures
+                if procedure not in filtered_lookup
             ]
-            random_count = min(int(self.config["inverse_random_candidates"]), len(remaining))
+            random_count = min(
+                int(self.config["inverse_random_candidates"]), len(remaining)
+            )
             procedures = filtered + (rng or random).sample(remaining, random_count)
             inverse_entry = {
                 "procedure": inverse_text,
@@ -2866,36 +3135,42 @@ class LocalBOState:
                 "model": self.config["inverse_model"],
                 "time": _now(),
                 "source": "inverse_filter",
+                "active": True,
+                "experiment_count": len(target_observations) + 1,
             }
             normalized_inverse = str(inverse_text or "").strip()
+            self._deactivate_inverse_filter_designs_locked()
             self.inverse_designs = [
                 design
                 for design in self.inverse_designs
                 if not (
                     design.get("source") == "inverse_filter"
-                    and str(design.get("procedure") or "").strip()
-                    == normalized_inverse
+                    and str(design.get("procedure") or "").strip() == normalized_inverse
                 )
             ]
             self.inverse_designs.insert(0, inverse_entry)
             self.inverse_designs = self.inverse_designs[:20]
         if not procedures:
-            return self._random_suggestions(available)
+            raise ValueError("No eligible candidate procedures remain for LLM scoring")
 
         self.check_cancelled()
         suggestion_count = min(k or self.config["batch_size"], len(procedures))
         by_proc = {cand["procedure"]: cand for cand in candidate_pool}
         aq_fxn = self._llm_acquisition_callable(acquisition_name)
         selection_note = None
+        sample_values: List[Optional[List[float]]] = []
         if aq_fxn is None:
             selected = (rng or random).sample(procedures, suggestion_count)
             acq_values = [0.0] * len(selected)
             means = [None] * len(selected)
             stds = [None] * len(selected)
+            sample_values = [None] * len(selected)
         else:
             training_rows, _ = _group_training_observations(
-                observations if observations is not None else self.active_observations(),
-                self.config["objective_direction"],
+                observations
+                if observations is not None
+                else self.active_observations(),
+                "maximize",
                 "off",
             )
             targets = [
@@ -2903,7 +3178,15 @@ class LocalBOState:
                 for row in training_rows
                 if row.get("target") is not None
             ]
-            best = max(targets) if targets else 0.0
+            best = (
+                (
+                    min(targets)
+                    if self.config["objective_direction"] == "minimize"
+                    else max(targets)
+                )
+                if targets
+                else 0.0
+            )
             raw = self._api_call_with_retries(
                 "Scoring LLM candidate shortlist",
                 lambda: self._llm_score_procedures(
@@ -2917,6 +3200,7 @@ class LocalBOState:
             selected, acq_values, means, stds = raw[:4]
             degenerate_scores = bool(raw[4]) if len(raw) > 4 else False
             degenerate_info = raw[5] if len(raw) > 5 else {}
+            sample_values = raw[6] if len(raw) > 6 else [None] * len(selected)
             if degenerate_scores:
                 count = int(degenerate_info.get("score_count") or len(procedures))
                 flat_mean = float(degenerate_info.get("mean") or 0.0)
@@ -2930,7 +3214,9 @@ class LocalBOState:
                 self.log(selection_note)
         self.check_cancelled()
         if not selected:
-            return self._random_suggestions(available)
+            raise ValueError(
+                "LLM suggestion failed: no candidate has two valid predictions; no fallback was used"
+            )
         metadata = self._suggestion_context_metadata("llm", acquisition_name)
         metadata["objective_scaling"] = scaler.get("mode", "off")
         return [
@@ -2938,17 +3224,18 @@ class LocalBOState:
                 "candidate_id": by_proc[procedure]["id"],
                 "procedure": procedure,
                 "acquisition": float(aq),
-                "mean": _unscale_target(
-                    float(mean), self.config["objective_direction"], scaler
-                )
-                if mean is not None
-                else None,
+                "mean": float(mean) if mean is not None else None,
                 "std": _unscale_uncertainty(std, scaler),
                 **metadata,
                 "inverse_seed": inverse_text,
                 "selection_note": selection_note,
+                "llm_sample_values": samples
+                if self.config.get("llm_diagnostics") and samples is not None
+                else None,
             }
-            for procedure, aq, mean, std in zip(selected, acq_values, means, stds)
+            for procedure, aq, mean, std, samples in zip(
+                selected, acq_values, means, stds, sample_values
+            )
             if procedure in by_proc
         ]
 
@@ -2964,69 +3251,70 @@ class LocalBOState:
             ),
             dtype=float,
         )
-        candidate_vectors = embeddings[: len(procedures)]
-        query_vector = embeddings[-1]
-        candidate_norms = np.linalg.norm(candidate_vectors, axis=1)
-        query_norm = np.linalg.norm(query_vector)
-        denom = np.maximum(candidate_norms * query_norm, 1e-12)
-        scores = (candidate_vectors @ query_vector) / denom
-        if k >= len(procedures):
-            return [procedures[index] for index in np.argsort(scores)[::-1]]
+        from boicl.llm_engine import retrieve_candidates
 
-        selected: List[int] = []
-        remaining = set(range(len(procedures)))
-        while remaining and len(selected) < k:
-            if not selected:
-                chosen = max(remaining, key=lambda index: scores[index])
-            else:
-                selected_vectors = candidate_vectors[selected]
-                selected_norms = np.maximum(candidate_norms[selected], 1e-12)
-
-                def mmr_score(index: int) -> float:
-                    similarities = (
-                        selected_vectors @ candidate_vectors[index]
-                    ) / np.maximum(selected_norms * candidate_norms[index], 1e-12)
-                    diversity_penalty = float(np.max(similarities))
-                    return (
-                        lambda_mult * float(scores[index])
-                        - (1.0 - lambda_mult) * diversity_penalty
-                    )
-
-                chosen = max(remaining, key=mmr_score)
-            selected.append(chosen)
-            remaining.remove(chosen)
-        return [procedures[index] for index in selected]
+        records = retrieve_candidates(
+            procedures,
+            embeddings[:-1],
+            embeddings[-1],
+            fetch_k=100,
+            shortlist_size=k,
+            mmr_lambda=lambda_mult,
+        )
+        return [row["candidate_id"] for row in records]
 
     def _inverse_target_display_value(
         self,
         observations: Optional[List[Dict[str, Any]]] = None,
         rng: Optional[random.Random] = None,
     ) -> float:
+        from boicl.llm_engine import resolve_inverse_target
+        from types import SimpleNamespace
+
         configured = _coerce_float(self.config.get("inverse_target_value"))
-        if configured is not None:
-            return configured
-        observations = observations if observations is not None else self.active_observations()
-        if not observations:
+        observations = (
+            observations if observations is not None else self.active_observations()
+        )
+        if not observations and configured is None:
             raise ValueError(
                 "Inverse design needs live observations or an explicit inverse target. "
                 "For a fully labeled dataset, use Offline Benchmark > Run & Append "
                 "instead of Generate Proposals."
             )
         values = [obs["value"] for obs in observations if obs["value"] is not None]
-        best = min(values) if self.config["objective_direction"] == "minimize" else max(values)
+        best = (
+            (
+                min(values)
+                if self.config["objective_direction"] == "minimize"
+                else max(values)
+            )
+            if values
+            else configured
+        )
         multiplier = float(self.config["inverse_target_multiplier"])
         jitter = float(self.config.get("inverse_target_jitter") or 0.0)
-        if jitter > 0:
-            sampler = rng if rng is not None else random
-            multiplier = max(0.0, sampler.normalvariate(multiplier, jitter))
-        target = best * multiplier
         floor_value = _coerce_float(self.config.get("inverse_target_floor_value"))
-        if floor_value is not None:
-            if self.config["objective_direction"] == "minimize":
-                target = min(target, floor_value)
-            else:
-                target = max(target, floor_value)
-        return target
+        lower, upper = self.objective_bounds()
+        reference_scale = (
+            upper - lower
+            if lower is not None and upper is not None
+            else (abs(floor_value) if floor_value else None)
+        )
+        sampler = rng if rng is not None else random
+        resolved = resolve_inverse_target(
+            best,
+            maximize=self.config["objective_direction"] == "maximize",
+            multiplier=multiplier,
+            jitter=jitter,
+            bounds=(lower, upper),
+            manual=configured,
+            reference_scale=reference_scale,
+            floor=floor_value,
+            rng=SimpleNamespace(normal=sampler.normalvariate),
+        )
+        self.last_inverse_target = resolved
+        self.log(f"Inverse target policy: {json.dumps(resolved)}")
+        return resolved["resolved_target"]
 
     def _inverse_target_model_value(
         self,
@@ -3034,14 +3322,10 @@ class LocalBOState:
         observations: Optional[List[Dict[str, Any]]] = None,
         target_value: Optional[float] = None,
     ) -> float:
-        if scaler is None:
-            _, scaler = self._training_rows_and_scaler(observations)
-        return _scale_target(
-            target_value
+        return (
+            float(target_value)
             if target_value is not None
-            else self._inverse_target_display_value(observations),
-            self.config["objective_direction"],
-            scaler,
+            else self._inverse_target_display_value(observations)
         )
 
     def _generate_inverse_text(
@@ -3071,7 +3355,9 @@ class LocalBOState:
             if self.config["selector_k"] and not os.environ.get("OPENAI_API_KEY"):
                 raise ValueError("OPENAI_API_KEY is required for selector examples.")
             if len(self._training_observations()) < 1:
-                raise ValueError("Add at least one labeled procedure before inverse design.")
+                raise ValueError(
+                    "Add at least one labeled procedure before inverse design."
+                )
             model, scaler = self._build_llm_model()
             generated = []
             design_count = int(self.config["inverse_design_count"])
@@ -3099,6 +3385,7 @@ class LocalBOState:
                             "model": self.config["inverse_model"],
                             "time": _now(),
                             "source": "manual_inverse_design",
+                            "active": False,
                         }
                     )
                     self.set_progress(
@@ -3133,7 +3420,9 @@ class LocalBOState:
             "candidate_id": candidate["id"],
             "procedure": candidate["procedure"],
             "objectives": {objective: value},
-            "uncertainties": {objective: uncertainty} if uncertainty is not None else {},
+            "uncertainties": {objective: uncertainty}
+            if uncertainty is not None
+            else {},
             "value": value,
             "target": self.target_value(value),
             "uncertainty": uncertainty,
@@ -3179,6 +3468,8 @@ class LocalBOState:
                 "inverse_model",
                 "llm_samples",
                 "llm_uncertainty_calibration",
+                "llm_prediction_temperature",
+                "llm_inverse_temperature",
                 "selector_k",
                 "llm_pool_scope",
                 "inverse_filter",
@@ -3378,7 +3669,9 @@ class LocalBOState:
                 if resume_run is None:
                     raise ValueError("The benchmark run to resume was not found.")
                 if not resume_run.get("partial"):
-                    raise ValueError("Only stopped or interrupted benchmark runs can be resumed.")
+                    raise ValueError(
+                        "Only stopped or interrupted benchmark runs can be resumed."
+                    )
                 if not resume_run.get("replicate_observations"):
                     raise ValueError(
                         "This benchmark was stopped before candidate-level rows were saved."
@@ -3390,9 +3683,13 @@ class LocalBOState:
                 }
                 self.config.update(saved_config)
                 if "api_pause_seconds" in payload:
-                    self.config["api_pause_seconds"] = float(payload["api_pause_seconds"])
+                    self.config["api_pause_seconds"] = float(
+                        payload["api_pause_seconds"]
+                    )
                 if "api_retry_attempts" in payload:
-                    self.config["api_retry_attempts"] = int(payload["api_retry_attempts"])
+                    self.config["api_retry_attempts"] = int(
+                        payload["api_retry_attempts"]
+                    )
                 if "api_rate_limit_cooldown_seconds" in payload:
                     self.config["api_rate_limit_cooldown_seconds"] = float(
                         payload["api_rate_limit_cooldown_seconds"]
@@ -3435,10 +3732,14 @@ class LocalBOState:
             iterations = int(self.config["benchmark_iterations"])
             replicates = int(self.config["benchmark_replicates"])
             if len(labelled) <= initial_points:
-                raise ValueError("Need more labelled candidates than initial random points.")
+                raise ValueError(
+                    "Need more labelled candidates than initial random points."
+                )
             missing_key = self._missing_key_for_benchmark()
             if missing_key:
-                raise ValueError(f"{missing_key} is required for this benchmark config.")
+                raise ValueError(
+                    f"{missing_key} is required for this benchmark config."
+                )
 
             name = (
                 requested_name
@@ -3471,7 +3772,9 @@ class LocalBOState:
             color = (resume_run or {}).get("color") or BENCHMARK_COLORS[
                 len(self.benchmark_runs) % len(BENCHMARK_COLORS)
             ]
-            run_id = (resume_run or {}).get("id") or f"benchmark-{len(self.benchmark_runs) + 1}"
+            run_id = (resume_run or {}).get(
+                "id"
+            ) or f"benchmark-{len(self.benchmark_runs) + 1}"
             partial_run = {
                 "id": run_id,
                 "name": name,
@@ -3498,7 +3801,10 @@ class LocalBOState:
                     replicate_observations[current_replicate] = [
                         dict(obs) for obs in current_observations
                     ]
-                obs_sets = [[dict(obs) for obs in obs_list] for obs_list in replicate_observations]
+                obs_sets = [
+                    [dict(obs) for obs in obs_list]
+                    for obs_list in replicate_observations
+                ]
                 obs_sets = [obs_list for obs_list in obs_sets if obs_list]
                 traces = [
                     _best_trace(obs_list, self.config["objective_direction"])
@@ -3605,9 +3911,7 @@ class LocalBOState:
                         )
                         if used_mean_seed:
                             if initial_points == 1:
-                                init_detail = (
-                                    "initialized 1 mean-nonzero seed point"
-                                )
+                                init_detail = "initialized 1 mean-nonzero seed point"
                             else:
                                 init_detail = (
                                     f"initialized 1 mean-nonzero seed point + "
@@ -3646,7 +3950,10 @@ class LocalBOState:
                             else None
                         )
                         candidate = self._benchmark_next_candidate(
-                            available, observations, rng, acquisition=acquisition_override
+                            available,
+                            observations,
+                            rng,
+                            acquisition=acquisition_override,
                         )
                         self.check_cancelled()
                         observations.append(self._observation_from_candidate(candidate))
@@ -3683,9 +3990,7 @@ class LocalBOState:
                 partial_run["time"] = _now()
                 update_partial_run()
                 self._upsert_benchmark_run_locked(partial_run, resume_index)
-                self.last_model_status = (
-                    "Benchmark stopped by user. The partial run was saved and can be resumed."
-                )
+                self.last_model_status = "Benchmark stopped by user. The partial run was saved and can be resumed."
                 self.log(f"Stopped benchmark '{name}'.")
                 self.cancel_progress(
                     f"Running benchmark: {name}",
@@ -3767,9 +4072,10 @@ class LocalBOState:
         with self.lock:
             self.observations = []
             self.suggestions = []
+            self.inverse_designs = []
             self.last_error = None
             self.last_model_status = "Run reset. Dataset is still loaded."
-            self.log("Cleared observations and suggestions.")
+            self.log("Cleared observations, suggestions, and inverse designs.")
             self._autosave_locked()
             return self.to_json()
 
@@ -3821,6 +4127,9 @@ class LocalBOState:
                     "prediction_inverse_random_candidates",
                     "prediction_llm_samples",
                     "prediction_llm_uncertainty_calibration",
+                    "prediction_llm_prediction_temperature",
+                    "prediction_llm_inverse_temperature",
+                    "prediction_llm_sample_values",
                     "prediction_score_limit",
                     "prediction_inverse_seed",
                     "prediction_selection_note",
@@ -3852,18 +4161,24 @@ class LocalBOState:
                 row["prediction_objective_scaling"] = prediction.get(
                     "objective_scaling", ""
                 )
-                row["prediction_llm_pool_scope"] = prediction.get(
-                    "llm_pool_scope", ""
-                )
-                row["prediction_inverse_filter"] = prediction.get(
-                    "inverse_filter", ""
-                )
+                row["prediction_llm_pool_scope"] = prediction.get("llm_pool_scope", "")
+                row["prediction_inverse_filter"] = prediction.get("inverse_filter", "")
                 row["prediction_inverse_random_candidates"] = prediction.get(
                     "inverse_random_candidates", ""
                 )
                 row["prediction_llm_samples"] = prediction.get("llm_samples", "")
                 row["prediction_llm_uncertainty_calibration"] = prediction.get(
                     "llm_uncertainty_calibration", ""
+                )
+                row["prediction_llm_prediction_temperature"] = prediction.get(
+                    "llm_prediction_temperature", ""
+                )
+                row["prediction_llm_inverse_temperature"] = prediction.get(
+                    "llm_inverse_temperature", ""
+                )
+                sample_values = prediction.get("llm_sample_values")
+                row["prediction_llm_sample_values"] = (
+                    json.dumps(sample_values) if sample_values is not None else ""
                 )
                 row["prediction_score_limit"] = prediction.get("score_limit", "")
                 row["prediction_inverse_seed"] = prediction.get("inverse_seed", "")
@@ -3963,7 +4278,9 @@ class LocalBOState:
                             "replicate": replicate_index,
                             "experiment_count": obs_index,
                             "candidate_id": obs.get("candidate_id", ""),
-                            "candidate_row": candidate.get("row", "") if candidate else "",
+                            "candidate_row": candidate.get("row", "")
+                            if candidate
+                            else "",
                             "procedure": obs["procedure"],
                             "time": obs.get("time", ""),
                         }
@@ -3982,14 +4299,43 @@ class LocalBOState:
             if self.campaign_name:
                 parts.append(_safe_cache_fragment(self.campaign_name.lower()))
             if self.dataset_filename:
-                parts.append(_safe_cache_fragment(Path(self.dataset_filename).stem.lower()))
+                parts.append(
+                    _safe_cache_fragment(Path(self.dataset_filename).stem.lower())
+                )
             parts.append(time.strftime("%Y%m%d_%H%M%S"))
             parts.append("observations")
+            return "_".join(parts) + ".csv"
+
+    def export_procedures_csv(self) -> str:
+        with self.lock:
+            out = StringIO()
+            writer = csv.DictWriter(out, fieldnames=["procedure"])
+            writer.writeheader()
+            for candidate in sorted(
+                self.candidates, key=lambda item: int(item.get("row") or 0)
+            ):
+                writer.writerow({"procedure": candidate.get("procedure", "")})
+            return out.getvalue()
+
+    def export_procedures_filename(self) -> str:
+        with self.lock:
+            parts = ["boicl"]
+            if self.campaign_name:
+                parts.append(_safe_cache_fragment(self.campaign_name.lower()))
+            if self.dataset_filename:
+                parts.append(
+                    _safe_cache_fragment(Path(self.dataset_filename).stem.lower())
+                )
+            parts.append(time.strftime("%Y%m%d_%H%M%S"))
+            parts.append("procedures")
             return "_".join(parts) + ".csv"
 
 
 class LocalAppHandler(BaseHTTPRequestHandler):
     state: LocalBOState
+    moc_init_lock = threading.Lock()
+    moc_service = None
+    moc_demo = False
 
     def log_message(self, fmt: str, *args: Any) -> None:
         if self.command == "GET" and self.path.startswith("/api/progress"):
@@ -4025,13 +4371,38 @@ class LocalAppHandler(BaseHTTPRequestHandler):
     def _handle_error(self, exc: Exception, status: int = 400) -> None:
         self.state.last_error = str(exc)
         if self.state.progress.get("status") == "running":
-            self.state.fail_progress(self.state.progress.get("label") or "Request", str(exc))
+            self.state.fail_progress(
+                self.state.progress.get("label") or "Request", str(exc)
+            )
         self._send_json({"error": str(exc), "state": self.state.to_json()}, status)
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path == "/":
+        if parsed.path.startswith("/api/toolkit/"):
+            try:
+                from .toolkit_bridge import get
+
+                get(self, parsed)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, 400)
+        elif parsed.path.startswith("/api/moc/"):
+            try:
+                from .moc_http import get
+
+                get(self, parsed)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, 400)
+        elif parsed.path == "/moc":
+            from .moc_ui import MOC_HTML
+
+            self._send_text(MOC_HTML, "text/html")
+        elif parsed.path in {"/", "/generic", "/campaign-graph"}:
             self._send_text(INDEX_HTML, "text/html")
+        elif parsed.path == "/toolkit-main.js":
+            self._send_text(
+                Path(__file__).with_name("toolkit_main.js").read_text(encoding="utf-8"),
+                "application/javascript",
+            )
         elif parsed.path == "/pool-builder":
             self._send_text(POOL_BUILDER_HTML, "text/html")
         elif parsed.path == "/guide":
@@ -4056,9 +4427,17 @@ class LocalAppHandler(BaseHTTPRequestHandler):
             raw = payload.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/csv; charset=utf-8")
-            self.send_header(
-                "Content-Disposition", f"attachment; filename={filename}"
-            )
+            self.send_header("Content-Disposition", f"attachment; filename={filename}")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+        elif parsed.path == "/api/export-procedures.csv":
+            payload = self.state.export_procedures_csv()
+            filename = self.state.export_procedures_filename()
+            raw = payload.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition", f"attachment; filename={filename}")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
@@ -4068,9 +4447,7 @@ class LocalAppHandler(BaseHTTPRequestHandler):
             raw = payload.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header(
-                "Content-Disposition", f"attachment; filename={filename}"
-            )
+            self.send_header("Content-Disposition", f"attachment; filename={filename}")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
@@ -4080,7 +4457,24 @@ class LocalAppHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         try:
-            if parsed.path == "/api/save-key":
+            if parsed.path == "/api/toolkit/inspect-dataset":
+                from .toolkit_bridge import inspect_upload
+
+                self._send_json(
+                    inspect_upload(
+                        parse_qs(parsed.query).get("filename", ["data.csv"])[0],
+                        self._read_raw(),
+                    )
+                )
+            elif parsed.path.startswith("/api/toolkit/"):
+                from .toolkit_bridge import post
+
+                post(self, parsed)
+            elif parsed.path.startswith("/api/moc/"):
+                from .moc_http import post
+
+                post(self, parsed)
+            elif parsed.path == "/api/save-key":
                 payload = self._read_json()
                 key = _clean_api_key_value(
                     payload.get("openai_api_key") or "", "OPENAI_API_KEY"
@@ -4143,7 +4537,9 @@ class LocalAppHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/random-walk/start":
                 self._send_json(self.state.start_live_random_walk(self._read_json()))
             elif parsed.path == "/api/random-walk/observe":
-                self._send_json(self.state.add_live_random_walk_result(self._read_json()))
+                self._send_json(
+                    self.state.add_live_random_walk_result(self._read_json())
+                )
             elif parsed.path == "/api/random-walk/clear":
                 self._send_json(self.state.clear_live_random_walk())
             elif parsed.path == "/api/suggest":
@@ -4385,6 +4781,22 @@ INDEX_HTML = r"""<!doctype html>
     .field {
       margin-bottom: 12px;
     }
+    .advanced-settings {
+      margin: 0 0 12px;
+      padding: 10px 0 0;
+      border-top: 1px solid var(--line);
+    }
+    .advanced-settings summary {
+      cursor: pointer;
+      color: #344054;
+      font-size: 12px;
+      font-weight: 760;
+      list-style-position: outside;
+      margin-bottom: 10px;
+    }
+    .advanced-settings[open] summary {
+      margin-bottom: 12px;
+    }
     .switchline {
       display: flex;
       align-items: center;
@@ -4414,6 +4826,43 @@ INDEX_HTML = r"""<!doctype html>
       max-width: 560px;
       overflow-wrap: anywhere;
       line-height: 1.35;
+    }
+    .candidate-results {
+      max-height: 340px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfe;
+      margin: -4px 0 12px;
+    }
+    .candidate-result {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: start;
+      padding: 10px;
+      border-bottom: 1px solid #edf0f5;
+    }
+    .candidate-result:last-child {
+      border-bottom: 0;
+    }
+    .candidate-result strong {
+      display: block;
+      color: #344054;
+      font-size: 12px;
+      margin-bottom: 4px;
+    }
+    .candidate-result .procedure {
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+      white-space: normal;
+    }
+    .candidate-result button {
+      min-height: 32px;
+      padding: 6px 10px;
+      white-space: nowrap;
     }
     .plot {
       width: 100%;
@@ -4501,6 +4950,7 @@ INDEX_HTML = r"""<!doctype html>
       <span class="chip" id="embeddingStatus">Embeddings</span>
       <span class="chip" id="observationStatus">0 observations</span>
       <button id="openPoolBuilderTop" title="Open or focus the reusable local procedure-pool builder tab.">Pool Builder</button>
+      <a class="button-link" id="focusedView" href="/moc">Focused campaign view</a>
       <a class="button-link" href="/guide" target="_blank" rel="noopener" title="Open the local user guide in a new browser tab.">User Guide</a>
       <button class="secondary" id="suggestTop">Update Suggestions</button>
     </div>
@@ -4527,6 +4977,11 @@ INDEX_HTML = r"""<!doctype html>
 
       <section class="panel">
         <h2>Campaign</h2>
+        <details><summary>Load a MoC continuation preset</summary>
+          <label for="mocPreset">Preset</label><select id="mocPreset"><option value="moc_llm">MoC · matched LLM</option><option value="moc_gp">MoC · structured GP</option><option value="moc_embedding_gp">MoC · embedding GP baseline</option><option value="moc_eight">MoC · eight-observation continuation</option></select>
+          <div class="toolbar"><button id="loadMocPreset">Load preset</button><button id="loadMocPair">Create matched GP + LLM pair</button></div>
+          <p class="hint">Each load creates a new campaign. The confirmed M12 result is 83.8 wt%. Existing campaigns remain available below.</p>
+        </details>
         <div class="field">
           <label for="campaignName">Campaign name</label>
           <input id="campaignName" placeholder="new campaign">
@@ -4539,12 +4994,15 @@ INDEX_HTML = r"""<!doctype html>
           <button class="primary" id="saveCampaign">Save</button>
           <button id="saveAsCampaign">Save Copy</button>
           <button id="loadCampaign">Load Selected</button>
+          <button id="openCampaignTab">Open Selected in New Tab</button>
           <button class="danger" id="deleteCampaign">Delete Saved</button>
           <button id="startFresh">Start Fresh</button>
           <button id="exportArchive">Export Archive</button>
           <button class="wide" id="importArchive">Import Archive</button>
           <input id="archiveFile" type="file" accept=".json" style="display:none">
         </div>
+        <p id="sharedCampaignIdentity" class="hint hidden"></p>
+        <details id="sharedCheckpoints" class="hidden"><summary>Saved checkpoints</summary><p class="hint">Changes save automatically. Resume a checkpoint as an independent campaign copy with its measurements, settings and pending reservations.</p><div class="field"><label for="checkpointName">Checkpoint label (optional)</label><input id="checkpointName"></div><button id="saveCheckpoint">Save checkpoint now</button><div class="field"><label for="checkpointSelect">Saved point</label><select id="checkpointSelect"></select></div><div class="toolbar"><button id="refreshCheckpoints">Refresh list</button><button id="restoreCheckpoint">Resume selected as independent copy</button></div></details>
       </section>
 
       <section class="panel">
@@ -4559,6 +5017,10 @@ INDEX_HTML = r"""<!doctype html>
           <button id="openPoolBuilderDataset">Build Pool</button>
         </div>
         <div class="muted" id="embeddingDetail" style="margin-top: 8px;"></div>
+        <details id="structuredImport"><summary>Map a generic dataset to structured GP features</summary>
+          <p class="hint">Choose a CSV or Excel file above, inspect columns, then explicitly select synthesis features and the measured objective. Blank objective values are unmeasured candidates.</p>
+          <button id="inspectFeatures">Inspect columns</button><div id="featureMapper"></div><button id="createStructured" class="hidden">Create structured campaign</button>
+        </details>
       </section>
 
       <section class="panel">
@@ -4567,14 +5029,16 @@ INDEX_HTML = r"""<!doctype html>
           <label for="workflowMode">Workflow mode</label>
           <select id="workflowMode">
             <option value="offline">Automatic benchmark: full labeled dataset</option>
-            <option value="live">Live campaign: add results manually</option>
+            <option value="live" selected>Live campaign: add results manually</option>
           </select>
         </div>
         <div class="field">
           <label for="optimizer">Suggestion engine</label>
           <select id="optimizer">
             <option value="gpr">GPR with embeddings</option>
-            <option value="llm">BO-ICL LLM</option>
+            <option value="gpr_features">GP: synthesis parameters</option>
+            <option value="gpr_embeddings">GP: text embeddings (shared)</option>
+            <option value="llm" selected>BO-ICL LLM</option>
           </select>
         </div>
         <div class="field">
@@ -4595,8 +5059,11 @@ INDEX_HTML = r"""<!doctype html>
             <select id="acquisition"></select>
           </div>
         </div>
+        <details id="sharedGPSettings" class="hidden"><summary>Structured GP sampler</summary><div class="field"><label for="gpBurnIn">Burn-in steps</label><input id="gpBurnIn" type="number" min="0"></div><div class="field"><label for="gpDraws">Retained draws</label><input id="gpDraws" type="number" min="1"></div><div class="field"><label for="gpThin">Prediction thinning</label><input id="gpThin" type="number" min="1"></div></details>
+        <div id="sharedSelector" class="field hidden"><label for="sharedSelectorMode">Observed examples</label><select id="sharedSelectorMode"><option value="nearest">Nearest by procedure</option><option value="all">All active observations</option></select></div>
+        <div class="field hidden"><label for="sharedDimensions">Embedding GP projection dimensions</label><input id="sharedDimensions" type="number" min="1" value="32"></div>
         <div class="muted" style="margin-top: -4px; margin-bottom: 12px;">
-          Tungsten phase campaigns: use an XRD phase percentage from 0-100 as the live objective, for example alpha phase (%) for Im-3m or beta phase (%) for Pm-3n.
+          Choose the measured objective and optimization direction. Synthesis features never include measured outcomes.
         </div>
         <div class="row">
           <div class="field">
@@ -4657,23 +5124,44 @@ INDEX_HTML = r"""<!doctype html>
           </div>
           <div class="field">
             <label for="ucbLambda">UCB lambda</label>
-            <input id="ucbLambda" type="number" step="0.1" value="0.1">
+            <input id="ucbLambda" type="number" step="0.1" value="0.5">
           </div>
         </div>
         <div class="row">
           <div class="field">
             <label for="llmSamples">LLM samples</label>
-            <input id="llmSamples" type="number" min="1" max="20" value="3">
+            <input id="llmSamples" type="number" min="2" max="20" value="5">
           </div>
           <div class="field">
             <label for="llmUncertaintyCalibration">LLM uncertainty scalar</label>
             <input id="llmUncertaintyCalibration" type="number" min="0" max="100" step="0.01" value="1">
           </div>
         </div>
+        <details class="advanced-settings">
+          <summary>Advanced BO-ICL sampling</summary>
+          <div class="field hidden"><label for="inverseTargetReferenceScale">Zero-baseline target scale</label><input id="inverseTargetReferenceScale" type="number" min="0.000000000001" step="any" value="1"><div id="inverseTargetReferenceScaleHint" class="hint"></div></div>
+          <div class="row">
+            <div class="field">
+              <label for="llmPredictionTemperature">Prediction temperature</label>
+              <input id="llmPredictionTemperature" type="number" min="0" max="2" step="0.05" value="0.7">
+            </div>
+            <div class="field">
+              <label for="llmInverseTemperature">Inverse temperature</label>
+              <input id="llmInverseTemperature" type="number" min="0" max="2" step="0.05" value="0.7">
+            </div>
+          </div>
+          <div class="field">
+            <label class="switchline" for="llmDiagnostics">
+              <input id="llmDiagnostics" type="checkbox">
+              LLM diagnostics
+            </label>
+            <div class="hint">Temporarily log raw parsed LLM samples for each scored shortlist candidate.</div>
+          </div>
+        </details>
         <div class="row">
           <div class="field">
             <label for="selectorK">Selector examples</label>
-            <input id="selectorK" type="number" min="0" value="0">
+            <input id="selectorK" type="number" min="0" value="5">
           </div>
         </div>
         <div class="row">
@@ -4715,7 +5203,7 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="field">
             <label for="inverseDesignCount">Inverse proposals</label>
-            <input id="inverseDesignCount" type="number" min="1" max="10" value="3">
+            <input id="inverseDesignCount" type="number" min="1" max="10" value="1">
         </div>
         <div class="row">
           <div class="field">
@@ -4818,7 +5306,10 @@ INDEX_HTML = r"""<!doctype html>
       <section class="panel">
         <div class="toolbar" style="justify-content: space-between; margin-bottom: 12px;">
           <h2 style="margin:0;">Best So Far</h2>
-          <a class="muted" href="/api/export-observations.csv">Export observations</a>
+          <div class="toolbar">
+            <a class="muted" href="/api/export-procedures.csv">Export procedures</a>
+            <a class="muted" href="/api/export-observations.csv">Export observations</a>
+          </div>
         </div>
         <div id="workflowBanner" class="notice" style="margin-bottom: 12px;"></div>
         <div id="progressPanel" class="progressbox hidden">
@@ -4833,19 +5324,23 @@ INDEX_HTML = r"""<!doctype html>
           <div class="muted" id="progressDetail"></div>
         </div>
         <div id="plot" class="plot"></div>
+        <details id="sharedComparisons" class="hidden"><summary>Comparison curves</summary><div id="sharedComparisonChoices"></div><p class="hint">Comparisons share the initial pool and observations. Later measurements belong to each arm separately. Checkboxes only change this plot and its focused-view copy.</p></details>
         <div id="benchmarkRuns" style="margin-top: 12px;"></div>
       </section>
 
       <section class="panel" id="liveResultPanel">
         <h2>Add Result</h2>
+        <div id="sharedPending" class="field hidden"><label for="pendingMeasurement">Reserved experiment</label><select id="pendingMeasurement"></select></div>
         <div class="field">
           <label for="candidateSearch">Candidate search</label>
-          <input id="candidateSearch" list="candidateOptions" autocomplete="off" placeholder="Search row #, ramp, temperature, dwell, or procedure text">
+          <input id="candidateSearch" list="candidateOptions" autocomplete="off" placeholder="Search row #, flow, ramp, temperature, dwell, cooling, or procedure text">
           <datalist id="candidateOptions"></datalist>
           <input id="candidateSelect" type="hidden">
         </div>
         <button id="clearCandidate" type="button" style="margin: -4px 0 10px;">Clear Candidate</button>
         <div class="muted" id="candidatePreview" style="margin: -6px 0 12px;"></div>
+        <div class="muted" id="candidateSearchMeta" style="margin: -6px 0 8px;"></div>
+        <div id="candidateSearchResults" class="candidate-results hidden"></div>
         <div class="field">
           <label for="manualProcedure">Procedure</label>
           <textarea id="manualProcedure"></textarea>
@@ -4860,8 +5355,10 @@ INDEX_HTML = r"""<!doctype html>
             <input id="objectiveUncertainty" type="number" step="any" placeholder="optional">
           </div>
         </div>
-        <div class="muted" style="margin-bottom: 12px;">For the tungsten workflow, enter the XRD-calculated phase percentage on a 0-100 scale. Example: enter 73.5 for 73.5%, not 0.735.</div>
+        <div id="measurementHint" class="muted" style="margin-bottom: 12px;">Enter the measured outcome and its uncertainty in the original objective units.</div>
+        <details id="sharedQuality" class="hidden"><summary>Measurement quality and source</summary><p class="hint">MoC results require esd, GOF and closure gap. Generic measurements preserve unknown quality as missing. These entries also apply to the independent random result below.</p><div class="row"><div class="field"><label for="qualityGOF">GOF</label><input id="qualityGOF" type="number" step="any"></div><div class="field"><label for="qualityGap">Closure gap (wt%)</label><input id="qualityGap" type="number" step="any"></div></div><div class="field"><label for="qualityGapOrigin">Gap origin</label><select id="qualityGapOrigin"><option value="reported">Reported</option><option value="derived">Derived</option><option value="unknown">Unknown</option></select></div><div class="field"><label for="qualityNote">Source note</label><input id="qualityNote"></div></details>
         <button class="primary" id="addObservation">Add Observation</button>
+        <div id="refinementControls" class="hidden"><div class="field"><label for="refinementReason">Reason for refinement</label><input id="refinementReason" placeholder="Required; original record remains in history"></div><button id="saveRefinement">Save refinement</button> <button id="cancelRefinement">Cancel refinement</button></div>
       </section>
 
       <section class="panel" id="liveRandomPanel">
@@ -4913,12 +5410,14 @@ INDEX_HTML = r"""<!doctype html>
       <section class="panel">
         <h2>Observations</h2>
         <div id="observations"></div>
+        <details id="sharedProvenance" class="hidden"><summary>Campaign record, request log and replay</summary><div class="field"><label for="sharedReplayStep">Recorded suggestion</label><select id="sharedReplayStep"></select></div><button id="sharedReplay">Replay recorded score</button> <button id="sharedLog">Load exact request log</button><pre id="sharedReplayResult" style="white-space:pre-wrap;max-height:400px;overflow:auto"></pre><details><summary>Configuration and complete history</summary><pre id="sharedRecord" style="white-space:pre-wrap;max-height:500px;overflow:auto"></pre></details><div class="field"><label for="sharedCachePath">Local portable cache package path</label><input id="sharedCachePath"></div><button id="sharedCacheImport">Validate and import cache</button></details>
       </section>
 
       <section id="messages" class="stack"></section>
     </section>
   </main>
 
+  <script src="/toolkit-main.js"></script>
   <script>
     window.name = 'boicl_runner';
     let state = null;
@@ -4926,6 +5425,7 @@ INDEX_HTML = r"""<!doctype html>
     let progressTimer = null;
     let transientNotice = '';
     let candidateSearchResults = [];
+    let candidateSearchMeta = {};
     let candidateSearchTimer = null;
     const poolChannel = 'BroadcastChannel' in window ? new BroadcastChannel('boicl-local-runner') : null;
 
@@ -4942,9 +5442,9 @@ INDEX_HTML = r"""<!doctype html>
       optimizer: 'Choose GPR with embeddings for the GP baseline, or BO-ICL LLM for in-context LLM predictions over the uploaded pool.',
       objectiveName: 'The numeric label column to optimize. If multiple objective columns were uploaded, choose one here.',
       objectiveDirection: 'Maximize for yields/selectivity/scores; minimize for losses, errors, or costs.',
-      acquisition: 'Candidate ranking rule. The paper notebook default sweep included upper confidence bound, greedy, random, and random mean baseline.',
-      objectiveLowerBound: 'Optional physical or measurement lower bound in original units. Used only for plot guides and clipping displayed error-bar endpoints, not prompts or acquisition math.',
-      objectiveUpperBound: 'Optional physical or measurement upper bound in original units. For phase percentages, use 100. Used only for plot guides and clipping displayed error-bar endpoints, not prompts or acquisition math.',
+      acquisition: 'Candidate ranking rule. New LLM campaigns use expected improvement by default.',
+      objectiveLowerBound: 'Optional physical or measurement lower bound in original units. Used only for plot guides, clipping displayed error-bar endpoints, and clipping inverse-design targets, not prompts or acquisition math.',
+      objectiveUpperBound: 'Optional physical or measurement upper bound in original units. For phase percentages, use 100. Used only for plot guides, clipping displayed error-bar endpoints, and clipping inverse-design targets, not prompts or acquisition math.',
       objectiveScaling: 'Off keeps labels in original units. Auto/min-max/z-score are used for GPR fitting only; BO-ICL LLM always uses original units so prompts, floors, and predictions stay consistent.',
       plotStatGuides: 'Controls full-dataset dashed reference lines. Best only is cleaner; Paper stats adds mean and percentile guides.',
       embeddingModel: 'OpenAI embedding model used to featurize procedures for GPR and nearest-neighbor inverse filtering.',
@@ -4953,9 +5453,12 @@ INDEX_HTML = r"""<!doctype html>
       predictionSystemMessage: 'Dataset-aware instruction prepended to BO-ICL prediction prompts. It is generated from procedure style examples without hidden labels.',
       inverseSystemMessage: 'Dataset-aware instruction prepended to inverse-design prompts. It constrains proposals to the uploaded procedure style.',
       batchSize: 'Number of candidates suggested at once in live experimentation. The paper BO loop used 1.',
-      ucbLambda: 'Exploration weight for upper confidence bound. The paper notebook default was 0.1.',
+      ucbLambda: 'Exploration weight for upper confidence bound. Crystal-source default: 0.5.',
       llmSamples: 'Number of LLM prediction samples per shortlisted candidate for BO-ICL uncertainty estimates.',
       llmUncertaintyCalibration: 'Multiplicative calibration factor applied to LLM predictive standard deviations before acquisition scoring and plotting. Default 1 leaves the LLM sample spread untouched. The paper used 4.33 as a per-dataset recalibrated value for gpt-4/topk on the C2 yield benchmark; that constant should not be assumed to transfer without refitting via uncertainty_toolbox.',
+      llmPredictionTemperature: 'Advanced BO-ICL sampling setting. Temperature for numeric prediction completions; higher values can add sample diversity and apparent uncertainty, but may make predictions noisier. Crystal-source default: 0.7.',
+      llmInverseTemperature: 'Advanced BO-ICL sampling setting. Temperature for inverse-design text generation before MMR/cosine shortlist retrieval. Crystal-source default: 0.7.',
+      llmDiagnostics: 'Temporary debugging mode. Logs the raw parsed LLM numeric samples for each scored shortlist candidate so zero uncertainty can be traced to identical samples versus aggregation.',
       selectorK: 'Number of nearest labeled examples to include in prompts. 0 uses the normal few-shot history.',
       inverseFilter: 'LLM-mode shortlist size retrieved with inverse-design text plus cached embeddings before completions are requested. Full pool mode searches every available candidate; Broad random pool mode searches the sampled broad pool. 0 disables the shortlist and scores the broad pool.',
       inverseRandomCandidates: 'Extra random candidates mixed with the LLM shortlist before completions are requested.',
@@ -4980,10 +5483,10 @@ INDEX_HTML = r"""<!doctype html>
       benchmarkReplicates: 'Number of repeated runs for the same workflow. The paper notebook default was 5.',
       benchmarkSeed: 'Starting random seed for reproducible benchmark replicates.',
       greedyFinalIteration: 'When checked, only the final BO choice in each replicate switches to greedy acquisition. Earlier choices use the selected acquisition function.',
-      candidateSearch: 'Search the full available pool by row number or procedure text, then choose a candidate for live result entry.',
+      candidateSearch: 'Search the full available pool by row number, parameter value, or procedure text. Matching candidates are shown below with full wrapped text.',
       clearCandidate: 'Clear the selected pool candidate and use the manual procedure field instead.',
       manualProcedure: 'Procedure text for a live observation. This fills automatically when you select a candidate.',
-      objectiveValue: 'Measured objective value in original units. For tungsten phase optimization, enter whole percent units from 0 to 100, for example 73.5 for 73.5%, not 0.735.',
+      objectiveValue: 'Measured objective in its original units. The selected campaign defines the objective, direction and valid bounds.',
       objectiveUncertainty: 'Optional measurement uncertainty or standard deviation in original units.',
       randomWalkTarget: 'Number of live random-control points to collect. The runner selects one random candidate at a time and waits for its measured value.',
       randomWalkProgress: 'Completed random-control measurements out of the requested count.',
@@ -5043,7 +5546,7 @@ INDEX_HTML = r"""<!doctype html>
         prepareEmbeddings: 'Generate and save local embeddings for the current dataset and embedding model.',
         regeneratePrompts: 'Replace both system messages with prompts generated from the uploaded dataset structure and procedure examples.',
         saveConfig: 'Apply the current settings without running a suggestion.',
-        resetRun: 'Clear live observations and suggestions while keeping the uploaded dataset.',
+        resetRun: 'Clear live observations, suggestions, and inverse-design rows while keeping the uploaded dataset.',
         runBenchmark: 'Run the current configuration against hidden labels and append it to the plot. If a stopped/error run with the same label and settings exists, it resumes that run instead of creating a duplicate trajectory.',
         clearAndRunBenchmark: 'Clear all existing offline benchmark curves, then run the current settings again from scratch.',
         resumeBenchmark: 'Continue the most recent stopped, errored, or interrupted offline benchmark from its saved procedure sequence.',
@@ -5068,12 +5571,18 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function request(path, options = {}) {
+      let requestBody = {};
+      if (path === '/api/load-campaign' || path.startsWith('/api/import-campaign-archive')) {
+        try { requestBody = JSON.parse(typeof options.body === 'string' ? options.body : new TextDecoder().decode(options.body)); } catch (_) {}
+      }
+      if ((sharedCampaignId && path !== '/api/save-key') || requestBody.id?.startsWith('shared:') || requestBody.bundle_version === 1) return toolkitRequest(path, options);
       setBusy(true);
       startProgressPolling();
       try {
         const response = await fetch(path, options);
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.error || 'Request failed');
+        if (sharedCampaignId) { await refresh(); return state; }
         state = payload.state || payload;
         state.live_benchmark_run = (state.progress || {}).partial_run || null;
         render();
@@ -5102,12 +5611,18 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function refresh() {
-      const response = await fetch('/api/state');
-      state = await response.json();
+      const loadingCampaign = sharedCampaignId;
+      const response = await fetch('/api/toolkit/state' + (sharedCampaignId ? '?campaign=' + encodeURIComponent(sharedCampaignId) : ''));
+      const result = await response.json();
+      if (loadingCampaign !== sharedCampaignId) return;
+      if (!response.ok) {renderError(result.error || 'Cannot load campaign');return;}
+      state = result;
       render();
+      scheduleSharedPoll();
     }
 
     async function pollProgress() {
+      if (sharedCampaignId) return;
       try {
         const response = await fetch('/api/progress', { cache: 'no-store' });
         const payload = await response.json();
@@ -5152,19 +5667,22 @@ INDEX_HTML = r"""<!doctype html>
         inverse_model: $('inverseModel').value,
         prediction_system_message: $('predictionSystemMessage').value,
         inverse_system_message: $('inverseSystemMessage').value,
-        llm_samples: Number($('llmSamples').value || 3),
-        llm_uncertainty_calibration: Number($('llmUncertaintyCalibration').value || 0),
-        selector_k: Number($('selectorK').value || 0),
+        llm_samples: Number($('llmSamples').value === '' ? 5 : $('llmSamples').value),
+        llm_uncertainty_calibration: Number($('llmUncertaintyCalibration').value === '' ? 1 : $('llmUncertaintyCalibration').value),
+        llm_prediction_temperature: Number($('llmPredictionTemperature').value === '' ? 0.7 : $('llmPredictionTemperature').value),
+        llm_inverse_temperature: Number($('llmInverseTemperature').value === '' ? 0.7 : $('llmInverseTemperature').value),
+        llm_diagnostics: $('llmDiagnostics').checked,
+        selector_k: Number($('selectorK').value === '' ? 5 : $('selectorK').value),
         llm_pool_scope: $('llmPoolScope').value,
-        inverse_filter: Number($('inverseFilter').value || 16),
+        inverse_filter: Number($('inverseFilter').value === '' ? 16 : $('inverseFilter').value),
         inverse_random_candidates: Number($('inverseRandomCandidates').value || 0),
         inverse_target_value: $('inverseTargetValue').value,
-        inverse_target_multiplier: Number($('inverseTargetMultiplier').value || 1.2),
-        inverse_target_jitter: Number($('inverseTargetJitter').value || 0),
+        inverse_target_multiplier: Number($('inverseTargetMultiplier').value === '' ? 1.2 : $('inverseTargetMultiplier').value),
+        inverse_target_jitter: Number($('inverseTargetJitter').value === '' ? 0.05 : $('inverseTargetJitter').value),
         inverse_target_floor_value: $('inverseTargetFloorValue').value,
-        inverse_design_count: Number($('inverseDesignCount').value || 3),
+        inverse_design_count: Number($('inverseDesignCount').value === '' ? 1 : $('inverseDesignCount').value),
         batch_size: Number($('batchSize').value || 1),
-        iterations_per_trial: Number($('iterationsPerTrial').value || 0),
+        iterations_per_trial: sharedCampaignId && $('iterationsPerTrial').value === '' ? null : Number($('iterationsPerTrial').value || 0),
         replicates_per_candidate: Number($('replicatesPerCandidate').value || 1),
         benchmark_iterations: Number($('benchmarkIterations').value || 30),
         benchmark_replicates: Number($('benchmarkReplicates').value || 5),
@@ -5172,11 +5690,11 @@ INDEX_HTML = r"""<!doctype html>
         benchmark_initial_seed_strategy: $('benchmarkInitialSeedStrategy').value || 'random',
         benchmark_seed: Number($('benchmarkSeed').value || 0),
         greedy_final_iteration: $('greedyFinalIteration').checked,
-        ucb_lambda: Number($('ucbLambda').value || 0.1),
+        ucb_lambda: Number($('ucbLambda').value === '' ? 0.5 : $('ucbLambda').value),
         score_limit: Number($('scoreLimit').value || 250),
-        api_pause_seconds: Number($('apiPauseSeconds').value || 0),
+        api_pause_seconds: Number($('apiPauseSeconds').value === '' ? 0.5 : $('apiPauseSeconds').value),
         api_retry_attempts: Number($('apiRetryAttempts').value || 8),
-        api_rate_limit_cooldown_seconds: Number($('apiRateLimitCooldownSeconds').value || 0),
+        api_rate_limit_cooldown_seconds: Number($('apiRateLimitCooldownSeconds').value === '' ? 10 : $('apiRateLimitCooldownSeconds').value),
         n_neighbors: Number($('nNeighbors').value || 5),
         auto_suggest: $('autoSuggest').checked
       };
@@ -5205,7 +5723,7 @@ INDEX_HTML = r"""<!doctype html>
           runs.push(liveRun);
         }
       }
-      return runs;
+      return sharedCampaignId ? runs.filter(run => run.kind !== 'independent_campaign_comparison' || sharedCurveVisible(run.id)) : runs;
     }
 
     function render() {
@@ -5250,6 +5768,7 @@ INDEX_HTML = r"""<!doctype html>
       renderLiveRandomWalk();
       renderObservations();
       renderMessages();
+      renderShared();
     }
 
     function renderCampaigns() {
@@ -5259,7 +5778,8 @@ INDEX_HTML = r"""<!doctype html>
       const options = ['<option value="">Choose saved campaign</option>'].concat(
         campaigns.map((item) => {
           const dataset = item.dataset_filename ? `, ${item.dataset_filename}` : '';
-          const label = `${item.name} (${item.observation_count || 0} obs, ${item.candidate_count || 0} candidates, ${item.benchmark_count || 0} runs${dataset})`;
+          const identity = item.id.startsWith('shared:') ? ` · ${item.id.slice(7, 15)}` : '';
+          const label = `${item.name}${identity} (${item.observation_count || 0} obs, ${item.candidate_count || 0} candidates, ${item.benchmark_count || 0} runs${dataset})`;
           return `<option value="${escapeHtml(item.id)}">${escapeHtml(label)}</option>`;
         })
       );
@@ -5280,13 +5800,16 @@ INDEX_HTML = r"""<!doctype html>
       setSelectOptions('inverseModel', state.model_presets || [], config.inverse_model);
       $('objectiveDirection').value = config.objective_direction;
       $('objectiveScaling').value = config.objective_scaling;
-      $('objectiveLowerBound').value = config.objective_lower_bound || '';
-      $('objectiveUpperBound').value = config.objective_upper_bound || '';
+      $('objectiveLowerBound').value = config.objective_lower_bound ?? '';
+      $('objectiveUpperBound').value = config.objective_upper_bound ?? '';
       $('plotStatGuides').value = config.plot_stat_guides || 'max';
       $('predictionSystemMessage').value = config.prediction_system_message;
       $('inverseSystemMessage').value = config.inverse_system_message;
       $('llmSamples').value = config.llm_samples;
       $('llmUncertaintyCalibration').value = config.llm_uncertainty_calibration;
+      $('llmPredictionTemperature').value = config.llm_prediction_temperature;
+      $('llmInverseTemperature').value = config.llm_inverse_temperature;
+      $('llmDiagnostics').checked = Boolean(config.llm_diagnostics);
       $('selectorK').value = config.selector_k;
       $('llmPoolScope').value = config.llm_pool_scope || 'full';
       $('inverseFilter').value = config.inverse_filter;
@@ -5294,7 +5817,7 @@ INDEX_HTML = r"""<!doctype html>
       $('inverseTargetValue').value = config.inverse_target_value;
       $('inverseTargetMultiplier').value = config.inverse_target_multiplier;
       $('inverseTargetJitter').value = config.inverse_target_jitter;
-      $('inverseTargetFloorValue').value = config.inverse_target_floor_value || '';
+      $('inverseTargetFloorValue').value = config.inverse_target_floor_value ?? '';
       $('inverseDesignCount').value = config.inverse_design_count;
       $('batchSize').value = config.batch_size;
       $('iterationsPerTrial').value = config.iterations_per_trial;
@@ -5318,7 +5841,7 @@ INDEX_HTML = r"""<!doctype html>
         ? `Resume ${partialRun.status || 'Partial'}`
         : 'Resume Last';
 
-      const current = $('acquisition').value || config.acquisition;
+      const current = sharedCampaignId ? config.acquisition : $('acquisition').value || config.acquisition;
       setSelectOptions(
         'acquisition',
         state.acquisition_functions || [],
@@ -5386,13 +5909,17 @@ INDEX_HTML = r"""<!doctype html>
 
     function candidateProcedureSummary(procedure) {
       const text = String(procedure || '');
+      const flow = text.match(/flow\s+[^.]*?\s+at\s+([0-9.]+)\s*mL\/min/i);
       const temp = text.match(/ramp to\s+([0-9.]+)\s*C/i);
       const ramp = text.match(/at\s+([0-9.]+)\s*C\/min/i);
       const dwell = text.match(/soak for\s+([0-9.]+)\s*h/i);
+      const cooling = text.match(/cool to ambient temperature at\s+([0-9.]+)\s*C\/min/i);
       const parts = [];
+      if (flow) parts.push(`flow=${flow[1]} mL/min`);
       if (temp) parts.push(`T=${temp[1]} C`);
       if (ramp) parts.push(`ramp=${ramp[1]} C/min`);
       if (dwell) parts.push(`dwell=${dwell[1]} h`);
+      if (cooling) parts.push(`cool=${cooling[1]} C/min`);
       return parts.length ? parts.join(' | ') : '';
     }
 
@@ -5429,6 +5956,8 @@ INDEX_HTML = r"""<!doctype html>
       $('candidateSelect').value = decorated.id || decorated.candidate_id || '';
       $('candidateSearch').value = decorated._candidateLabel;
       $('manualProcedure').value = decorated.procedure || '';
+      $('objectiveValue').value = '';
+      $('objectiveUncertainty').value = '';
       updateCandidatePreview();
       $('objectiveValue').focus();
     }
@@ -5440,9 +5969,43 @@ INDEX_HTML = r"""<!doctype html>
       updateCandidatePreview();
     }
 
-    function populateCandidateOptions(items) {
+    function renderCandidateSearchResults() {
+      const host = $('candidateSearchResults');
+      const meta = $('candidateSearchMeta');
+      if (!candidateSearchResults.length) {
+        host.innerHTML = '';
+        host.classList.add('hidden');
+        meta.textContent = '';
+        return;
+      }
+      const query = $('candidateSearch').value.trim();
+      const matched = Number(candidateSearchMeta.matched_count || candidateSearchResults.length);
+      const available = Number(candidateSearchMeta.available_count || (state ? state.available_count : 0) || matched);
+      meta.textContent = query
+        ? `Showing ${candidateSearchResults.length.toLocaleString()} of ${matched.toLocaleString()} matching candidate(s) from ${available.toLocaleString()} available.`
+        : `Showing suggested candidates and the first ${candidateSearchResults.length.toLocaleString()} available candidate(s). Type row numbers or terms to narrow the list.`;
+      host.innerHTML = candidateSearchResults.map((item) => {
+        const summary = candidateProcedureSummary(item.procedure);
+        const row = item.row ? `Row ${item.row}` : 'Candidate';
+        const label = [row, summary].filter(Boolean).join(' | ');
+        const id = item.id || item.candidate_id || '';
+        return `
+          <div class="candidate-result">
+            <div>
+              <strong>${escapeHtml(label)}</strong>
+              <div class="procedure">${escapeHtml(item.procedure || '')}</div>
+            </div>
+            <button type="button" data-candidate-id="${escapeHtml(id)}">Use</button>
+          </div>
+        `;
+      }).join('');
+      host.classList.remove('hidden');
+    }
+
+    function populateCandidateOptions(items, meta = {}) {
       const seen = new Set();
       candidateSearchResults = [];
+      candidateSearchMeta = meta;
       items.forEach((item) => {
         const decorated = item._candidateLabel ? item : decorateCandidate(item);
         const id = decorated.id || decorated.candidate_id || '';
@@ -5453,6 +6016,7 @@ INDEX_HTML = r"""<!doctype html>
       $('candidateOptions').innerHTML = candidateSearchResults.map((item) => (
         `<option value="${escapeHtml(item._candidateLabel)}"></option>`
       )).join('');
+      renderCandidateSearchResults();
     }
 
     function exactCandidateSearchMatch() {
@@ -5482,7 +6046,10 @@ INDEX_HTML = r"""<!doctype html>
       populateCandidateOptions([
         ...suggestions.map((sug) => decorateCandidate(sug, 'Suggested')),
         ...candidates.map((cand) => decorateCandidate(cand))
-      ]);
+      ], {
+        available_count: state.available_count || candidates.length,
+        matched_count: state.available_count || candidates.length
+      });
       updateCandidatePreview();
     }
 
@@ -5504,10 +6071,14 @@ INDEX_HTML = r"""<!doctype html>
         })
         .map((sug) => decorateCandidate(sug, 'Suggested'));
       try {
-        const response = await fetch(`/api/candidate-search?q=${encodeURIComponent(query)}&limit=80`, { cache: 'no-store' });
+        const path = sharedCampaignId ? `/api/toolkit/candidate-search?campaign=${encodeURIComponent(sharedCampaignId)}&` : '/api/candidate-search?';
+        const response = await fetch(`${path}q=${encodeURIComponent(query)}&limit=80`, { cache: 'no-store' });
         const payload = await response.json();
         const rows = (payload.candidates || []).map((cand) => decorateCandidate(cand));
-        populateCandidateOptions([...suggestions, ...rows]);
+        populateCandidateOptions([...suggestions, ...rows], {
+          available_count: payload.available_count,
+          matched_count: payload.matched_count
+        });
         updateCandidatePreview();
       } catch (error) {
         renderError(error.message);
@@ -5528,7 +6099,7 @@ INDEX_HTML = r"""<!doctype html>
       const host = $('plot');
       const trace = state.best_trace || [];
       const randomTrace = state.random_walk_trace || [];
-      const liveRandomTrace = state.live_random_walk_trace || [];
+      const liveRandomTrace = sharedCampaignId && !sharedCurveVisible('random-control') ? [] : state.live_random_walk_trace || [];
       const benchmarkRuns = benchmarkRunsForDisplay();
       const statMode = (state.config || {}).plot_stat_guides || 'max';
       const rawDatasetStats = state.dataset_stats || [];
@@ -5542,7 +6113,7 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       const obs = state.live_observation_points || state.observations || [];
-      const randomObs = (state.live_random_walk || {}).observations || [];
+      const randomObs = sharedCampaignId && !sharedCurveVisible('random-control') ? [] : (state.live_random_walk || {}).observations || [];
       const width = Math.max(560, host.clientWidth || 760);
       const height = 330;
       const pad = { left: 56, right: 76, top: 26, bottom: 46 };
@@ -5576,14 +6147,26 @@ INDEX_HTML = r"""<!doctype html>
         clipToObjectiveBounds(Number(center) + Number(spread || 0)),
         clipToObjectiveBounds(Number(center))
       ];
+      const predictionRange = (prediction) => {
+        const lower = optionalNumber(prediction.lower95);
+        const upper = optionalNumber(prediction.upper95);
+        if (lower !== null && upper !== null) {
+          return { lower: clipToObjectiveBounds(lower), upper: clipToObjectiveBounds(upper),
+            label: '95% latent-function interval' };
+        }
+        const spread = optionalNumber(prediction.std ?? prediction.sd) || 0;
+        return { lower: clipToObjectiveBounds(Number(prediction.mean) - spread),
+          upper: clipToObjectiveBounds(Number(prediction.mean) + spread),
+          label: prediction.uncertainty_type || 'prediction spread (1 SD)' };
+      };
       const xIndexes = [
         ...trace.map((item) => Number(item.index)),
         ...randomTrace.map((item) => Number(item.index)),
         ...liveRandomTrace.map((item) => Number(item.index)),
         ...benchmarkRuns.flatMap((run) => (run.summary || []).map((item) => Number(item.index))),
         ...benchmarkRuns.flatMap((run) => (run.prediction_summary || []).map((item) => Number(item.index)))
-      ].filter((value) => Number.isFinite(value) && value >= 1);
-      const minIndex = 1;
+      ].filter((value) => Number.isFinite(value) && value >= (state.plot_x_axis?.min ?? 1));
+      const minIndex = state.plot_x_axis?.min ?? 1;
       const maxIndex = Math.max(1, ...xIndexes);
       const values = activeObs.flatMap((item) => {
         const unc = Number(item.uncertainty || 0);
@@ -5592,8 +6175,8 @@ INDEX_HTML = r"""<!doctype html>
         activeObs.flatMap((item) => {
           const prediction = item.prediction || {};
           if (prediction.mean === null || prediction.mean === undefined) return [];
-          const std = Number(prediction.std || 0);
-          return boundedRangeValues(prediction.mean, std);
+          const interval = predictionRange(prediction);
+          return [interval.lower, interval.upper, clipToObjectiveBounds(prediction.mean)];
         }),
         randomObs.flatMap((item) => {
           const unc = Number(item.uncertainty || 0);
@@ -5695,28 +6278,28 @@ INDEX_HTML = r"""<!doctype html>
           const cx = x(item.index);
           const displayMean = clipToObjectiveBounds(item.mean);
           const cy = y(displayMean);
-          const std = Number(item.std || 0);
+          const interval = predictionRange(item);
           const count = Number(item.count || 0);
           const partial = expectedReps > 1 && count > 0 && count < expectedReps;
           const opacity = partial ? '0.45' : '0.85';
           const dashAttr = partial ? ' stroke-dasharray="3 2"' : '';
-          const err = std ? `<line x1="${cx}" x2="${cx}" y1="${y(clipToObjectiveBounds(item.mean - std))}" y2="${y(clipToObjectiveBounds(item.mean + std))}" stroke="${color}" stroke-width="1.4" opacity="${partial ? '0.4' : '0.75'}"${dashAttr} />` : '';
+          const err = interval.lower !== interval.upper ? `<line x1="${cx}" x2="${cx}" y1="${y(interval.lower)}" y2="${y(interval.upper)}" stroke="${color}" stroke-width="1.4" opacity="${partial ? '0.4' : '0.75'}"${dashAttr} />` : '';
           const tooltipCount = expectedReps > 0 ? ` (n=${count}/${expectedReps}${partial ? ', partial' : ''})` : '';
-          return `${err}<path d="M ${cx.toFixed(1)} ${(cy - 5).toFixed(1)} L ${(cx + 5).toFixed(1)} ${cy.toFixed(1)} L ${cx.toFixed(1)} ${(cy + 5).toFixed(1)} L ${(cx - 5).toFixed(1)} ${cy.toFixed(1)} Z" fill="#fff" stroke="${color}" stroke-width="1.8" opacity="${opacity}"${dashAttr}><title>${escapeHtml(run.name)} predicted: ${fmt(item.mean)} +/- ${fmt(item.std)}${tooltipCount}</title></path>`;
+          return `${err}<path d="M ${cx.toFixed(1)} ${(cy - 5).toFixed(1)} L ${(cx + 5).toFixed(1)} ${cy.toFixed(1)} L ${cx.toFixed(1)} ${(cy + 5).toFixed(1)} L ${(cx - 5).toFixed(1)} ${cy.toFixed(1)} Z" fill="#fff" stroke="${color}" stroke-width="1.8" opacity="${opacity}"${dashAttr}><title>${escapeHtml(run.name)} predicted: ${fmt(item.mean)}; ${escapeHtml(interval.label)} ${fmt(interval.lower)} to ${fmt(interval.upper)}${tooltipCount}</title></path>`;
         }).join('');
       }).join('');
       const livePredictions = activeObs.map((item, idx) => {
         const prediction = item.prediction || {};
         if (prediction.mean === null || prediction.mean === undefined) return '';
-        const cx = x(idx + 1);
+        const cx = x(item.index ?? idx + 1);
         const displayMean = clipToObjectiveBounds(prediction.mean);
         const cy = y(displayMean);
-        const std = Number(prediction.std || 0);
-        const err = std ? `<line x1="${cx}" x2="${cx}" y1="${y(clipToObjectiveBounds(prediction.mean - std))}" y2="${y(clipToObjectiveBounds(prediction.mean + std))}" stroke="#2563eb" stroke-width="1.4" opacity="0.75" />` : '';
-        return `${err}<path d="M ${cx.toFixed(1)} ${(cy - 5).toFixed(1)} L ${(cx + 5).toFixed(1)} ${cy.toFixed(1)} L ${cx.toFixed(1)} ${(cy + 5).toFixed(1)} L ${(cx - 5).toFixed(1)} ${cy.toFixed(1)} Z" fill="#fff" stroke="#2563eb" stroke-width="1.8"><title>${escapeHtml(item.procedure)} predicted: ${fmt(prediction.mean)} +/- ${fmt(prediction.std)}</title></path>`;
+        const interval = predictionRange(prediction);
+        const err = interval.lower !== interval.upper ? `<line x1="${cx}" x2="${cx}" y1="${y(interval.lower)}" y2="${y(interval.upper)}" stroke="#2563eb" stroke-width="1.4" opacity="0.75" />` : '';
+        return `${err}<path d="M ${cx.toFixed(1)} ${(cy - 5).toFixed(1)} L ${(cx + 5).toFixed(1)} ${cy.toFixed(1)} L ${cx.toFixed(1)} ${(cy + 5).toFixed(1)} L ${(cx - 5).toFixed(1)} ${cy.toFixed(1)} Z" fill="#fff" stroke="#2563eb" stroke-width="1.8"><title>${escapeHtml(item.procedure)} predicted: ${fmt(prediction.mean)}; ${escapeHtml(interval.label)} ${fmt(interval.lower)} to ${fmt(interval.upper)}</title></path>`;
       }).join('');
       const points = activeObs.map((item, idx) => {
-        const cx = x(idx + 1);
+        const cx = x(item.index ?? idx + 1);
         const cy = y(item.value);
         const unc = Number(item.uncertainty || 0);
         const err = unc ? `<line x1="${cx}" x2="${cx}" y1="${y(clipToObjectiveBounds(item.value - unc))}" y2="${y(clipToObjectiveBounds(item.value + unc))}" stroke="#b45309" stroke-width="1.5" />` : '';
@@ -5760,7 +6343,9 @@ INDEX_HTML = r"""<!doctype html>
         return `<line x1="${xx}" x2="${xx + 22}" y1="16" y2="16" stroke="${item.color}" stroke-width="3" stroke-dasharray="${item.dash}" />
           <text x="${xx + 28}" y="20">${escapeHtml(item.label).slice(0, 16)}</text>`;
       }).join('');
-      host.innerHTML = `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}" role="img">
+      host.innerHTML = `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}" role="img" aria-label="Measured outcomes, best measured trace, and separate model predictions">
+        <title>Measured outcomes and separate model predictions</title>
+        <desc>Solid blue dots are confirmed measurements with reported measurement uncertainty. Diamonds are model predictions; their bars show the labeled predictive interval or response spread. Comparison trace bands, when present, describe variation across independent runs.</desc>
         ${legend}
         ${ticks}
         ${zeroLine}
@@ -5779,7 +6364,7 @@ INDEX_HTML = r"""<!doctype html>
         ${bestPath ? `<path d="${bestPath}" fill="none" stroke="#0f766e" stroke-width="3" />` : ''}
         ${livePredictions}
         ${points}
-        <text x="${width / 2 - 44}" y="${height - 12}">experiment count</text>
+        <text x="${width / 2}" text-anchor="middle" y="${height - 12}">${escapeHtml(state.plot_x_axis?.label || 'experiment count')}</text>
       </svg>`;
     }
 
@@ -5836,12 +6421,15 @@ INDEX_HTML = r"""<!doctype html>
         prediction.inverse_filter !== undefined && prediction.inverse_filter !== null ? `shortlist: ${prediction.inverse_filter}` : '',
         prediction.llm_samples !== undefined && prediction.llm_samples !== null ? `LLM samples: ${prediction.llm_samples}` : '',
         prediction.llm_uncertainty_calibration !== undefined && prediction.llm_uncertainty_calibration !== null ? `uncertainty scalar: ${prediction.llm_uncertainty_calibration}` : '',
+        prediction.llm_prediction_temperature !== undefined && prediction.llm_prediction_temperature !== null ? `prediction temperature: ${prediction.llm_prediction_temperature}` : '',
+        prediction.llm_inverse_temperature !== undefined && prediction.llm_inverse_temperature !== null ? `inverse temperature: ${prediction.llm_inverse_temperature}` : '',
         prediction.selection_note ? `selection note: ${prediction.selection_note}` : ''
       ].filter(Boolean);
       return fields.join('; ');
     }
 
     function renderSuggestions() {
+      if (state.shared_campaign) {renderSharedSuggestions();return;}
       const suggestions = state.suggestions || [];
       if (!suggestions.length) {
         $('suggestions').innerHTML = '<div class="empty">No suggestions</div>';
@@ -5872,11 +6460,22 @@ INDEX_HTML = r"""<!doctype html>
         $('inverseDesigns').innerHTML = '<div class="empty">No inverse designs</div>';
         return;
       }
+      const designStatus = (design) => {
+        if (design.active && design.source === 'inverse_filter') {
+          return design.experiment_count
+            ? `Active for experiment ${design.experiment_count}`
+            : 'Active for current suggestions';
+        }
+        if (design.source === 'inverse_filter') return 'Previous shortlist query';
+        if (design.source === 'manual_inverse_design') return 'Manual proposal';
+        return 'Saved proposal';
+      };
       $('inverseDesigns').innerHTML = `<div class="scroll"><table>
-        <thead><tr><th>Proposal</th><th>Target</th><th>Model</th><th></th></tr></thead>
+        <thead><tr><th>Proposal</th><th>Target</th><th>Status</th><th>Model</th><th></th></tr></thead>
         <tbody>${designs.map((design, idx) => `<tr>
           <td class="procedure">${escapeHtml(design.procedure)}</td>
           <td>${fmt(design.target)}</td>
+          <td>${escapeHtml(designStatus(design))}</td>
           <td>${escapeHtml(design.model || '')}</td>
           <td><button data-inverse-use="${idx}">Use</button></td>
         </tr>`).join('')}</tbody>
@@ -5893,6 +6492,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function renderObservations() {
+      if (state.shared_campaign) {renderSharedObservations();return;}
       const observations = state.observations || [];
       if (!observations.length) {
         $('observations').innerHTML = '<div class="empty">No observations</div>';
@@ -5986,6 +6586,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function stopCurrentRun() {
+      if (sharedCampaignId) {await toolkitAction('cancel');return;}
       try {
         $('stopRun').disabled = true;
         const response = await fetch('/api/cancel', { method: 'POST' });
@@ -5997,12 +6598,12 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function updateSuggestions() {
-      await request('/api/config', {
+      const configured = await request('/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payloadConfig())
       });
-      await request('/api/suggest', { method: 'POST' });
+      if (configured) await request('/api/suggest', { method: 'POST' });
     }
 
     $('saveKey').addEventListener('click', async () => {
@@ -6051,7 +6652,7 @@ INDEX_HTML = r"""<!doctype html>
     });
 
     $('exportArchive').addEventListener('click', () => {
-      window.location.href = '/api/export-campaign-archive.json';
+      window.location.href = sharedCampaignId ? '/api/moc/export?id=' + encodeURIComponent(sharedCampaignId) : '/api/export-campaign-archive.json';
     });
 
     $('importArchive').addEventListener('click', () => {
@@ -6110,7 +6711,7 @@ INDEX_HTML = r"""<!doctype html>
     });
 
     $('addObservation').addEventListener('click', async () => {
-      await request('/api/observe', {
+      const recorded = await request('/api/observe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -6120,10 +6721,11 @@ INDEX_HTML = r"""<!doctype html>
           uncertainty: $('objectiveUncertainty').value
         })
       });
+      if (!recorded) return;
       $('objectiveValue').value = '';
       $('objectiveUncertainty').value = '';
       clearCandidateSelection(true);
-      if (state && state.config.auto_suggest) await updateSuggestions();
+      if (state && state.config.auto_suggest && !sharedCampaignId) await updateSuggestions();
     });
 
     $('startRandomWalk').addEventListener('click', async () => {
@@ -6158,6 +6760,12 @@ INDEX_HTML = r"""<!doctype html>
     $('candidateSearch').addEventListener('change', () => {
       const exact = exactCandidateSearchMatch();
       if (exact) setCandidateSelection(exact);
+    });
+    $('candidateSearchResults').addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-candidate-id]');
+      if (!button) return;
+      const item = findCandidateById(button.dataset.candidateId);
+      if (item) setCandidateSelection(item);
     });
     $('clearCandidate').addEventListener('click', () => clearCandidateSelection(true));
 
@@ -6445,10 +7053,6 @@ POOL_BUILDER_HTML = r"""<!doctype html>
           <input id="gasName" value="pure H2">
         </div>
         <div class="field">
-          <label for="flowRate">Flow (mL/min)</label>
-          <input id="flowRate" type="number" step="any" value="40">
-        </div>
-        <div class="field">
           <label for="stabilizeTime">Stabilize (min)</label>
           <input id="stabilizeTime" type="number" step="any" value="30">
         </div>
@@ -6456,10 +7060,6 @@ POOL_BUILDER_HTML = r"""<!doctype html>
       <div class="field">
         <label for="sampleTube">Sample holder</label>
         <input id="sampleTube" value="quartz sample tube">
-      </div>
-      <div class="field">
-        <label for="coolingText">Cooling</label>
-        <input id="coolingText" value="passively cool to ambient temperature">
       </div>
       <div class="field">
         <label for="phaseObjective">Live objective</label>
@@ -6470,6 +7070,14 @@ POOL_BUILDER_HTML = r"""<!doctype html>
       </div>
 
       <h2>Variables</h2>
+      <div class="field">
+        <label>Flow rate (mL/min)</label>
+        <div class="range-grid">
+          <label><span>Minimum</span><input id="flowMin" type="number" step="any" value="40" aria-label="Flow minimum"></label>
+          <label><span>Maximum</span><input id="flowMax" type="number" step="any" value="40" aria-label="Flow maximum"></label>
+          <label><span>Step</span><input id="flowStep" type="number" step="any" value="10" aria-label="Flow step"></label>
+        </div>
+      </div>
       <div class="field">
         <label>Ramp rate (C/min)</label>
         <div class="range-grid">
@@ -6494,10 +7102,18 @@ POOL_BUILDER_HTML = r"""<!doctype html>
           <label><span>Step</span><input id="dwellStep" type="number" step="any" value="1" aria-label="Dwell step"></label>
         </div>
       </div>
+      <div class="field">
+        <label>Cooling rate (C/min)</label>
+        <div class="range-grid">
+          <label><span>Minimum</span><input id="coolingMin" type="number" step="any" value="5" aria-label="Cooling minimum"></label>
+          <label><span>Maximum</span><input id="coolingMax" type="number" step="any" value="5" aria-label="Cooling maximum"></label>
+          <label><span>Step</span><input id="coolingStep" type="number" step="any" value="1" aria-label="Cooling step"></label>
+        </div>
+      </div>
       <div class="row">
         <div class="field">
           <label for="poolSize">Pool size</label>
-          <input id="poolSize" type="text" value="0" readonly title="Calculated automatically from the number of ramp-rate, temperature, and dwell-time combinations.">
+          <input id="poolSize" type="text" value="0" readonly title="Calculated automatically from the number of flow-rate, ramp-rate, temperature, dwell-time, and cooling-rate combinations.">
         </div>
         <div class="field">
           <label for="previewCount">Preview rows</label>
@@ -6542,11 +7158,12 @@ POOL_BUILDER_HTML = r"""<!doctype html>
     const DEFAULT_BUILDER_VALUES = {
       systemName: 'WO3/SiO2',
       gasName: 'pure H2',
-      flowRate: '40',
       stabilizeTime: '30',
       sampleTube: 'quartz sample tube',
-      coolingText: 'passively cool to ambient temperature',
       phaseObjective: 'alpha phase (%)',
+      flowMin: '40',
+      flowMax: '40',
+      flowStep: '10',
       rampMin: '2',
       rampMax: '20',
       rampStep: '2',
@@ -6556,6 +7173,9 @@ POOL_BUILDER_HTML = r"""<!doctype html>
       dwellMin: '1',
       dwellMax: '8',
       dwellStep: '1',
+      coolingMin: '5',
+      coolingMax: '5',
+      coolingStep: '1',
       previewCount: '20',
     };
 
@@ -6594,21 +7214,25 @@ POOL_BUILDER_HTML = r"""<!doctype html>
       const system = $('systemName').value.trim() || 'WO3/SiO2';
       const gas = $('gasName').value.trim() || 'pure H2';
       const holder = $('sampleTube').value.trim() || 'quartz sample tube';
-      const flow = formatNumber(numericValue('flowRate'));
       const stabilize = formatNumber(numericValue('stabilizeTime'));
-      const cooling = $('coolingText').value.trim() || 'passively cool to ambient temperature';
-      return `Reduction experiment of ${system}: load the catalyst into a ${holder} and flow ${gas} at ${flow} mL/min. Stabilize under ${gas} flow for ${stabilize} min, ramp to ${formatNumber(row.temperature)} C at ${formatNumber(row.ramp)} C/min, soak for ${formatNumber(row.dwell)} h, then ${cooling}.`;
+      return `Reduction experiment of ${system}: load the catalyst into a ${holder} and flow ${gas} at ${formatNumber(row.flow)} mL/min. Stabilize under ${gas} flow for ${stabilize} min, ramp to ${formatNumber(row.temperature)} C at ${formatNumber(row.ramp)} C/min, soak for ${formatNumber(row.dwell)} h, then cool to ambient temperature at ${formatNumber(row.cooling)} C/min.`;
     }
 
     function buildRows() {
+      const flows = rangeValues(numericValue('flowMin'), numericValue('flowMax'), numericValue('flowStep'), 'Flow rate');
       const ramps = rangeValues(numericValue('rampMin'), numericValue('rampMax'), numericValue('rampStep'), 'Ramp rate');
       const temps = rangeValues(numericValue('tempMin'), numericValue('tempMax'), numericValue('tempStep'), 'Temperature');
       const dwells = rangeValues(numericValue('dwellMin'), numericValue('dwellMax'), numericValue('dwellStep'), 'Dwell time');
+      const coolings = rangeValues(numericValue('coolingMin'), numericValue('coolingMax'), numericValue('coolingStep'), 'Cooling rate');
       const allRows = [];
-      for (const temp of temps) {
-        for (const ramp of ramps) {
-          for (const dwell of dwells) {
-            allRows.push({ ramp, temperature: temp, dwell });
+      for (const flow of flows) {
+        for (const temp of temps) {
+          for (const ramp of ramps) {
+            for (const dwell of dwells) {
+              for (const cooling of coolings) {
+                allRows.push({ flow, ramp, temperature: temp, dwell, cooling });
+              }
+            }
           }
         }
       }
@@ -6744,10 +7368,10 @@ POOL_BUILDER_HTML = r"""<!doctype html>
     }
 
     [
-      'systemName', 'gasName', 'flowRate', 'stabilizeTime', 'sampleTube',
-      'coolingText', 'rampMin', 'rampMax', 'rampStep', 'tempMin', 'tempMax',
-      'tempStep', 'dwellMin', 'dwellMax', 'dwellStep', 'previewCount',
-      'phaseObjective'
+      'systemName', 'gasName', 'stabilizeTime', 'sampleTube',
+      'flowMin', 'flowMax', 'flowStep', 'rampMin', 'rampMax', 'rampStep',
+      'tempMin', 'tempMax', 'tempStep', 'dwellMin', 'dwellMax', 'dwellStep',
+      'coolingMin', 'coolingMax', 'coolingStep', 'previewCount', 'phaseObjective'
     ].forEach((id) => {
       $(id).addEventListener('input', renderPreview);
       $(id).addEventListener('change', renderPreview);
@@ -6869,10 +7493,10 @@ USER_GUIDE_HTML = r"""<!doctype html>
 
     <section>
       <h2>Procedure Pool Builder</h2>
-      <p>Open <code>Pool Builder</code> to generate an unlabeled live-experiment pool for the WO3/SiO2 reduction template. The app reuses one Pool Builder tab instead of opening a fresh tab every time. The first version varies ramp rate, maximum temperature, and dwell time while keeping gas, flow rate, stabilization time, holder, and cooling text fixed.</p>
+      <p>Open <code>Pool Builder</code> to generate an unlabeled live-experiment pool for the WO3/SiO2 reduction template. The app reuses one Pool Builder tab instead of opening a fresh tab every time. The builder varies flow rate, ramp rate, maximum temperature, dwell time, and cooling rate while keeping gas, stabilization time, and holder fixed.</p>
       <p>The builder imports a live-pool CSV with <code>procedure</code> plus a blank selected-objective column. Blank objective cells keep the main runner in live-campaign mode; if those cells are later filled with measured labels, the same CSV can be re-imported as a labeled offline benchmark dataset.</p>
       <p>After import, the builder shows an import confirmation and the runner refreshes with a matching notice. If the campaign is not saved yet, click <code>Save</code> in the runner to keep the generated pool for later.</p>
-      <p><code>Pool size</code> is calculated from the minimum, maximum, and step settings for the three variables. The live objective selector sets the main runner to maximize either <code>alpha phase (%)</code> for Im-3m or <code>beta phase (%)</code> for Pm-3n; enter the XRD-calculated percentage from 0 to 100 with <code>Add Result</code>. Use whole percent units: <code>73.5</code> means 73.5%, not 0.735.</p>
+      <p><code>Pool size</code> is calculated from the minimum, maximum, and step settings for flow rate, ramp rate, maximum temperature, dwell time, and cooling rate. The live objective selector sets the main runner to maximize either <code>alpha phase (%)</code> for Im-3m or <code>beta phase (%)</code> for Pm-3n; enter the XRD-calculated percentage from 0 to 100 with <code>Add Result</code>. Use whole percent units: <code>73.5</code> means 73.5%, not 0.735.</p>
     </section>
 
     <section>
@@ -6893,7 +7517,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
         <li>Click <code>Run & Append</code>. Change settings and click it again to compare another configuration. If a run stopped after a connection, rate-limit, or model error, clicking <code>Run & Append</code> again with the same label/settings resumes the partial trajectory instead of creating a duplicate curve.</li>
       </ol>
       <div class="callout">Paper-style numerical defaults are <code>Initial random = 1</code>, <code>Batch size = 1</code>, <code>BO iterations = 30</code>, <code>Workflow replicates = 5</code>, and <code>UCB lambda = 0.1</code>. Current model defaults use supported modern model IDs rather than retired paper-era model names.</div>
-      <p>For BO-ICL LLM runs on large pools, <code>LLM shortlist</code> retrieves the smaller inverse-design/embedding shortlist that is actually scored by the LLM. The inverse-design target is based on the current replicate's labeled history: by default it uses current best x <code>Normal(1.2, 0.05)</code>, matching the paper-style stochastic target. If sparse observations are often zero, set <code>Auto target floor</code> to a meaningful minimum aspirational value so the inverse query does not stay anchored at zero. With <code>LLM pool scope = Full pool (paper)</code>, the shortlist searches the full available pool with cached embeddings and MMR/cosine similarity, then optional random add-ons. With <code>Broad random pool (fast)</code>, the app first samples <code>Broad pool</code> candidates and runs the same MMR/cosine step only inside that subset. The default <code>LLM shortlist = 16</code>, <code>Random add-ons = 0</code>, and <code>LLM samples = 3</code> scores at most 16 candidates per BO step.</p>
+      <p>For BO-ICL LLM runs on large pools, <code>LLM shortlist</code> retrieves the smaller set that is scored by the LLM. The automatic target improves from the incumbent in raw units, using the optimization direction and a multiplier drawn from <code>Normal(1.2, 0.05)</code>, then applies physical bounds. Zero incumbents require an explicit positive reference scale or manual target. Full-pool mode searches every eligible candidate, keeps the nearest 100, then applies MMR. Broad-pool mode applies that retrieval inside an explicitly sampled subset. The generic runner retains its saved controls; the named MoC preset uses five forward responses, a 16-candidate shortlist and zero random additions. At least two valid responses are required for ranking, and fewer than two observed designs use an explicit initial-design policy without a model call.</p>
       <p>LLM runtime scales with <code>(LLM shortlist + Random add-ons) x LLM samples x BO iterations x Workflow replicates</code> when the shortlist is enabled. If <code>LLM shortlist = 0</code>, runtime falls back to <code>Broad pool x LLM samples</code>. If every scored LLM prediction is flat, for example all candidates score <code>0 +/- 0</code>, the acquisition ranking is treated as uninformative and the app chooses by inverse-design/MMR retrieval rank while recording that the predictor did not provide a useful value ranking. Rate-limit errors are retried automatically; increase <code>429 cooldown (s)</code>, increase <code>API pause (s)</code>, or lower the shortlist/samples if 429s keep appearing. Use the <code>Stop</code> button in the progress panel to cancel after the current API call returns.</p>
       <p>The plot shows the mean best-so-far trajectory and a +/- 1 sample-standard-deviation band across workflow replicates. Model prediction markers show the predicted objective mean and calibrated uncertainty for BO-selected points separately from the measured value. The dashed random baseline is the paper notebook's random-mean quantile expectation. <code>Plot guides</code> defaults to the best labelled value only; switch it to <code>Paper stats</code> to add the mean and percentile guide lines.</p>
     </section>
@@ -6922,23 +7546,23 @@ USER_GUIDE_HTML = r"""<!doctype html>
           <tr><td>Suggestion engine</td><td><code>GPR with embeddings</code> uses OpenAI embeddings plus a Gaussian process. <code>BO-ICL LLM</code> uses the selected LLM for in-context predictions.</td></tr>
           <tr><td>Acquisition</td><td>Rule for ranking the next experiment. UCB balances mean and uncertainty; expected improvement favors likely gains; greedy uses predicted best; random is a control.</td></tr>
           <tr><td>Target scaling</td><td>Off by default. Auto/min-max/z-score can help GPR numerics when bounded labels are not already near unit scale. BO-ICL LLM keeps labels, inverse targets, floors, and predictions in original objective units.</td></tr>
-          <tr><td>Objective bounds</td><td>Optional lower/upper physical bounds in original units. They are used for plot guide lines and to clip displayed prediction/error-bar endpoints, but they are not sent to LLM prompts and they do not change labels, targets, raw predictions, exports, or acquisition scores. Percent-like objectives infer 0-100 display bounds when these fields are blank.</td></tr>
+          <tr><td>Objective bounds</td><td>Optional physical bounds in raw units. Automatic inverse targets respect these bounds; out-of-bounds manual targets are errors. Invalid prediction samples are excluded before ranking, never silently clipped into accepted predictions. Display intervals also use these bounds. Custom system messages are preserved verbatim. Percent-like objectives infer 0–100 display bounds when the fields are blank.</td></tr>
           <tr><td>Broad pool</td><td>Caps candidates scored by GPR. In LLM mode, it is used only when <code>LLM shortlist = 0</code> or when <code>LLM pool scope = Broad random pool</code>.</td></tr>
           <tr><td>LLM shortlist</td><td>Number of candidates retrieved by inverse-design text plus cached embeddings before LLM scoring. In Full pool mode this matches the paper; in Broad random pool mode it is a faster approximation.</td></tr>
           <tr><td>LLM pool scope</td><td><code>Full pool (paper)</code> compares the inverse-design query against every available candidate. <code>Broad random pool (fast)</code> first samples the Broad pool and then applies MMR/cosine similarity inside that subset.</td></tr>
-          <tr><td>LLM uncertainty scalar</td><td>Multiplicative factor applied to LLM predictive standard deviations before acquisition scoring and plotting. The default <code>1</code> leaves the LLM sample spread untouched. The paper used <code>4.33</code> as a per-dataset recalibrated value for <code>gpt-4/topk</code> on the C2 yield benchmark and refit it on a held-out slice via <code>uncertainty_toolbox</code>; do not assume that constant transfers to other datasets without refitting.</td></tr>
+          <tr><td>LLM uncertainty scalar</td><td>Rescales empirical support about its mean while retaining probability mass. <code>1</code> preserves the distribution and acquisition; <code>0</code> gives a point mass. Expanded support respects explicit physical bounds. Agreement among responses has zero completion spread and does not establish prediction accuracy. This does not scale XRD measurement noise or GP uncertainty.</td></tr>
           <tr><td>Suggestions Method / Acq / Mean</td><td><code>Method</code> records source, model, and acquisition function. <code>Mean</code> is the predicted objective in original units. <code>Acq</code> is the acquisition score used for ranking. The inverse-design target creates the retrieval query; shortlisted candidates do not have to predict exactly at that target.</td></tr>
           <tr><td>Prediction markers</td><td>For model-selected points, the plot can show the stored prediction mean and uncertainty as a distinct marker with an error bar. The measured value remains the actual observation and best-so-far trace.</td></tr>
           <tr><td>Live Random Walk</td><td>Separate live control trajectory. The app selects one random available candidate at a time, waits for the measured value, then appends it to the random-control plot/export without adding it to the BO training context.</td></tr>
-          <tr><td>Auto target jitter</td><td>Stochastic spread around the automatic inverse-design target multiplier. The default <code>0.05</code> gives current best x <code>Normal(1.2, 0.05)</code>; set it to <code>0</code> for deterministic targets.</td></tr>
-          <tr><td>Auto target floor</td><td>Optional minimum automatic inverse-design target for sparse-zero maximization campaigns. For phase percentages, use whole percent units such as <code>5</code> or <code>10</code>. Manual inverse target overrides it.</td></tr>
+          <tr><td>Auto target jitter</td><td>Standard deviation of the multiplier draw. The corrected target is best + direction × max(0, draw − 1) × |best|, then physical bounds. Direction is +1 for maximize and −1 for minimize. A zero incumbent requires an explicit positive reference scale. Set jitter to <code>0</code> for deterministic targets.</td></tr>
+          <tr><td>Auto target floor</td><td>Optional target lower bound in raw units. It must be consistent with physical bounds. For a zero unbounded generic objective, a positive configured floor supplies an explicit reference scale; otherwise enter a manual target or configure a scale. Invalid manual targets are errors.</td></tr>
           <tr><td>Initial seed strategy</td><td>How the first initial point is chosen for each replicate of the offline benchmark. <code>Random</code> samples uniformly from labeled candidates and is the paper-style/live-realistic setting. <code>Closest nonzero label to dataset mean</code> is a labeled-data diagnostic for sparse offline datasets; it deliberately uses hidden labels and should not be used for live-realistic performance claims. Extra initial points beyond the first remain random.</td></tr>
           <tr><td>Greedy for final iteration</td><td>Offline benchmark option that keeps the selected acquisition for earlier BO choices, then uses greedy acquisition for the final BO choice in each replicate.</td></tr>
-          <tr><td>API pause / 429 cooldown / 429 retries</td><td><code>API pause</code> spaces out successful calls. <code>429 cooldown</code> waits after a rate-limit error before retrying. Retries controls how many recovery attempts are allowed before the partial run is saved for resume.</td></tr>
+          <tr><td>API pause / 429 cooldown / maximum attempts</td><td>The attempt limit includes the first request: 8 means at most eight attempts. The MoC service paces each actual provider request, honors Retry-After, and permits cancellation during backoff. The saved generic runner control retains its historical label but also counts total attempts.</td></tr>
           <tr><td>Replicates</td><td>Live-mode repeated measurements allowed for the same candidate before it is removed from the available pool.</td></tr>
           <tr><td>Workflow replicates</td><td>Offline benchmark repeated runs of the whole BO workflow for averaging and spread bands.</td></tr>
           <tr><td>API keys</td><td>Keys are written only to the local ignored <code>.env</code> file. OpenAI keys are required for embeddings and OpenAI LLMs; OpenRouter and Anthropic keys are only needed for those model families.</td></tr>
-          <tr><td>System messages</td><td>Generated from the uploaded dataset by default. They constrain the LLM to numeric predictions or procedure-style inverse designs without exposing hidden labels. Prediction calls also add a guardrail so the LLM does not treat objective bounds, inverse-design targets, or acquisition scores as measured predictions.</td></tr>
+          <tr><td>System messages</td><td>Generated from the uploaded dataset by default, with procedure-only inputs and observed answers. Managed prompts add a prediction guardrail. Edited messages are preserved exactly, even if their opening resembles a managed template. Use the explicit reset action to replace an edited prompt.</td></tr>
         </tbody>
       </table>
     </section>
@@ -6966,11 +7590,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Synthetic offline walkthrough; isolated from real campaigns",
+    )
     args = parser.parse_args(argv)
 
     root = Path.cwd()
     port = _find_port(args.port)
     LocalAppHandler.state = LocalBOState(root)
+    LocalAppHandler.moc_demo = args.demo
+    LocalAppHandler.moc_service = None
     server = ThreadingHTTPServer((args.host, port), LocalAppHandler)
     url = f"http://{args.host}:{port}"
     print(f"BO-ICL local runner is available at {url}")

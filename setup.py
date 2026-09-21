@@ -14,6 +14,17 @@ setup(
     url="https://github.com/ur-whitelab/BO-ICL",
     license="MIT",
     packages=["boicl"],
+    package_data={
+        "boicl": [
+            "data/moc/*.csv",
+            "data/moc/*.gz",
+            "data/moc/*.json",
+            "prompts/*.txt",
+            "prompts/*.json",
+            "prompts/*.md",
+            "toolkit_main.js",
+        ]
+    },
     install_requires=[
         "numpy",
         "langchain",
@@ -25,6 +36,8 @@ setup(
         "scipy",
         "pandas",
         "tiktoken",
+        "openpyxl",
+        "python-dotenv",
     ],
     extras_require={"gpr": ["scikit-learn", "torch", "botorch", "gpytorch"]},
     test_suite="tests",

@@ -13,6 +13,10 @@ IBMPlexMono-Regular.ttf
 .vscode
 .cache/
 .boicl-local/
+MoC_BOICL_agent_handoff/
+.pre-handoff-existing.diff
+.moc-campaigns/
+.moc-demo/
 saved_experiments/
 *.embedding-cache.csv
 **.DS_Store

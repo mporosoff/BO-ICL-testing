@@ -3,12 +3,15 @@ from scipy.stats import norm
 from .llm_model import DiscreteDist, GaussDist
 
 
-def expected_improvement(dist, best):
+def expected_improvement(dist, best, xi=0.0, maximize=True):
     """Expected improvement for the given discrete distribution"""
     if isinstance(dist, DiscreteDist):
-        return expected_improvement_d(dist.probs, dist.values, best)
+        return expected_improvement_d(dist.probs, dist.values, best, xi, maximize)
     elif isinstance(dist, GaussDist):
-        return expected_improvement_g(dist.mean(), dist.std(), best)
+        direction = 1 if maximize else -1
+        return expected_improvement_g(
+            direction * dist.mean(), dist.std(), direction * best + xi
+        )
 
 
 def log_expected_improvement(dist, best):
@@ -28,12 +31,15 @@ def log_expected_improvement(dist, best):
 #         return np.log(expected_improvement_g(dist.mean(), dist.std(), best))
 
 
-def probability_of_improvement(dist, best):
+def probability_of_improvement(dist, best, xi=0.0, maximize=True):
     """Probability of improvement for the given discrete distribution"""
     if isinstance(dist, DiscreteDist):
-        return probability_of_improvement_d(dist.probs, dist.values, best)
+        return probability_of_improvement_d(dist.probs, dist.values, best, xi, maximize)
     elif isinstance(dist, GaussDist):
-        return probability_of_improvement_g(dist.mean(), dist.std(), best)
+        direction = 1 if maximize else -1
+        return probability_of_improvement_g(
+            direction * dist.mean(), dist.std(), direction * best + xi
+        )
 
 
 def upper_confidence_bound(dist, best, _lambda):
@@ -52,9 +58,10 @@ def greedy(dist, best):
         return greedy_g(dist.mean(), dist.std(), best)
 
 
-def expected_improvement_d(probs, values, best):
+def expected_improvement_d(probs, values, best, xi=0.0, maximize=True):
     """Expected improvement for the given discrete distribution"""
-    ei = np.sum(np.maximum(values - best, 0) * probs)
+    direction = 1 if maximize else -1
+    ei = np.sum(np.maximum(direction * (np.asarray(values) - best) - xi, 0) * probs)
     return ei
 
 
@@ -65,9 +72,10 @@ def log_expected_improvement_d(probs, values, best):
     return log_ei
 
 
-def probability_of_improvement_d(probs, values, best):
+def probability_of_improvement_d(probs, values, best, xi=0.0, maximize=True):
     """Probability of improvement for the given discrete distribution"""
-    pi = np.sum(np.cast[float](values > best) * probs)
+    direction = 1 if maximize else -1
+    pi = np.sum((direction * (np.asarray(values) - best) > xi).astype(float) * probs)
     return pi
 
 
@@ -93,16 +101,13 @@ def expected_improvement_g(mean, std, best):
 
 def log_expected_improvement_g(mean, std, best):
     """Log Expected improvement for the given Gaussian distribution"""
-    eps = 1e-15
-    z = (mean - best) / (std + eps)
-    # ei = std * h(z)
-    # ei = std * (norm.pdf(z) + z * norm.cdf(z))
-    log_ei = np.log(std) + np.log((norm.pdf(z) + z * norm.cdf(z)))
-    return log_ei
+    return np.log(expected_improvement_g(mean, std, best) + 1e-15)
 
 
 def probability_of_improvement_g(mean, std, best):
     """Probability of improvement for the given Gaussian distribution"""
+    if std == 0:
+        return float(mean > best)
     eps = 1e-15
     z = (mean - best) / (std + eps)
     pi = norm.cdf(z)

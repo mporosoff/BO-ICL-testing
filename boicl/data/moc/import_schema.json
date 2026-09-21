@@ -1,0 +1,71 @@
+{
+  "schema": "moc_handoff_v1",
+  "implementation_status": "input contract, not yet an existing toolkit import format",
+  "workbook": "MoC_handoff_inputs.xlsx",
+  "sheets": {
+    "Pool_import": "legacy-compatible procedure pool only; all labels blank",
+    "Design_space": "canonical candidate table",
+    "Seed_observations": "three measured active seeds; join by candidate_id",
+    "Variable_values": "grid and protocol overview"
+  },
+  "csv_equivalents": {
+    "Pool_import": "MoC_pool_7776_current_import.csv",
+    "Design_space": "MoC_design_space_7776.csv",
+    "Seed_observations": "MoC_seed_observations.csv"
+  },
+  "sole_objective": {
+    "field": "moc_wt_pct",
+    "direction": "maximize",
+    "units": "wt% on0to100 scale",
+    "bounds": [0, 100]
+  },
+  "six_input_columns": [
+    "temperature_C",
+    "ramp_C_per_min",
+    "flow_sccm",
+    "hold_h",
+    "AMT_to_sucrose_mass_ratio",
+    "gas"
+  ],
+  "gp_transforms": ["linear", "linear", "linear", "ln", "log2", "H2=1,N2=0"],
+  "full_space_bounds": [
+    [550, 900],
+    [5, 15],
+    [30, 100],
+    [0.5, 10],
+    [0.5, 2],
+    [0, 1]
+  ],
+  "display_ratio": "sucrose_to_AMT_mass_ratio",
+  "ratio_reciprocal": "AMT_to_sucrose_mass_ratio=1/sucrose_to_AMT_mass_ratio",
+  "observation_quality_columns": [
+    "moc_wt_pct_sigma",
+    "gof",
+    "closure_gap_wt_pct",
+    "closure_gap_origin"
+  ],
+  "auxiliary_response_columns": [
+    "mo_wt_pct",
+    "mo_wt_pct_sigma",
+    "mo2c_wt_pct",
+    "mo2c_wt_pct_sigma",
+    "moo2_wt_pct",
+    "moo2_wt_pct_sigma",
+    "phase_accounting_residual_wt_pct"
+  ],
+  "procedure_embedding_input": "LLM: experimental procedure: + exact procedure cell; embedding GP: exact bare procedure cell. UTF-8 hash without BOM/newline; preserve Unicode/whitespace. Neither contains labels/IDs/metadata.",
+  "identity_algorithm": "moc- + first16hex SHA256 of moc-t1-v1|T={integer}|ramp={integer}|hold={g}|gas={H2orN2}|flow={integer}|sucrose_amt={g}",
+  "order": "ascending first original Excel row; duplicate source rows collapsed",
+  "candidate_count": 7776,
+  "active_observation_count": 3,
+  "eligible_initial_count": 7773,
+  "pending_count": 0,
+  "historical_repeat_policy": "five archived designs eligible only as marked new quality repeats",
+  "m12_resolution": {
+    "authoritative": 83.8,
+    "superseded": 81.7,
+    "authority": "user confirmation in handoff request",
+    "date": "2026-09-20"
+  },
+  "source_commit": "810c3f7d7ecc632e4cfd422977b10b471e526f82"
+}
