@@ -5356,7 +5356,7 @@ INDEX_HTML = r"""<!doctype html>
           </div>
         </div>
         <div id="measurementHint" class="muted" style="margin-bottom: 12px;">Enter the measured outcome and its uncertainty in the original objective units.</div>
-        <details id="sharedQuality" class="hidden"><summary>Measurement quality and source</summary><p class="hint">MoC results require esd, GOF and closure gap. Generic measurements preserve unknown quality as missing. These entries also apply to the independent random result below.</p><div class="row"><div class="field"><label for="qualityGOF">GOF</label><input id="qualityGOF" type="number" step="any"></div><div class="field"><label for="qualityGap">Closure gap (wt%)</label><input id="qualityGap" type="number" step="any"></div></div><div class="field"><label for="qualityGapOrigin">Gap origin</label><select id="qualityGapOrigin"><option value="reported">Reported</option><option value="derived">Derived</option><option value="unknown">Unknown</option></select></div><div class="field"><label for="qualityNote">Source note</label><input id="qualityNote"></div><p class="hint">Confirmed values do not establish a quantification method. Keep unknown historical methods unspecified. Record the actual method and normalization; mass fractions and pattern-area fractions are not interchangeable.</p><label>Quantification method<select id="quality_quantification_method"><option value="historical_unspecified">Historical / unspecified (unknown)</option><option value="gsas_ii_mass_fraction">GSAS-II mass fraction</option><option value="xrd_area_fraction">Integrated phase-pattern area fraction</option><option value="other">Other documented method</option></select></label><label>Normalization basis<input id="quality_normalization"></label><label>Source file<input id="quality_source_file"></label><label>Source record identifier<input id="quality_source_identifier"></label><label>Refinement identifier<input id="quality_refinement_id"></label><label>Uncertainty method / provenance<input id="quality_uncertainty_method"></label><label>Definition note<input id="quality_definition_note"></label><details><summary>Measurement definition and historical training</summary><p class="hint">Document a validated definition before mixing explicit methods with historical observations. This decision preserves original numbers and provenance. Incompatible explicit definitions are excluded from training; unknown historical records need exclusion or a scientific justification to retain them.</p><pre id="qualityStatus"></pre><label>Validated definition<select id="definitionMethod"><option value="">Choose validated method</option><option value="gsas_ii_mass_fraction">GSAS-II mass fraction</option><option value="xrd_area_fraction">Integrated phase-pattern area fraction</option><option value="other">Other documented method</option></select></label><label>Normalization basis<input id="definitionNormalization"></label><label>Definition note (required for other methods)<input id="definitionNote"></label><label>Unknown historical records<select id="definitionHistoricalPolicy"><option value="exclude">Exclude from model training</option><option value="retain_with_justification">Retain with scientific justification</option></select></label><label>Scientific decision / reason<input id="definitionReason"></label><button class="secondary" id="applyDefinition">Record definition decision</button></details></details>
+        <details id="sharedQuality" class="hidden"><summary>Measurement quality and source</summary><p class="hint">MoC results require esd, GOF and closure gap. Generic measurements preserve unknown quality as missing. These entries also apply to the independent random result below.</p><div class="row"><div class="field"><label for="qualityGOF">GOF</label><input id="qualityGOF" type="number" step="any"></div><div class="field"><label for="qualityGap">Closure gap (wt%)</label><input id="qualityGap" type="number" step="any"></div></div><div class="field"><label for="qualityGapOrigin">Gap origin</label><select id="qualityGapOrigin"><option value="reported">Reported</option><option value="derived">Derived</option><option value="unknown">Unknown</option></select></div><div class="field"><label for="qualityNote">Source note</label><input id="qualityNote"></div><p class="hint">Confirmed values do not establish a quantification method. Keep unknown historical methods unspecified. Record the actual method and normalization; mass fractions and pattern-area fractions are not interchangeable.</p><label>Quantification method<select id="quality_quantification_method"><option value="historical_unspecified">Historical / unspecified (unknown)</option><option value="gsas_ii_mass_fraction">GSAS-II mass fraction</option><option value="xrd_area_fraction">Integrated phase-pattern area fraction</option><option value="other">Other documented method</option></select></label><label>Normalization basis<input id="quality_normalization"></label><label>Source file<input id="quality_source_file"></label><label>Source record identifier<input id="quality_source_identifier"></label><label>Refinement identifier<input id="quality_refinement_id"></label><label>Uncertainty method / provenance<input id="quality_uncertainty_method"></label><label>Definition note<input id="quality_definition_note"></label><details><summary>Measurement definition and historical training</summary><p class="hint">Document a validated definition before mixing explicit methods with historical observations. This decision preserves original numbers and provenance. Incompatible explicit definitions are excluded from training; unknown historical records need exclusion or a scientific justification to retain them.</p><pre id="qualityStatus"></pre><label>Validated definition<select id="definitionMethod"><option value="">Choose validated method</option><option value="gsas_ii_mass_fraction">GSAS-II mass fraction</option><option value="xrd_area_fraction">Integrated phase-pattern area fraction</option><option value="other">Other documented method</option></select></label><label>Normalization basis<input id="definitionNormalization"></label><label>Definition note (required for other methods)<input id="definitionNote"></label><label>Unknown historical records<select id="definitionHistoricalPolicy"><option value="unresolved">Unresolved — choose a policy</option><option value="exclude">Exclude from model training</option><option value="retain_with_justification">Retain with scientific justification</option></select></label><label>Scientific decision / reason<input id="definitionReason"></label><button class="secondary" id="applyDefinition">Record definition decision</button></details></details>
         <button class="primary" id="addObservation">Add Observation</button>
         <div id="refinementControls" class="hidden"><div class="field"><label for="refinementReason">Reason for refinement</label><input id="refinementReason" placeholder="Required; original record remains in history"></div><button id="saveRefinement">Save refinement</button> <button id="cancelRefinement">Cancel refinement</button></div>
       </section>
@@ -5410,7 +5410,7 @@ INDEX_HTML = r"""<!doctype html>
       <section class="panel">
         <h2>Observations</h2>
         <div id="observations"></div>
-        <details id="sharedRequestPreview" class="hidden"><summary>Preview full LLM request (no model calls)</summary><p class="hint">Uses saved settings. Choose a candidate for a forward preview, or the inverse role for its target. A recorded step uses its stored request. Missing cached selector inputs or an unknown future shortlist are reported as unresolved; preview does not generate embeddings.</p><label>Request role<select id="requestPreviewRole"><option value="forward">Forward prediction</option><option value="inverse">Inverse proposal</option></select></label><label>Request source<select id="requestPreviewSource"><option value="current">Current saved settings</option><option value="recorded">Recorded suggestion selected below</option></select></label><label>Find candidate by ID or procedure<input id="requestPreviewQuery"></label><button class="secondary" id="requestPreviewSearch">Find candidates</button><label>Selected candidate<select id="requestPreviewCandidate"></select></label><button class="secondary" id="requestPreview">Preview request</button><pre id="requestPreviewResult"></pre></details><details id="sharedProvenance" class="hidden"><summary>Campaign record, request log and replay</summary><div class="field"><label for="sharedReplayStep">Recorded suggestion</label><select id="sharedReplayStep"></select></div><button id="sharedReplay">Replay recorded score</button> <button id="sharedLog">Load exact request log</button><pre id="sharedReplayResult" style="white-space:pre-wrap;max-height:400px;overflow:auto"></pre><details><summary>Configuration and complete history</summary><pre id="sharedRecord" style="white-space:pre-wrap;max-height:500px;overflow:auto"></pre></details><div class="field"><label for="sharedCachePath">Local portable cache package path</label><input id="sharedCachePath"></div><button id="sharedCacheImport">Validate and import cache</button></details>
+        <details id="sharedRequestPreview" class="hidden"><summary>Preview full LLM request (no model calls)</summary><p class="hint">Uses saved settings. Choose a candidate for a forward preview. Next BO inverse request uses one completion; Standalone inverse proposal uses its separate saved count and sequence. A recorded step uses its stored request. Missing cached selector inputs or an unknown future shortlist are reported as unresolved; preview does not generate embeddings.</p><label>Request role<select id="requestPreviewRole"><option value="forward">Forward prediction</option><option value="bo_inverse">Next BO inverse request</option><option value="standalone_inverse">Standalone inverse proposal</option></select></label><label>Request source<select id="requestPreviewSource"><option value="current">Current saved settings</option><option value="recorded">Recorded suggestion selected below</option></select></label><label>Find candidate by ID or procedure<input id="requestPreviewQuery"></label><button class="secondary" id="requestPreviewSearch">Find candidates</button><label>Selected candidate<select id="requestPreviewCandidate"></select></label><button class="secondary" id="requestPreview">Preview request</button><pre id="requestPreviewResult"></pre></details><details id="sharedProvenance" class="hidden"><summary>Campaign record, request log and replay</summary><div class="field"><label for="sharedReplayStep">Recorded suggestion</label><select id="sharedReplayStep"></select></div><button id="sharedReplay">Replay recorded score</button> <button id="sharedLog">Load exact request log</button><pre id="sharedReplayResult" style="white-space:pre-wrap;max-height:400px;overflow:auto"></pre><details><summary>Configuration and complete history</summary><pre id="sharedRecord" style="white-space:pre-wrap;max-height:500px;overflow:auto"></pre></details><div class="field"><label for="sharedCachePath">Local portable cache package path</label><input id="sharedCachePath"></div><button id="sharedCacheImport">Validate and import cache</button></details>
       </section>
 
       <section id="messages" class="stack"></section>
@@ -5443,8 +5443,8 @@ INDEX_HTML = r"""<!doctype html>
       objectiveName: 'The numeric label column to optimize. If multiple objective columns were uploaded, choose one here.',
       objectiveDirection: 'Maximize for yields/selectivity/scores; minimize for losses, errors, or costs.',
       acquisition: 'Candidate ranking rule. New LLM campaigns use expected improvement by default.',
-      objectiveLowerBound: 'Physical lower bound in original units. Shared campaigns enforce it in model/acquisition behavior, accepted LLM samples, inverse targets and displayed intervals.',
-      objectiveUpperBound: 'Physical upper bound in original units. Shared campaigns enforce it in model/acquisition behavior, accepted LLM samples, inverse targets and displayed intervals. Generic units and bounds remain user-defined.',
+      objectiveLowerBound: 'Physical lower limit in original units. Structured GP uses a bounded transform; LLM samples and targets enforce the limit. Embedding GP keeps an ordinary Gaussian posterior and raw-unit EI; its display limits do not bound either.',
+      objectiveUpperBound: 'Physical upper limit in original units. Structured GP uses a bounded transform; LLM samples and targets enforce the limit. Embedding GP keeps an ordinary Gaussian posterior and raw-unit EI; its display limits do not bound either. Generic units remain user-defined.',
       objectiveScaling: 'Off keeps labels in original units. Auto/min-max/z-score are used for GPR fitting only; BO-ICL LLM always uses original units so prompts, floors, and predictions stay consistent.',
       plotStatGuides: 'Controls full-dataset dashed reference lines. Best only is cleaner; Paper stats adds mean and percentile guides.',
       embeddingModel: 'OpenAI embedding model used to featurize procedures for GPR and nearest-neighbor inverse filtering.',
@@ -5775,6 +5775,11 @@ INDEX_HTML = r"""<!doctype html>
       const campaign = state.campaign || {};
       $('campaignName').value = campaign.name || '';
       const campaigns = state.campaigns || [];
+      const picker = $('savedCampaign');
+      const selected = picker.value;
+      const activeId = campaign.id || '';
+      const preserveSelection = picker.dataset.activeCampaign === activeId &&
+        (selected === '' || campaigns.some(item => item.id === selected));
       const options = ['<option value="">Choose saved campaign</option>'].concat(
         campaigns.map((item) => {
           const dataset = item.dataset_filename ? `, ${item.dataset_filename}` : '';
@@ -5783,8 +5788,10 @@ INDEX_HTML = r"""<!doctype html>
           return `<option value="${escapeHtml(item.id)}">${escapeHtml(label)}</option>`;
         })
       );
-      $('savedCampaign').innerHTML = options.join('');
-      if (campaign.id) $('savedCampaign').value = campaign.id;
+      picker.innerHTML = options.join('');
+      picker.value = preserveSelection ? selected :
+        (campaigns.some(item => item.id === activeId) ? activeId : '');
+      picker.dataset.activeCampaign = activeId;
     }
 
     function renderConfig() {
@@ -5868,18 +5875,19 @@ INDEX_HTML = r"""<!doctype html>
     function renderLiveRandomWalk() {
       const walk = state.live_random_walk || {};
       const observations = walk.observations || [];
+      const completed = walk.completed_count ?? observations.length;
       const target = Number(walk.target_count || 0);
       const typedTarget = Number($('randomWalkTarget').value || 0);
-      const displayTarget = target || Math.max(observations.length, state.observations.length || 0, typedTarget || 8);
+      const displayTarget = target || Math.max(completed, state.observations.length || 0, typedTarget || 8);
       $('randomWalkTarget').value = displayTarget;
-      $('randomWalkProgress').value = `${observations.length}/${target || displayTarget}`;
+      $('randomWalkProgress').value = `${completed}/${target || displayTarget}`;
       const candidate = walk.current_candidate || null;
       if (candidate) {
         const summary = candidateProcedureSummary(candidate.procedure);
         const row = candidate.row ? `row ${candidate.row}` : 'candidate';
         $('randomWalkCandidate').textContent = `${row}: ${summary || candidate.procedure}`;
         $('addRandomWalkResult').disabled = busy;
-      } else if (walk.status === 'complete' && observations.length) {
+      } else if (walk.status === 'complete' && completed) {
         $('randomWalkCandidate').textContent = 'Random walk complete.';
         $('addRandomWalkResult').disabled = true;
       } else {
@@ -6108,12 +6116,17 @@ INDEX_HTML = r"""<!doctype html>
         : (statMode === 'max'
           ? rawDatasetStats.filter((item) => ['max', 'min'].includes(item.label))
           : []);
-      if (!trace.length && !benchmarkRuns.length && !randomTrace.length && !liveRandomTrace.length && !datasetStats.length) {
+      const excludedMeasurements = [
+        ...(state.excluded_measurement_points || []).map((item) => ({ ...item, campaign_name: 'Active campaign' })),
+        ...benchmarkRuns.flatMap((run) => (run.excluded_measurement_points || []).map((item) => ({ ...item, campaign_name: run.name }))),
+        ...(sharedCampaignId && !sharedCurveVisible('random-control') ? [] : ((state.live_random_walk || {}).excluded_measurement_points || [])).map((item) => ({ ...item, campaign_name: 'Random control' }))
+      ];
+      if (!trace.length && !benchmarkRuns.length && !randomTrace.length && !liveRandomTrace.length && !datasetStats.length && !excludedMeasurements.length) {
         host.innerHTML = '<div class="empty" style="margin: 18px;">No observations, random baseline, or benchmark runs yet</div>';
         return;
       }
       const obs = state.live_observation_points || state.observations || [];
-      const randomObs = sharedCampaignId && !sharedCurveVisible('random-control') ? [] : (state.live_random_walk || {}).observations || [];
+      const randomObs = sharedCampaignId && !sharedCurveVisible('random-control') ? [] : ((state.live_random_walk || {}).plot_observations ?? (state.live_random_walk || {}).observations ?? []);
       const width = Math.max(560, host.clientWidth || 760);
       const height = 330;
       const pad = { left: 56, right: 76, top: 26, bottom: 46 };
@@ -6160,6 +6173,7 @@ INDEX_HTML = r"""<!doctype html>
           label: prediction.uncertainty_type || 'prediction spread (1 SD)' };
       };
       const xIndexes = [
+        ...excludedMeasurements.map((item) => Number(item.index)),
         ...trace.map((item) => Number(item.index)),
         ...activeObs.map((item, idx) => Number(item.index ?? idx + 1)),
         ...randomTrace.map((item) => Number(item.index)),
@@ -6206,6 +6220,7 @@ INDEX_HTML = r"""<!doctype html>
         datasetStats.map((item) => item.value),
         [objectiveLower, objectiveUpper]
       ).filter((value) => value !== null && value !== undefined && Number.isFinite(Number(value)));
+      if (!values.length && excludedMeasurements.length) values.push(0, 1);
       if (!values.length) {
         host.innerHTML = '<div class="empty" style="margin: 18px;">No plottable values yet</div>';
         return;
@@ -6317,6 +6332,12 @@ INDEX_HTML = r"""<!doctype html>
         const positionText = orderedAxis ? `${label}${item.initialization_index ? ' (initialization)' : ' (new measurement)'}: ` : '';
         return `${err}<circle data-observation-index="${index}" data-axis-label="${escapeHtml(String(label))}" cx="${cx}" cy="${cy}" r="4" fill="#2563eb"><title>${escapeHtml(positionText)}${escapeHtml(item.procedure)}: ${fmt(item.value)}${countText}</title></circle>`;
       }).join('');
+      const excludedMarkers = excludedMeasurements.map((item) => {
+        const cx = x(item.index);
+        const cy = height - pad.bottom - 8;
+        const label = item.axis_label ?? axisLabel(item.index);
+        return `<path data-excluded-measurement-index="${item.index}" data-axis-label="${escapeHtml(String(label))}" d="M ${cx - 4} ${cy - 4} L ${cx + 4} ${cy + 4} M ${cx - 4} ${cy + 4} L ${cx + 4} ${cy - 4}" stroke="#64748b" stroke-width="2"><title>${escapeHtml(item.campaign_name)} ${escapeHtml(String(label))}: completed physical measurement excluded from training and best curve; outcome not plotted. ${escapeHtml(item.reason || '')}</title></path>`;
+      }).join('');
       const ticks = [0, 0.25, 0.5, 0.75, 1].map((t) => {
         const value = minY + (maxY - minY) * t;
         const yy = y(value);
@@ -6353,6 +6374,7 @@ INDEX_HTML = r"""<!doctype html>
           <text x="${pad.left + 8}" y="${pad.top + 15}" fill="#475569">Initialization</text>`
         : '';
       const legendItems = [
+        excludedMarkers ? { label: 'excluded (×)', color: '#64748b', dash: '2 2' } : null,
         bestPath ? { label: 'live best', color: '#0f766e', dash: '' } : null,
         randomPath ? { label: 'random expected', color: '#667085', dash: '5 5' } : null,
         liveRandomPath ? { label: 'live random', color: '#b45309', dash: '5 3' } : null,
@@ -6366,7 +6388,7 @@ INDEX_HTML = r"""<!doctype html>
       }).join('');
       host.innerHTML = `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}" role="img" aria-label="Measured outcomes, best measured trace, and separate model predictions">
         <title>Measured outcomes and separate model predictions</title>
-        <desc>Solid blue dots are confirmed measurements with reported measurement uncertainty. ${initializationRegion ? 'The shaded region shows initialization observations labeled i1, i2, and so on in supplied order. Its divider precedes new measurement 1; initialization does not consume the new-measurement budget. ' : ''}Diamonds are model predictions; their bars show the labeled predictive interval or response spread. Comparison trace bands, when present, describe variation across independent runs.</desc>
+        <desc>Solid blue dots are confirmed measurements with reported measurement uncertainty. ${initializationRegion ? 'The shaded region shows initialization observations labeled i1, i2, and so on in supplied order. Its divider precedes new measurement 1; initialization does not consume the new-measurement budget. ' : ''}Grey crosses at the bottom mark completed measurements excluded from training and the compatible-best curve; their outcomes are not plotted and their physical experiment positions remain occupied. Diamonds are model predictions; their bars show the labeled predictive interval or response spread. Comparison trace bands, when present, describe variation across independent runs.</desc>
         ${legend}
         ${initializationRegion}
         ${ticks}
@@ -6386,6 +6408,7 @@ INDEX_HTML = r"""<!doctype html>
         ${bestPath ? `<path d="${bestPath}" fill="none" stroke="#0f766e" stroke-width="3" />` : ''}
         ${livePredictions}
         ${points}
+        ${excludedMarkers}
         <text x="${width / 2}" text-anchor="middle" y="${height - 12}">${escapeHtml(state.plot_x_axis?.label || 'experiment count')}</text>
       </svg>`;
     }
@@ -7486,7 +7509,7 @@ USER_GUIDE_HTML = r"""<!doctype html>
     <p class="muted">Use this local browser tool for Bayesian-optimization active learning over a finite pool of procedures.</p>
 
     <section>
-      <h2>Shared campaigns: both views, one history</h2><p>The main toolkit is the landing page. <code>Load preset</code> creates a new campaign; <code>Load Selected</code> resumes one. <code>Focused campaign view</code> opens the same MoC ID and graph. Generic shared datasets use the main view. Multiple tabs can run independent campaigns.</p><p><code>New-measurement budget</code>: blank is unlimited; zero prevents new suggestions. Seeds are initialization. After intentional start, automatic refresh after a saved measurement can issue paid LLM or embedding requests. <code>Save checkpoint now</code> marks a saved point; <code>Resume selected as independent copy</code> creates a new arm and preserves the source.</p><p><code>GP: synthesis parameters</code> uses mapped features, no embeddings and no provider key. MoC retains its six source synthesis transforms. <code>GP: text embeddings</code> is a separate bare-procedure ada-002 baseline. LLM retrieval uses prefixed 3-large vectors; caches must match model, dimension, exact text and representation.</p><p>Under the LLM advanced controls, a manual inverse target is optional: blank means automatic, zero is explicit. Standalone proposals are separate text records and cannot be reserved or measured as pool candidates. <code>Preview full LLM request (no model calls)</code> shows exact available requests and identifies unresolved inputs. It does not generate embeddings.</p><p>Measurement quality records method, normalization, source/refinement identifiers and uncertainty provenance. Confirming 72.1/83.8/23.4 does not establish the seeds’ quantification method. Historical unspecified methods remain unknown; document a definition decision before combining explicit different definitions. Refinements preserve prior records. Shared bounds affect models and acquisition, not only plotting.</p></section><section><h2>Legacy saved datasets and benchmarks</h2>
+      <h2>Shared campaigns: both views, one history</h2><p>The main toolkit is the landing page. <code>Load preset</code> creates a new campaign; <code>Load Selected</code> resumes one. <code>Focused campaign view</code> opens the same MoC ID and graph. Generic shared datasets use the main view. Multiple tabs can run independent campaigns.</p><p><code>New-measurement budget</code>: blank is unlimited; zero prevents new suggestions. Seeds are initialization. After intentional start, automatic refresh after a saved measurement can issue paid LLM or embedding requests. <code>Save checkpoint now</code> marks a saved point; <code>Resume selected as independent copy</code> creates a new arm and preserves the source.</p><p><code>GP: synthesis parameters</code> uses mapped features, no embeddings and no provider key. MoC retains its six source synthesis transforms. <code>GP: text embeddings</code> is a separate bare-procedure ada-002 baseline. LLM retrieval uses prefixed 3-large vectors; caches must match model, dimension, exact text and representation.</p><p>Under the LLM advanced controls, a manual inverse target is optional: blank means automatic, zero is explicit. Standalone proposals are separate text records and cannot be reserved or measured as pool candidates. <code>Preview full LLM request (no model calls)</code> shows exact available requests and identifies unresolved inputs. It does not generate embeddings.</p><p>Measurement quality records method, normalization, source/refinement identifiers and uncertainty provenance. Confirming 72.1/83.8/23.4 does not establish the seeds’ quantification method. Historical unspecified methods remain unknown; document a definition decision before combining explicit different definitions. Refinements preserve prior records. Bounds act differently by method: the synthesis-parameter GP uses a bounded transform and posterior; LLM samples and targets enforce the limits. The embedding GP retains an ordinary Gaussian posterior and EI in raw objective units. Its display limits do not bound its posterior or acquisition.</p></section><section><h2>Legacy saved datasets and benchmarks</h2>
       <p>Live experimental campaigns can run for days or weeks. Save the campaign once before you start, then the app autosaves later changes into a local folder under <code>saved_experiments/</code>. That folder is ignored by Git so lab data and API context stay on this computer.</p>
       <ol>
         <li>Enter a <code>Campaign name</code> and click <code>Save</code>.</li>

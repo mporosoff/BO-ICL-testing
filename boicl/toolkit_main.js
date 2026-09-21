@@ -29,6 +29,39 @@ function fillQualityValues(record = {}) {
       (key === "quantification_method" ? "historical_unspecified" : "");
 }
 
+function syncDefinitionForm(definition, campaignId) {
+  const method = $("definitionMethod");
+  const saved = {
+    definitionMethod:
+      definition.quantification_method === "historical_unspecified"
+        ? ""
+        : definition.quantification_method || "",
+    definitionNormalization: definition.normalization || "",
+    definitionNote: definition.definition_note || "",
+    definitionHistoricalPolicy: [
+      "exclude",
+      "retain_with_justification",
+    ].includes(definition.historical_policy)
+      ? definition.historical_policy
+      : "unresolved",
+    definitionReason: "",
+  };
+  const values = JSON.stringify(saved);
+  const current = JSON.stringify(
+    Object.fromEntries(Object.keys(saved).map((id) => [id, $(id).value])),
+  );
+  // Polling may reveal a saved revision in another view, but keep local drafts.
+  if (
+    method.dataset.campaign === campaignId &&
+    method.dataset.definitionValues &&
+    current !== method.dataset.definitionValues
+  )
+    return;
+  for (const [id, value] of Object.entries(saved)) $(id).value = value;
+  method.dataset.campaign = campaignId;
+  method.dataset.definitionValues = values;
+}
+
 async function toolkitFetch(path, body, method = "POST") {
   const response = await fetch(path, {
     method,
@@ -320,20 +353,54 @@ function renderSharedComparisons() {
   const rows = (state.benchmark_runs || []).filter(
     (r) => r.kind === "independent_campaign_comparison",
   );
-  if (state.shared_control_id)
+  if (
+    state.shared_control_id &&
+    state.live_random_walk?.comparison_compatibility?.compatible !== false
+  )
     rows.push({
       id: "random-control",
       name: "Independent measured random control",
       campaign_id: state.shared_control_id,
     });
-  $("sharedComparisonChoices").innerHTML = rows.length
+  const diagnostics = (state.comparison_diagnostics || []).filter(
+    (r) => r.compatible === false || r.mismatches?.length,
+  );
+  const mismatchLabels = {
+    measurement_definition: "measurement definition",
+    effective_initialization: "initial training cohort",
+    initialization_fingerprint: "original initialization",
+    pool_fingerprint: "candidate pool",
+    objective: "objective",
+    units: "units",
+    bounds: "objective bounds",
+    direction: "optimization direction",
+    repeat_policy: "repeat policy",
+    new_measurement_budget: "measurement budget",
+    seed: "random seed",
+  };
+  const notes = diagnostics
+    .map((r) => {
+      const subject =
+        r.kind === "random_control"
+          ? "Independent random control"
+          : "Comparison campaign";
+      const reasons = (r.mismatches || [])
+        .map((key) => mismatchLabels[key] || key.replaceAll("_", " "))
+        .join(", ");
+      return `<p class="muted">${subject} remains saved. Its graph is hidden because the campaigns differ${reasons ? " in " + escapeHtml(reasons) : " in comparison requirements"}. <a href="/?campaign=${encodeURIComponent(r.campaign_id)}">Open arm</a></p>`;
+    })
+    .join("");
+  const choices = rows.length
     ? rows
         .map(
           (r) =>
             `<label class="switchline"><input type="checkbox" data-curve="${escapeHtml(r.id)}" ${sharedCurveVisible(r.id) ? "checked" : ""}>${escapeHtml(r.name)} <a href="/?campaign=${encodeURIComponent(r.campaign_id)}">Open arm</a></label>`,
         )
         .join("")
-    : '<p class="muted">Create a matched pair or start an independent random control to add comparison curves.</p>';
+    : diagnostics.length
+      ? ""
+      : '<p class="muted">Create a matched pair or start an independent random control to add comparison curves.</p>';
+  $("sharedComparisonChoices").innerHTML = choices + notes;
   document.querySelectorAll("[data-curve]").forEach(
     (input) =>
       (input.onchange = () => {
@@ -503,16 +570,7 @@ function renderShared() {
     null,
     2,
   );
-  const definition = config.measurement_definition || {};
-  if ($("definitionMethod").dataset.campaign !== sharedCampaignId) {
-    $("definitionMethod").dataset.campaign = sharedCampaignId;
-    $("definitionMethod").value =
-      definition.quantification_method === "historical_unspecified"
-        ? ""
-        : definition.quantification_method || "";
-    $("definitionNormalization").value = definition.normalization || "";
-    $("definitionNote").value = definition.definition_note || "";
-  }
+  syncDefinitionForm(config.measurement_definition || {}, sharedCampaignId);
   $("workflowBanner").textContent =
     (state.shared_campaign.synthetic_demo ? "SYNTHETIC DEMO · " : "") +
     "Shared campaign " +
@@ -743,8 +801,9 @@ document.addEventListener("DOMContentLoaded", () => {
   };
   $("applyDefinition").onclick = async () => {
     try {
+      const requestedCampaign = sharedCampaignId;
       await toolkitFetch("/api/moc/measurement-definition", {
-        id: sharedCampaignId,
+        id: requestedCampaign,
         definition: {
           quantification_method: $("definitionMethod").value,
           normalization: $("definitionNormalization").value,
@@ -753,6 +812,7 @@ document.addEventListener("DOMContentLoaded", () => {
         historical_policy: $("definitionHistoricalPolicy").value,
         reason: $("definitionReason").value,
       });
+      if (requestedCampaign !== sharedCampaignId) return;
       $("definitionMethod").dataset.campaign = "";
       await refresh();
       renderNotice(

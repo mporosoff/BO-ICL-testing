@@ -129,11 +129,14 @@ plots and exports retain original units. Entered uncertainty is stored,
 exported, and plotted as an error bar.
 `Objective lower bound` and `Objective upper bound` are optional physical or
 measurement bounds in original units. For phase percentages, use `0` and `100`.
-Automatic inverse targets respect these bounds. Out-of-bounds manual targets
-are errors. Out-of-range numeric predictions are rejected before acquisition,
+LLM automatic inverse targets respect these bounds. Out-of-bounds manual targets
+are errors. Out-of-range LLM numeric predictions are rejected before acquisition,
 with at least two accepted completions required for ranking. Raw responses are
 never silently converted into boundary predictions. Plot interval endpoints
-also respect configured display bounds. Custom prompts are kept verbatim.
+also respect configured display bounds. The shared synthesis-parameter GP uses a
+bounded transform and posterior. The separate embedding GP uses an ordinary
+Gaussian posterior and EI in raw objective units; display limits do not bound
+its posterior or acquisition. Custom prompts are kept verbatim.
 For model-selected points, the runner also stores the model prediction that was
 used for ranking. Those prediction means and uncertainties are plotted as
 separate prediction markers with error bars and are included in saved campaigns,

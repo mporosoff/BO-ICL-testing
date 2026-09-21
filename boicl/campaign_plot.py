@@ -6,7 +6,11 @@ oracle columns) never supply plot statistics, measurements or random baselines.
 """
 from copy import deepcopy
 import math
-from .measurement_quality import comparison_definition, quality_metadata
+from .measurement_quality import (
+    comparison_definition,
+    effective_initial_cohort,
+    quality_metadata,
+)
 
 
 COLORS = ("#7c3aed", "#dc2626", "#0891b2", "#db2777", "#65a30d")
@@ -67,33 +71,81 @@ def _prediction(raw):
     return result
 
 
-def measured_points(campaign):
-    """One display position per active physical measurement, including seeds.
+def _measurement_positions(campaign):
+    """Assign physical effort positions before considering model inclusion.
 
     Refinement replacements retain the original physical measurement position.
-    Individual physical repeats retain separate positions and uncertainties.
-    Initialization positions are supplied order, not optimization iterations.
+    Archived BO records live outside this ledger and do not consume positions.
     """
-    config = campaign["config"]
-    ledger = campaign.get("observations", [])
-    order, ids_to_physical, active = {}, {}, {}
-    for index, row in enumerate(ledger):
+    order, latest = {}, {}
+    for index, row in enumerate(campaign.get("observations", [])):
         physical = _physical_id(row, index)
         order.setdefault(physical, index)
-        if row.get("observation_id"):
-            ids_to_physical[row["observation_id"]] = physical
-        if row.get("record_status", "measured") != "measured" or not row.get(
-            "training_included", True
-        ):
+        if row.get("record_status", "measured") != "measured":
             continue
-        value = _outcome(row, config)
-        if value is None:
-            continue
-        if physical in active:
+        if physical in latest:
             raise ValueError(
                 "Multiple active refinements for the same physical measurement cannot form separate plot points"
             )
-        active[physical] = row
+        latest[physical] = row
+    ordered = sorted(
+        latest.items(),
+        key=lambda pair: (not bool(pair[1].get("is_seed")), order[pair[0]]),
+    )
+    positions, initialized, completed = [], 0, 0
+    for index, (physical, row) in enumerate(ordered, 1):
+        seed = bool(row.get("is_seed", False))
+        if seed:
+            initialized += 1
+        else:
+            completed += 1
+        positions.append(
+            (
+                dict(
+                    index=index,
+                    axis_label=f"i{initialized}" if seed else str(completed),
+                    initialization_index=initialized if seed else None,
+                    optimization_step=0 if seed else completed,
+                    physical_measurement_id=physical,
+                    is_seed=seed,
+                    initialization=seed,
+                ),
+                row,
+            )
+        )
+    return positions
+
+
+def excluded_measurements(campaign):
+    """Mark effort without plotting incompatible outcomes on the objective axis."""
+    return [
+        {
+            **position,
+            "candidate_id": row["candidate_id"],
+            "observation_id": row.get("observation_id"),
+            "training_included": False,
+            "reason": (row.get("training_exclusion") or {}).get("reason")
+            or "Excluded from model training",
+        }
+        for position, row in _measurement_positions(campaign)
+        if not row.get("training_included", True)
+    ]
+
+
+def _effort_counts(campaign):
+    positions = _measurement_positions(campaign)
+    initialized = sum(position["is_seed"] for position, _ in positions)
+    return initialized, len(positions) - initialized
+
+
+def measured_points(campaign):
+    """Included measurements at their original physical effort positions."""
+    config = campaign["config"]
+    ids_to_physical = {
+        row["observation_id"]: _physical_id(row, index)
+        for index, row in enumerate(campaign.get("observations", []))
+        if row.get("observation_id")
+    }
     prediction_by_physical = {}
     for suggestion in campaign.get("suggestions", []):
         physical = ids_to_physical.get(suggestion.get("observation_id"))
@@ -104,17 +156,11 @@ def measured_points(campaign):
         str(row["candidate_id"]): str(row.get("procedure", ""))
         for row in campaign.get("candidates", [])
     }
-    ordered = sorted(
-        active.items(),
-        key=lambda pair: (not bool(pair[1].get("is_seed")), order[pair[0]]),
-    )
-    points, initialized, completed = [], 0, 0
-    for physical, row in ordered:
-        seed = bool(row.get("is_seed", False))
-        if seed:
-            initialized += 1
-        else:
-            completed += 1
+    points = []
+    for position, row in _measurement_positions(campaign):
+        if not row.get("training_included", True) or _outcome(row, config) is None:
+            continue
+        physical, seed = position["physical_measurement_id"], position["is_seed"]
         sigma = _number(
             row.get(
                 config.get("objective", "moc_wt_pct") + "_sigma",
@@ -129,10 +175,7 @@ def measured_points(campaign):
         candidate_id = str(row["candidate_id"])
         points.append(
             {
-                "index": len(points) + 1,
-                "axis_label": f"i{initialized}" if seed else str(completed),
-                "initialization_index": initialized if seed else None,
-                "optimization_step": 0 if seed else completed,
+                **position,
                 "candidate_id": candidate_id,
                 "observation_id": row.get("observation_id"),
                 "physical_measurement_id": physical,
@@ -233,6 +276,11 @@ def comparison_compatibility(reference, other):
             mismatches.append("measurement_definition")
     except ValueError:
         mismatches.append("measurement_definition")
+    try:
+        if effective_initial_cohort(reference) != effective_initial_cohort(other):
+            mismatches.append("effective_initialization")
+    except ValueError:
+        mismatches.append("effective_initialization")
     for key in ("pool_fingerprint", "initialization_fingerprint"):
         if not reference.get(key) or reference.get(key) != other.get(key):
             mismatches.append(key)
@@ -265,8 +313,7 @@ def comparison_run(reference, other, color=COLORS[0]):
         )
     points = measured_points(other)
     trace = best_trace(points, other["config"].get("direction", "maximize"))
-    completed = sum(not point["is_seed"] for point in points)
-    initialization_count = len(points) - completed
+    initialization_count, completed = _effort_counts(other)
     summary = [
         {
             "index": row["index"],
@@ -293,6 +340,8 @@ def comparison_run(reference, other, color=COLORS[0]):
         "partial": True,
         "kind": "independent_campaign_comparison",
         "initialization_count": initialization_count,
+        "completed_count": completed,
+        "excluded_measurement_points": excluded_measurements(other),
         "summary": summary,
         "prediction_summary": pending_predictions(
             other, completed, initialization_count
@@ -310,8 +359,8 @@ def comparison_run(reference, other, color=COLORS[0]):
 def plot_payload(campaign, comparisons=(), random_campaign=None):
     """Return existing renderPlot keys; no new plotting implementation required."""
     points = measured_points(campaign)
-    completed = sum(not point["is_seed"] for point in points)
-    initialization_count = len(points) - completed
+    initialization_count, completed = _effort_counts(campaign)
+    excluded = excluded_measurements(campaign)
     config = campaign["config"]
     runs, diagnostics = [], []
     for other in comparisons:
@@ -353,19 +402,24 @@ def plot_payload(campaign, comparisons=(), random_campaign=None):
         random_state = {
             "campaign_id": random_campaign["campaign_id"],
             "observations": random_points,
-            "initialization_count": sum(point["is_seed"] for point in random_points),
+            "initialization_count": _effort_counts(random_campaign)[0],
+            "completed_count": _effort_counts(random_campaign)[1],
+            "excluded_measurement_points": excluded_measurements(random_campaign),
             "status": "independent measured random control",
             "training_shared": False,
         }
     bounds = config.get("bounds") or [None, None]
-    axis_points = points + random_points
+    axis_points = points + excluded + random_points
+    axis_points.extend(random_state.get("excluded_measurement_points", []))
     for run in runs:
         axis_points.extend(run.get("summary", []))
         axis_points.extend(run.get("prediction_summary", []))
+        axis_points.extend(run.get("excluded_measurement_points", []))
     last_position = max((point["index"] for point in axis_points), default=0)
     return {
         "initialization_count": initialization_count,
         "live_observation_points": points,
+        "excluded_measurement_points": excluded,
         "best_trace": best_trace(points, config.get("direction", "maximize")),
         "benchmark_runs": runs,
         "live_random_walk": random_state,
@@ -394,6 +448,7 @@ def plot_payload(campaign, comparisons=(), random_campaign=None):
         "plot_counts": {
             "initialization": initialization_count,
             "new_completed": completed,
+            "excluded_from_training": len(excluded),
             "pending_predictions": len(pending),
         },
         "comparison_diagnostics": diagnostics,

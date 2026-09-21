@@ -179,7 +179,7 @@ def config_changes(payload, config):
 
 
 def project(service, cid, state):
-    from .campaign_plot import plot_payload
+    from .campaign_plot import comparison_compatibility, plot_payload
     from .campaign_controls import (
         comparison_campaigns,
         random_control_campaign,
@@ -257,6 +257,14 @@ def project(service, cid, state):
         )
     compatible = comparison_campaigns(service, cid)
     random_campaign = random_control_campaign(service, cid)
+    random_compatibility = (
+        comparison_compatibility(data, random_campaign) if random_campaign else None
+    )
+    random_overlay = (
+        random_campaign
+        if random_compatibility and random_compatibility["compatible"]
+        else None
+    )
     progress = deepcopy(summary["progress"])
     progress["status"] = {
         "suggested": "complete",
@@ -312,9 +320,29 @@ def project(service, cid, state):
         ),
     )
     payload.update(
-        plot_payload(data, comparisons=compatible, random_campaign=random_campaign)
+        plot_payload(data, comparisons=compatible, random_campaign=random_overlay)
     )
-    payload["live_random_walk"] = random_control_state(service, cid)
+    random_plot = payload["live_random_walk"]
+    payload["live_random_walk"] = {
+        **random_plot,
+        **(
+            random_control_state(service, cid, data=random_campaign)
+            if random_campaign
+            else {}
+        ),
+        # The control form shows only new outcomes; the graph retains all
+        # compatible physical positions, including initialization and exclusions.
+        "plot_observations": random_plot.get("observations", []),
+    }
+    if random_compatibility and not random_compatibility["compatible"]:
+        payload["comparison_diagnostics"].append(
+            {
+                "campaign_id": random_campaign["campaign_id"],
+                "kind": "random_control",
+                **random_compatibility,
+            }
+        )
+        payload["live_random_walk"]["comparison_compatibility"] = random_compatibility
     payload["shared_history"] = {
         key: deepcopy(data[key])
         for key in ("observations", "events", "archive", "provenance")
