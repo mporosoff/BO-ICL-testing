@@ -76,6 +76,7 @@ async function settle(){await new Promise(resolve=>setImmediate(resolve));}
         timeout=25,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout
 
 
 pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="Node unavailable")
@@ -297,3 +298,66 @@ for(const id of ['generateInverse','cachePrepare','cacheImport'])assert(!el(id).
 assert.equal(evaluate('settingsSavePending'),false);
 """,
     )
+
+
+@pytest.mark.parametrize(
+    "saved_mode,saved_count,selected_mode,expected_count",
+    [
+        ("all", None, "nearest", 5),
+        ("nearest", 7, "nearest", 7),
+        ("nearest", 7, "all", None),
+    ],
+)
+def test_focused_example_mode_payload_passes_service_preview_and_save(
+    tmp_path, saved_mode, saved_count, selected_mode, expected_count
+):
+    from boicl.campaign import CampaignService
+
+    case = json.dumps(
+        {
+            "saved_mode": saved_mode,
+            "saved_count": saved_count,
+            "selected_mode": selected_mode,
+        }
+    )
+    output = run_focused(
+        tmp_path,
+        r"""
+const testcase=TESTCASE,initial=campaign();
+initial.config.llm.selector_mode=testcase.saved_mode;initial.config.llm.selector_k=testcase.saved_count;
+show(initial);el('examples').value=testcase.selected_mode;el('examples').onchange();
+let changes;
+response=async(action,body)=>{
+ assert.equal(action,'config-preview');changes=body.changes;
+ return {after:initial.config};
+};
+await el('previewSettings').onclick();assert(changes);assert(!el('applySettings').classList.contains('hidden'));
+console.log(JSON.stringify(changes));
+""".replace(
+            "TESTCASE", case
+        ),
+    )
+    changes = json.loads(output)
+    service = CampaignService(tmp_path / "campaigns")
+    cid = service.create(
+        "moc_five_llm",
+        overrides={
+            "llm": {
+                "selector_mode": saved_mode,
+                "selector_k": saved_count,
+                "manual_inverse_target": 90,
+            }
+        },
+        synthetic_demo=True,
+    )
+    observations = service.get(cid)["observations"]
+    preview = service.update_config(cid, changes, apply=False)
+    assert preview["after"]["llm"]["selector_mode"] == selected_mode
+    assert preview["after"]["llm"]["selector_k"] == expected_count
+    assert service.get(cid)["config"]["llm"]["selector_mode"] == saved_mode
+    saved = service.update_config(cid, changes)
+    assert saved["config"]["llm"]["selector_mode"] == selected_mode
+    assert saved["config"]["llm"]["selector_k"] == expected_count
+    assert service.get(cid)["observations"] == observations
+    resumed = CampaignService(tmp_path / "campaigns")
+    assert resumed.get(cid)["config"]["llm"]["selector_k"] == expected_count
