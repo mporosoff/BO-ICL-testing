@@ -40,7 +40,10 @@ reference packages remain outside commits.
    sequence and saved proposal count. Both reuse execution's schedule and request
    builder. The former `inverse` API role remains a standalone-preview alias.
    Recorded requests remain exact; unavailable or future-dependent requests stay
-   unresolved. Mocked execution equality is tested across interleaved sequences,
+   unresolved. Current inverse previews also respect engine availability; GP
+   and random-control campaigns cannot claim an executable standalone LLM request.
+   Historical recorded requests remain available after an engine change.
+   Mocked execution equality is tested across interleaved sequences,
    maximization/minimization, automatic/manual-zero targets, restart and changed
    settings. Preview creates no requests, embeddings, reservations or history.
 6. **Method-specific bounds.** README, local-runner guide, operator guide and
@@ -75,6 +78,10 @@ these are not added to the full-run total. The full run includes the default
 7,776-design structured-GP recommendation `moc-32c375b3a148b782`, with 1,000
 burn-in steps and 4,000 retained draws. The 0.3.2 package builds locally without
 dependency downloads. Formatting and integrity hooks are run before publication.
+The initial GitHub/Linux full run passed **456 tests**, with **16 live-provider
+tests skipped**. Automated review then identified a direct-API standalone-preview
+availability mismatch; the subsequent fix adds regression coverage for both GP
+representations, random controls, the legacy alias and recorded requests.
 
 ## Operating the repaired controls
 

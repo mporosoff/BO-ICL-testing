@@ -153,7 +153,17 @@ def test_two_inverse_modes_match_execution_through_independent_sequences(
         assert len(service.get(cid)["inverse_proposals"]) == sequence + 1
 
 
-def test_recorded_requests_ignore_current_mode_settings_and_schedule(tmp_path):
+@pytest.mark.parametrize(
+    "engine,policy",
+    [
+        ("gpr_features", "engine"),
+        ("gpr_embeddings", "engine"),
+        ("llm", "random_control"),
+    ],
+)
+def test_recorded_requests_ignore_current_mode_settings_and_schedule(
+    tmp_path, engine, policy
+):
     service = CampaignService(tmp_path)
     cid = create_campaign(service)
     bo = service.request_preview(cid, role="bo_inverse")
@@ -171,11 +181,13 @@ def test_recorded_requests_ignore_current_mode_settings_and_schedule(tmp_path):
     service.update_config(
         cid,
         {
+            "engine": engine,
+            "selection_policy": policy,
             "llm": {
                 "manual_inverse_target": 0,
                 "inverse_proposal_count": 2,
                 "inverse_system_message": "Changed system",
-            }
+            },
         },
     )
     before, disk = service.export(cid), files(service.root)
@@ -185,6 +197,38 @@ def test_recorded_requests_ignore_current_mode_settings_and_schedule(tmp_path):
             assert preview["source"] == "recorded" and preview["status"] == "exact"
             assert preview["preview_label"] == "Recorded inverse request"
             assert preview["request"] == request and preview["request_schedule"] is None
+    assert service.export(cid) == before and files(service.root) == disk
+
+
+@pytest.mark.parametrize(
+    "engine,policy",
+    [
+        ("gpr_features", "engine"),
+        ("gpr_embeddings", "engine"),
+        ("llm", "random_control"),
+    ],
+)
+@pytest.mark.parametrize("role", ["standalone_inverse", "inverse"])
+def test_current_standalone_preview_requires_the_executable_llm_selection_engine(
+    tmp_path, monkeypatch, engine, policy, role
+):
+    import boicl.campaign as campaign_module
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("An unavailable standalone preview must not access selector cache")
+
+    monkeypatch.setattr(campaign_module, "cached_selector_vectors", forbidden)
+    service = CampaignService(tmp_path)
+    cid = create_campaign(service, synthetic=False)
+    service.update_config(cid, {"engine": engine, "selection_policy": policy})
+    before, disk = service.export(cid), files(service.root)
+    preview = service.request_preview(cid, role=role)
+    assert preview["status"] == "unresolved" and preview["request"] is None
+    assert "require the BO-ICL LLM engine" in preview["reason"]
+    assert "request_sha256" not in preview
+    assert preview["preview_kind"] == "standalone_inverse"
+    with pytest.raises(ValueError, match="require the BO-ICL LLM engine"):
+        service.start_inverse_proposals(cid, background=False)
     assert service.export(cid) == before and files(service.root) == disk
 
 

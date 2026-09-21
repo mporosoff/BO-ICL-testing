@@ -841,6 +841,14 @@ class CampaignService:
                 candidate_id = record.get("candidate_id")
         observations = [] if recorded is not None else llm_observations(data)
         unavailable = None
+        if recorded is None and kind == "standalone_inverse":
+            if (
+                data["config"]["engine"] != "llm"
+                or data["config"].get("selection_policy") != "engine"
+            ):
+                unavailable = (
+                    "Standalone inverse proposals require the BO-ICL LLM engine"
+                )
         if recorded is None and kind == "bo_inverse":
             if (
                 data["config"]["engine"] != "llm"
